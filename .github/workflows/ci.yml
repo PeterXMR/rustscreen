@@ -1,0 +1,63 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  rust:
+    name: Rust (build / test / clippy / fmt)
+    runs-on: macos-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: cargo build --workspace
+        run: cargo build --workspace
+
+      - name: cargo test --workspace
+        run: cargo test --workspace
+
+      - name: cargo clippy --workspace --all-targets
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+
+  android-native:
+    name: Android native (.so via cargo-ndk)
+    runs-on: macos-latest
+    # NOTE: The Gradle APK build (assembleDebug) is intentionally NOT included here.
+    # It requires a pinned JDK (17–21) and a fully-installed Android SDK/emulator — that
+    # setup will be added in a later phase (P7/P8) once the build is stable.
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable + aarch64-linux-android target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - name: Set up Android NDK r25c
+        id: setup-ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r25c
+
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk
+
+      - name: Build android-client .so
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: >
+          cargo ndk
+          -t arm64-v8a
+          -o android/app/src/main/jniLibs
+          build -p android-client
