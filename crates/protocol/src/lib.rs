@@ -1,4 +1,5 @@
 pub mod framing;
+pub mod messages;
 pub mod nal;
 
 pub fn protocol_version() -> u32 {

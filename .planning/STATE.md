@@ -11,9 +11,10 @@ See: .planning/PROJECT.md (updated 2026-06-02)
 
 ## Current Position
 
-Phase: P3 of P0–P8 (Capture + Hardware-Encode on macOS) — **IN PROGRESS (Wave A done, Wave B gated)**
-Plan: P3-01 planned & verified; Wave A executed (cable-free), Wave B awaiting hands-on-Mac session
-Status: Wave A complete (CI-green); Wave B blocked on interactive Mac run (Screen Recording TCC grant + gated dep installs)
+Phase: P3 (Wave A done, Wave B gated) + **P5 protocol layer done (cable-free slice)**
+Plan: P3-01 (Wave A done); P5-01 planned & verified, cable-free Tasks 0–2 executed
+Status: P3 Wave B + P5 live pipeline/latency both await hardware; all cable-free protocol/codec logic now landed
+Last activity (P5): 2026-06-03 — **P5 cable-free slice planned via GSD** (RESEARCH/CONTEXT/PLAN/P5-VALIDATION; plan-checker PASS after one revision) **and executed** (TDD) on branch `feat/p5-protocol-messages` (stacked on `feat/p3-capture-encode`): `protocol::messages` — `Frame` enum (Handshake/VideoConfig/Video/Touch/Control) + codec layered on `framing` (postcard for structured, raw `[pts u64 BE][keyframe u8][nal]` for Video) + pure `negotiate()` handshake/resolution negotiation. Added `serde`+`postcard` (verified legit, no_std-friendly). Workspace 52→75 tests; clippy/fmt clean. Satisfies PIPE-01 criterion #3 *logic*; criteria #1/#2 (live pipeline + latency) remain hardware-blocked.
 Last activity: 2026-06-03 — **P3 planned via GSD** (RESEARCH.md, CONTEXT.md, PLAN.md, P3-VALIDATION.md; plan-checker PASS after one revision). **P3 Wave A executed** (TDD, cable-free): `encode_vt.rs` (`avcc_to_annex_b` + keyframe SPS/PPS in-band injection) and `capture_select.rs` (`DisplaySource`/`select_backend` SCK↔CGDisplayStream fallback). Workspace 33→46 tests, clippy/fmt clean. **Uncommitted** (no-commit session). Earlier cable-free spike also present: `protocol::nal` (SPS/PPS), `macos-host` `Capturer`/`Encoder` seams + `run_session`/`LatencyStats`, `protocol::framing`.
   - **P3 Wave B (NEEDS CABLE-FREE BUT HANDS-ON-MAC):** B0 gated dep installs (`screencapturekit` 7.0.0, `videotoolbox` 0.18.0 [SUS], in-tree `cg-virtual-display`), SCK + CGDisplayStream capture adapters, VideoToolbox encode adapter (fused zero-copy), spike `main` → `out.h264`, then `ffplay` visual gate (criterion #1). Risk: virtual display may be invisible to SCK *and* CGDisplayStream (Apple FB17797423) — escalate if both fail.
 

@@ -15,7 +15,7 @@ RustScreen de-risks first, then builds. The journey: scaffold the workspace (P0,
 - [ ] **Phase P1: USB Byte Round-Trip** 🔬 - ⚠ DEFERRED (hardware-blocked: needs Pixel 6a on USB). 1 MB echoes both directions; resolves D1 (AOA vs NCM)
 - [ ] **Phase P3: Capture + Hardware-Encode on macOS** 🔬 - Capture virtual display, VideoToolbox H.264 to a playable file (NEXT — Mac-only, unblocked)
 - [ ] **Phase P4: Decode + Present on the Pixel** 🔬 - ⚠ DEFERRED (hardware-blocked: needs Pixel 6a). AMediaCodec decode-to-surface onto `ANativeWindow`
-- [ ] **Phase P5: Live End-to-End Pipeline + Latency** - Wire P1–P4 live; measure glass-to-glass < 50 ms
+- [ ] **Phase P5: Live End-to-End Pipeline + Latency** - Wire P1–P4 live; measure glass-to-glass < 50 ms (cable-free protocol slice planned)
 - [ ] **Phase P6: Touch Back-Channel → macOS Injection** - Tap on phone moves/clicks the Mac cursor via `CGEvent`
 - [ ] **Phase P7: Robustness, UX, Codec Options, Signing + Rust-Purity Upgrades** - Hotplug, HEVC, menu-bar, notarize, pure-Rust adapters
 - [ ] **Phase P8: Packaging, Distribution, OSS Hygiene** - Notarized DMG + release `.apk`, README/LICENSE, clone-to-second-screen
@@ -92,7 +92,9 @@ Plans:
   2. Measured glass-to-glass latency is < 50 ms, with per-stage timings logged and the §2 budget revised with real numbers.
   3. The protocol frame codec round-trips (TDD-verified) and `VideoConfig` (SPS/PPS) is sent on connect and on each keyframe; handshake/resolution negotiation succeeds.
 **Type**: Build (TDD for protocol framing + handshake negotiation).
-**Plans**: TBD
+**Plans:** 1 plan for the cable-free slice (criterion #3 logic only; criteria #1/#2 + live wiring are cable/device-blocked, deferred). In P5-01-PLAN.md.
+Plans:
+- [ ] P5-01-PLAN.md — `protocol::messages` Frame codec layered on `framing` + pure `negotiate()` (TDD, CI-green) behind one serde/postcard dep-gate checkpoint. Live transport / send-on-connect / decode loop / latency harness / touch deferred.
 **UI hint**: yes
 
 ### Phase P6: Touch Back-Channel → macOS Injection
@@ -142,7 +144,7 @@ Plans:
 | P1. USB Byte Round-Trip 🔬 | 0/TBD | ⚠ Deferred (needs phone) | - |
 | P3. Capture + Encode 🔬 | 0/1 | Planned (Mac-only, next) | - |
 | P4. Decode + Present 🔬 | 0/TBD | ⚠ Deferred (needs phone) | - |
-| P5. Live Pipeline + Latency | 0/TBD | Blocked on P1/P4 | - |
+| P5. Live Pipeline + Latency | 0/1 cable-free slice | Cable-free slice planned (live wiring blocked on P1/P4) | - |
 | P6. Touch Injection | 0/TBD | Blocked on P5 | - |
 | P7. Robustness + Purity | 0/TBD | Not started | - |
 | P8. Packaging + Distribution | 0/TBD | Not started | - |
