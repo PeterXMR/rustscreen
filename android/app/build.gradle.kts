@@ -40,6 +40,6 @@ android {
 }
 
 dependencies {
-    implementation("androidx.core:core-ktx:1.12.0")
-    implementation("androidx.appcompat:appcompat:1.6.1")
+    // The thin shell (D7) uses only framework APIs (android.app.Activity, SurfaceView)
+    // and loads the Rust cdylib via JNI — no AndroidX dependencies are required.
 }
