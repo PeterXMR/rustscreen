@@ -1,0 +1,31 @@
+# Rust
+/target
+**/target
+Cargo.lock.bak
+*.rs.bk
+
+# Android
+/android/.gradle
+/android/build
+/android/app/build
+/android/local.properties
+/android/.idea
+**/jniLibs/*/*.so
+*.apk
+*.aab
+*.keystore
+
+# macOS
+.DS_Store
+*.app
+*.dmg
+
+# Spike artifacts
+*.h264
+*.hevc
+*.mp4
+
+# Editor / IDE
+.vscode
+.idea
+*.swp
