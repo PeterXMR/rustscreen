@@ -11,10 +11,11 @@ See: .planning/PROJECT.md (updated 2026-06-02)
 
 ## Current Position
 
-Phase: P3 of P0–P8 (Capture + Hardware-Encode on macOS) — **NEXT unblocked phase**
-Plan: 0 of TBD in current phase
-Status: Ready to plan
-Last activity: 2026-06-03 — P0 merged (PR #1 + cleanup); GSD bootstrap merged (PR #2). **P2 COMPLETE — keystone risk R1 RETIRED**: virtual display created from Rust (CGDirectDisplayID=4, active count 1→2) via ObjC++ shim behind `VirtualDisplay` port (branch `feat/p2-virtual-display`, PR pending).
+Phase: P3 of P0–P8 (Capture + Hardware-Encode on macOS) — **IN PROGRESS (Wave A done, Wave B gated)**
+Plan: P3-01 planned & verified; Wave A executed (cable-free), Wave B awaiting hands-on-Mac session
+Status: Wave A complete (CI-green); Wave B blocked on interactive Mac run (Screen Recording TCC grant + gated dep installs)
+Last activity: 2026-06-03 — **P3 planned via GSD** (RESEARCH.md, CONTEXT.md, PLAN.md, P3-VALIDATION.md; plan-checker PASS after one revision). **P3 Wave A executed** (TDD, cable-free): `encode_vt.rs` (`avcc_to_annex_b` + keyframe SPS/PPS in-band injection) and `capture_select.rs` (`DisplaySource`/`select_backend` SCK↔CGDisplayStream fallback). Workspace 33→46 tests, clippy/fmt clean. **Uncommitted** (no-commit session). Earlier cable-free spike also present: `protocol::nal` (SPS/PPS), `macos-host` `Capturer`/`Encoder` seams + `run_session`/`LatencyStats`, `protocol::framing`.
+  - **P3 Wave B (NEEDS CABLE-FREE BUT HANDS-ON-MAC):** B0 gated dep installs (`screencapturekit` 7.0.0, `videotoolbox` 0.18.0 [SUS], in-tree `cg-virtual-display`), SCK + CGDisplayStream capture adapters, VideoToolbox encode adapter (fused zero-copy), spike `main` → `out.h264`, then `ffplay` visual gate (criterion #1). Risk: virtual display may be invisible to SCK *and* CGDisplayStream (Apple FB17797423) — escalate if both fail.
 
 **Execution order (agreed, non-numeric):** P0 ✓ → P2 ✓ → ~~P1~~ (deferred, hardware-blocked) → **P3** → P4 → P5 → P6 → P7 → P8.
 

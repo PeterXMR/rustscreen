@@ -66,7 +66,9 @@ RustScreen de-risks first, then builds. The journey: scaffold the workspace (P0,
   2. SPS/PPS (codec config) is extracted and logged for downstream decode.
   3. Per-frame encode latency is logged (realtime/low-latency config, no B-frames, zero-copy IOSurface).
 **Type**: Spike. Wrap VideoToolbox/SCK behind own `Encoder`/`Capturer` traits (R3 churn); CGDisplayStream fallback. Expand into a TDD plan after the spike succeeds.
-**Plans**: TBD
+**Plans:** 1 plan (Wave A cable-free TDD + Wave B hands-on-Mac, in P3-01-PLAN.md)
+Plans:
+- [ ] P3-01-PLAN.md — AVCC→Annex-B + capture-select (TDD, CI-green) then SCK/VideoToolbox/CGDisplayStream adapters + spike main + ffplay verify (hands-on-Mac)
 **UI hint**: yes
 
 ### Phase P4: Decode + Present on the Pixel 🔬
@@ -138,7 +140,7 @@ RustScreen de-risks first, then builds. The journey: scaffold the workspace (P0,
 | P0. Workspace Scaffold | — (PR #1) | Complete | 2026-06-02 |
 | P2. Virtual Display (R1 keystone) 🔬 | spike ✓ | Complete | 2026-06-03 |
 | P1. USB Byte Round-Trip 🔬 | 0/TBD | ⚠ Deferred (needs phone) | - |
-| P3. Capture + Encode 🔬 | 0/TBD | Next (Mac-only) | - |
+| P3. Capture + Encode 🔬 | 0/1 | Planned (Mac-only, next) | - |
 | P4. Decode + Present 🔬 | 0/TBD | ⚠ Deferred (needs phone) | - |
 | P5. Live Pipeline + Latency | 0/TBD | Blocked on P1/P4 | - |
 | P6. Touch Injection | 0/TBD | Blocked on P5 | - |
