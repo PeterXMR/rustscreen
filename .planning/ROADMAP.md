@@ -11,10 +11,10 @@ RustScreen de-risks first, then builds. The journey: scaffold the workspace (P0,
 **Execution Order (agreed, non-numeric):** P0 → **P2** → P1 → P3 → P4 → P5 → P6 → P7 → P8. P2 is front-loaded ahead of P1 because it is the keystone risk (R1): if creating a virtual display from Rust fails, the whole architecture changes, so it is attacked first.
 
 - [x] **Phase P0: Workspace Scaffold & Cross-Compilation** - Cargo workspace, cross-compile, thin Kotlin shell, CI (COMPLETE — PR #1)
-- [ ] **Phase P2: Create a Virtual Display from Rust** 🔬 - Keystone risk R1; phantom display via private `CGVirtualDisplay` (NEXT)
-- [ ] **Phase P1: USB Byte Round-Trip** 🔬 - 1 MB echoes both directions over USB-C; resolves D1 (AOA vs NCM)
-- [ ] **Phase P3: Capture + Hardware-Encode on macOS** 🔬 - Capture virtual display, VideoToolbox H.264 to a playable file
-- [ ] **Phase P4: Decode + Present on the Pixel** 🔬 - AMediaCodec decode-to-surface onto `ANativeWindow`
+- [x] **Phase P2: Create a Virtual Display from Rust** 🔬 - Keystone risk R1 RETIRED; phantom display via private `CGVirtualDisplay` (COMPLETE — branch `feat/p2-virtual-display`)
+- [ ] **Phase P1: USB Byte Round-Trip** 🔬 - ⚠ DEFERRED (hardware-blocked: needs Pixel 6a on USB). 1 MB echoes both directions; resolves D1 (AOA vs NCM)
+- [ ] **Phase P3: Capture + Hardware-Encode on macOS** 🔬 - Capture virtual display, VideoToolbox H.264 to a playable file (NEXT — Mac-only, unblocked)
+- [ ] **Phase P4: Decode + Present on the Pixel** 🔬 - ⚠ DEFERRED (hardware-blocked: needs Pixel 6a). AMediaCodec decode-to-surface onto `ANativeWindow`
 - [ ] **Phase P5: Live End-to-End Pipeline + Latency** - Wire P1–P4 live; measure glass-to-glass < 50 ms
 - [ ] **Phase P6: Touch Back-Channel → macOS Injection** - Tap on phone moves/clicks the Mac cursor via `CGEvent`
 - [ ] **Phase P7: Robustness, UX, Codec Options, Signing + Rust-Purity Upgrades** - Hotplug, HEVC, menu-bar, notarize, pure-Rust adapters
@@ -136,11 +136,11 @@ RustScreen de-risks first, then builds. The journey: scaffold the workspace (P0,
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
 | P0. Workspace Scaffold | — (PR #1) | Complete | 2026-06-02 |
-| P2. Virtual Display (R1 keystone) 🔬 | 0/TBD | Not started | - |
-| P1. USB Byte Round-Trip 🔬 | 0/TBD | Not started | - |
-| P3. Capture + Encode 🔬 | 0/TBD | Not started | - |
-| P4. Decode + Present 🔬 | 0/TBD | Not started | - |
-| P5. Live Pipeline + Latency | 0/TBD | Not started | - |
-| P6. Touch Injection | 0/TBD | Not started | - |
+| P2. Virtual Display (R1 keystone) 🔬 | spike ✓ | Complete | 2026-06-03 |
+| P1. USB Byte Round-Trip 🔬 | 0/TBD | ⚠ Deferred (needs phone) | - |
+| P3. Capture + Encode 🔬 | 0/TBD | Next (Mac-only) | - |
+| P4. Decode + Present 🔬 | 0/TBD | ⚠ Deferred (needs phone) | - |
+| P5. Live Pipeline + Latency | 0/TBD | Blocked on P1/P4 | - |
+| P6. Touch Injection | 0/TBD | Blocked on P5 | - |
 | P7. Robustness + Purity | 0/TBD | Not started | - |
 | P8. Packaging + Distribution | 0/TBD | Not started | - |

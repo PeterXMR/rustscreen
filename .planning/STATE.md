@@ -11,14 +11,19 @@ See: .planning/PROJECT.md (updated 2026-06-02)
 
 ## Current Position
 
-Phase: P2 of P0–P8 (Create a Virtual Display from Rust) — **NEXT to execute**
+Phase: P3 of P0–P8 (Capture + Hardware-Encode on macOS) — **NEXT unblocked phase**
 Plan: 0 of TBD in current phase
 Status: Ready to plan
-Last activity: 2026-06-02 — Project ingested; PROJECT/REQUIREMENTS/ROADMAP/STATE initialized. P0 marked complete (PR #1).
+Last activity: 2026-06-03 — P0 merged (PR #1 + cleanup); GSD bootstrap merged (PR #2). **P2 COMPLETE — keystone risk R1 RETIRED**: virtual display created from Rust (CGDirectDisplayID=4, active count 1→2) via ObjC++ shim behind `VirtualDisplay` port (branch `feat/p2-virtual-display`, PR pending).
 
-**Execution order (agreed, non-numeric):** P0 ✓ → **P2** → P1 → P3 → P4 → P5 → P6 → P7 → P8. P2 is front-loaded ahead of P1 because it is keystone risk R1: if creating a virtual display from Rust fails, the whole architecture changes, so attack it first.
+**Execution order (agreed, non-numeric):** P0 ✓ → P2 ✓ → ~~P1~~ (deferred, hardware-blocked) → **P3** → P4 → P5 → P6 → P7 → P8.
 
-Progress: [█░░░░░░░░░] ~11% (1 of 9 phases: P0 complete)
+**⚠ Hardware-blocked (need Pixel 6a on USB — defer until user is back with cable):**
+- **P1** (USB byte round-trip): requires the phone as a USB device for AOA/accessory testing; no emulator substitute.
+- **P4** (decode on Pixel): requires the phone to decode/present.
+Both stay deferred. Continue on Mac-only phases (P3 next, depends on P2's virtual display ID — now available). P5 (live pipeline) and P6 (touch) ultimately need P1/P4, so they wait too.
+
+Progress: [██░░░░░░░░] ~22% (2 of 9 phases: P0, P2 complete)
 
 ## Performance Metrics
 
