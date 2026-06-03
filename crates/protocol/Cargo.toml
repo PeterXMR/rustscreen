@@ -2,5 +2,10 @@
 name = "protocol"
 version = "0.1.0"
 edition = "2021"
+# MSRV: messages.rs uses slice::split_at_checked (stable since 1.80). Pinned so a
+# too-old toolchain fails loudly instead of with a confusing error.
+rust-version = "1.80"
 
 [dependencies]
+serde    = { version = "1", default-features = false, features = ["derive", "alloc"] }
+postcard = { version = "1", default-features = false, features = ["alloc"] }
