@@ -12,6 +12,8 @@ import android.os.Build
 import android.os.Bundle
 import android.os.ParcelFileDescriptor
 import android.util.Log
+import android.view.Surface
+import android.view.SurfaceHolder
 import android.view.SurfaceView
 import java.util.concurrent.atomic.AtomicBoolean
 
@@ -42,7 +44,31 @@ class MainActivity : Activity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        setContentView(SurfaceView(this))
+        // The SurfaceView is the decode-to-surface target (P4 Wave B, D3). Its
+        // SurfaceHolder.Callback hands the Surface to native code the moment it is created;
+        // ANativeWindow_fromSurface in Rust turns it into the AMediaCodec render target.
+        // Glue only — all decode logic lives in the Rust cdylib.
+        val surfaceView = SurfaceView(this)
+        surfaceView.holder.addCallback(object : SurfaceHolder.Callback {
+            override fun surfaceCreated(holder: SurfaceHolder) {
+                Log.i(TAG, "surface created — handing to native decode-to-surface")
+                nativeOnSurface(holder.surface)
+            }
+
+            override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
+                // No-op: the decoder reads dimensions from the H.264 SPS (csd-0); the surface
+                // scales to fit. A resolution change is a Wave-2 (live reconfig) concern.
+            }
+
+            override fun surfaceDestroyed(holder: SurfaceHolder) {
+                // The Surface is going away; tell native code so it can stop rendering into a
+                // dead window. The Rust side releases its ANativeWindow reference and ends the
+                // decode loop.
+                Log.i(TAG, "surface destroyed — notifying native")
+                nativeOnSurfaceDestroyed()
+            }
+        })
+        setContentView(surfaceView)
         nativeInit()
         val filter = IntentFilter(ACTION_USB_PERMISSION)
         // Android 13+ requires an explicit export flag for runtime-registered receivers.
@@ -151,5 +177,14 @@ class MainActivity : Activity() {
 
         @JvmStatic
         external fun nativeOnUsbFd(fd: Int)
+
+        // P4 Wave B (DEC-01): hand the SurfaceView's Surface to the native AMediaCodec
+        // decode-to-surface adapter (ANativeWindow_fromSurface), and signal teardown when
+        // the surface is destroyed.
+        @JvmStatic
+        external fun nativeOnSurface(surface: Surface)
+
+        @JvmStatic
+        external fun nativeOnSurfaceDestroyed()
     }
 }

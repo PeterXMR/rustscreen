@@ -17,10 +17,14 @@ pub mod nal_type {
     pub const NON_IDR_SLICE: u8 = 1;
     /// Coded slice of an IDR picture (a keyframe the decoder can start from).
     pub const IDR_SLICE: u8 = 5;
+    /// Supplemental Enhancement Information.
+    pub const SEI: u8 = 6;
     /// Sequence Parameter Set.
     pub const SPS: u8 = 7;
     /// Picture Parameter Set.
     pub const PPS: u8 = 8;
+    /// Access Unit Delimiter.
+    pub const AUD: u8 = 9;
 }
 
 /// Codec configuration extracted from an H.264 stream.
@@ -91,6 +95,256 @@ pub fn extract_codec_config(stream: &[u8]) -> Option<CodecConfig> {
         sps: sps?,
         pps: pps?,
     })
+}
+
+/// Split an Annex-B elementary stream into access units, one per coded picture.
+///
+/// Each returned slice is one access unit **with** its start codes, ready to hand to a
+/// decoder. A picture's leading non-VCL NALs (SPS/PPS/SEI/AUD) are grouped with the VCL
+/// slice that follows them, so a keyframe's in-band SPS/PPS stay attached to *its own* IDR
+/// — including the second and later keyframes in a stream. A new access unit begins at the
+/// first AU-starting NAL (a VCL slice, or a leading SPS/PPS/SEI/AUD) that follows the VCL
+/// slice of the previous picture. Single-slice pictures are assumed (each VCL slice starts a
+/// new picture); the MVP encoder emits one slice per frame.
+pub fn split_access_units(stream: &[u8]) -> Vec<&[u8]> {
+    let starts = start_code_offsets(stream);
+    if starts.is_empty() {
+        return Vec::new();
+    }
+
+    let mut units = Vec::new();
+    let mut au_start = starts[0];
+    let mut seen_vcl = false;
+    for (i, &off) in starts.iter().enumerate() {
+        let nal_end = starts.get(i + 1).copied().unwrap_or(stream.len());
+        let ty = nal_unit_type(strip_start_code(&stream[off..nal_end]));
+        let is_vcl = matches!(
+            ty,
+            Some(nal_type::IDR_SLICE) | Some(nal_type::NON_IDR_SLICE)
+        );
+        // A NAL that can begin an access unit: a VCL slice, or a leading parameter/marker NAL.
+        let starts_au = is_vcl
+            || matches!(
+                ty,
+                Some(nal_type::SPS)
+                    | Some(nal_type::PPS)
+                    | Some(nal_type::SEI)
+                    | Some(nal_type::AUD)
+            );
+        // Once this picture's slice has been seen, the next AU-starting NAL (the next
+        // picture's leading SPS/PPS/SEI or its slice) opens a new access unit.
+        if seen_vcl && starts_au {
+            units.push(&stream[au_start..off]);
+            au_start = off;
+            seen_vcl = false;
+        }
+        if is_vcl {
+            seen_vcl = true;
+        }
+    }
+    units.push(&stream[au_start..]);
+    units
+}
+
+/// Byte offsets of each Annex-B start code in `stream` (offset at the start code's first
+/// `00 00 01` byte). A 4-byte start code is reported at its `00 00 01`, leaving the leading
+/// extra `00` in the previous NAL's slice — harmless for access-unit slicing.
+fn start_code_offsets(stream: &[u8]) -> Vec<usize> {
+    let mut offsets = Vec::new();
+    let mut i = 0;
+    while i + 3 <= stream.len() {
+        if stream[i] == 0 && stream[i + 1] == 0 && stream[i + 2] == 1 {
+            offsets.push(i);
+            i += 3;
+        } else {
+            i += 1;
+        }
+    }
+    offsets
+}
+
+/// Strip a leading 3- or 4-byte Annex-B start code from a NAL slice, returning the body
+/// (which begins at the NAL header byte).
+fn strip_start_code(nal: &[u8]) -> &[u8] {
+    nal.strip_prefix(&[0, 0, 0, 1])
+        .or_else(|| nal.strip_prefix(&[0, 0, 1]))
+        .unwrap_or(nal)
+}
+
+/// Decode the coded picture `(width, height)` in luma samples from an H.264 SPS NAL.
+///
+/// `sps` is a single SPS NAL unit **without** its start code (it begins at the NAL
+/// header byte), exactly as stored in [`CodecConfig::sps`]. Returns `None` if the slice
+/// is not an SPS or is truncated/malformed. The Pixel's `AMediaCodec` requires explicit
+/// `KEY_WIDTH`/`KEY_HEIGHT` at configure time, so the decode-to-surface adapter reads
+/// them from here rather than relying on the decoder to derive them from `csd-0`.
+///
+/// Parses just enough of the SPS (through `frame_cropping`) per ITU-T H.264 §7.3.2.1.1,
+/// applying the frame-crop offsets so e.g. a coded 2400x1088 reports the displayed
+/// 2400x1080. Crop-unit scaling follows the SPS `chroma_format_idc` (correct for
+/// monochrome, 4:2:0, 4:2:2, and 4:4:4); the MVP encodes 4:2:0 (D2).
+pub fn sps_dimensions(sps: &[u8]) -> Option<(u32, u32)> {
+    if nal_unit_type(sps)? != nal_type::SPS {
+        return None;
+    }
+    // RBSP = SPS payload (after the 1-byte NAL header) with emulation-prevention bytes
+    // removed: any `00 00 03` sequence drops the `03`.
+    let payload = sps.get(1..)?;
+    let mut rbsp = Vec::with_capacity(payload.len());
+    let mut zeros = 0usize;
+    for &b in payload {
+        if zeros >= 2 && b == 0x03 {
+            zeros = 0;
+            continue; // skip emulation-prevention byte
+        }
+        rbsp.push(b);
+        zeros = if b == 0 { zeros + 1 } else { 0 };
+    }
+
+    let mut r = BitReader::new(&rbsp);
+    let profile_idc = r.u(8)?;
+    let _constraint_flags = r.u(8)?;
+    let _level_idc = r.u(8)?;
+    let _seq_parameter_set_id = r.ue()?;
+
+    // High-profile (and friends) carry chroma/bit-depth fields + an optional scaling matrix.
+    let mut chroma_format_idc = 1; // default 4:2:0 for profiles without the field
+    if matches!(
+        profile_idc,
+        100 | 110 | 122 | 244 | 44 | 83 | 86 | 118 | 128 | 138 | 139 | 134 | 135
+    ) {
+        chroma_format_idc = r.ue()?;
+        if chroma_format_idc == 3 {
+            let _separate_colour_plane_flag = r.u(1)?;
+        }
+        let _bit_depth_luma_minus8 = r.ue()?;
+        let _bit_depth_chroma_minus8 = r.ue()?;
+        let _qpprime_y_zero_transform_bypass_flag = r.u(1)?;
+        let seq_scaling_matrix_present_flag = r.u(1)?;
+        if seq_scaling_matrix_present_flag == 1 {
+            let lists = if chroma_format_idc != 3 { 8 } else { 12 };
+            for i in 0..lists {
+                if r.u(1)? == 1 {
+                    // Present scaling list: walk it with the spec's delta loop so the bit
+                    // cursor lands correctly. Size is 16 (4x4, i<6) or 64 (8x8).
+                    let size = if i < 6 { 16 } else { 64 };
+                    let mut last_scale = 8i32;
+                    let mut next_scale = 8i32;
+                    for _ in 0..size {
+                        if next_scale != 0 {
+                            let delta = r.se()?;
+                            next_scale = (last_scale + delta + 256) % 256;
+                        }
+                        if next_scale != 0 {
+                            last_scale = next_scale;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let _log2_max_frame_num_minus4 = r.ue()?;
+    let pic_order_cnt_type = r.ue()?;
+    if pic_order_cnt_type == 0 {
+        let _log2_max_pic_order_cnt_lsb_minus4 = r.ue()?;
+    } else if pic_order_cnt_type == 1 {
+        let _delta_pic_order_always_zero_flag = r.u(1)?;
+        let _offset_for_non_ref_pic = r.se()?;
+        let _offset_for_top_to_bottom_field = r.se()?;
+        let num_ref_frames_in_pic_order_cnt_cycle = r.ue()?;
+        for _ in 0..num_ref_frames_in_pic_order_cnt_cycle {
+            let _offset_for_ref_frame = r.se()?;
+        }
+    }
+
+    let _max_num_ref_frames = r.ue()?;
+    let _gaps_in_frame_num_value_allowed_flag = r.u(1)?;
+    let pic_width_in_mbs_minus1 = r.ue()?;
+    let pic_height_in_map_units_minus1 = r.ue()?;
+    let frame_mbs_only_flag = r.u(1)?;
+    if frame_mbs_only_flag == 0 {
+        let _mb_adaptive_frame_field_flag = r.u(1)?;
+    }
+    let _direct_8x8_inference_flag = r.u(1)?;
+
+    let width = (pic_width_in_mbs_minus1 + 1) * 16;
+    let height = (2 - frame_mbs_only_flag) * (pic_height_in_map_units_minus1 + 1) * 16;
+
+    // Frame cropping trims the coded macroblock grid down to the displayed picture
+    // (e.g. 1088 -> 1080).
+    let (mut crop_l, mut crop_r, mut crop_t, mut crop_b) = (0u32, 0u32, 0u32, 0u32);
+    if r.u(1)? == 1 {
+        crop_l = r.ue()?;
+        crop_r = r.ue()?;
+        crop_t = r.ue()?;
+        crop_b = r.ue()?;
+    }
+    // Crop units are SubWidthC / SubHeightC * (2 - frame_mbs_only) per ITU-T H.264
+    // Table 6-1; monochrome (chroma_format_idc 0) has no chroma arrays so the unit is 1.
+    let (sub_width_c, sub_height_c) = match chroma_format_idc {
+        1 => (2, 2), // 4:2:0
+        2 => (2, 1), // 4:2:2
+        _ => (1, 1), // 4:4:4 (3); monochrome (0) handled below
+    };
+    let (crop_unit_x, crop_unit_y) = if chroma_format_idc == 0 {
+        (1, 2 - frame_mbs_only_flag)
+    } else {
+        (sub_width_c, sub_height_c * (2 - frame_mbs_only_flag))
+    };
+
+    let width = width.checked_sub((crop_l + crop_r) * crop_unit_x)?;
+    let height = height.checked_sub((crop_t + crop_b) * crop_unit_y)?;
+    Some((width, height))
+}
+
+/// Minimal MSB-first bit reader over an RBSP byte slice, with the H.264 Exp-Golomb
+/// codings (`ue`/`se`). Every read returns `None` on exhaustion so a truncated SPS
+/// degrades to `None` instead of panicking.
+struct BitReader<'a> {
+    data: &'a [u8],
+    bit_pos: usize,
+}
+
+impl<'a> BitReader<'a> {
+    fn new(data: &'a [u8]) -> Self {
+        BitReader { data, bit_pos: 0 }
+    }
+
+    /// Read `n` bits (n <= 32) MSB-first as an unsigned value.
+    fn u(&mut self, n: u32) -> Option<u32> {
+        let mut v = 0u32;
+        for _ in 0..n {
+            let byte = self.data.get(self.bit_pos / 8)?;
+            let bit = (byte >> (7 - (self.bit_pos % 8))) & 1;
+            v = (v << 1) | bit as u32;
+            self.bit_pos += 1;
+        }
+        Some(v)
+    }
+
+    /// Unsigned Exp-Golomb `ue(v)`.
+    fn ue(&mut self) -> Option<u32> {
+        let mut leading_zeros = 0u32;
+        while self.u(1)? == 0 {
+            leading_zeros += 1;
+            if leading_zeros > 31 {
+                return None; // malformed / runaway
+            }
+        }
+        if leading_zeros == 0 {
+            return Some(0);
+        }
+        let rest = self.u(leading_zeros)?;
+        Some((1u32 << leading_zeros) - 1 + rest)
+    }
+
+    /// Signed Exp-Golomb `se(v)`.
+    fn se(&mut self) -> Option<i32> {
+        let k = self.ue()?;
+        let val = k.div_ceil(2) as i32;
+        Some(if k % 2 == 0 { -val } else { val })
+    }
 }
 
 /// Whether `stream` contains an IDR slice (a keyframe / random-access point).
@@ -551,5 +805,94 @@ mod tests {
         let au = to_annex_b_access_unit(&picture, false, Some(&config())).unwrap();
         assert_eq!(au, picture);
         assert_eq!(extract_codec_config(&au), None);
+    }
+
+    #[test]
+    fn sps_dimensions_high_profile_with_crop() {
+        // The real SPS from the P3 `out.h264` acceptance clip: High profile (100),
+        // level 5.0, coded 2400x1088 with a 4:2:0 bottom crop down to 2400x1080.
+        let sps = [
+            0x27, 0x64, 0x00, 0x32, 0xac, 0x56, 0x80, 0x25, 0x80, 0x89, 0xf9, 0x50,
+        ];
+        assert_eq!(sps_dimensions(&sps), Some((2400, 1080)));
+    }
+
+    #[test]
+    fn sps_dimensions_rejects_non_sps_nal() {
+        // A PPS NAL (type 8), not an SPS — no dimensions to read.
+        assert_eq!(sps_dimensions(&[0x28, 0xee, 0x3c, 0xb0]), None);
+    }
+
+    #[test]
+    fn sps_dimensions_rejects_truncated() {
+        // Truncated SPS (header + profile only) must not panic; returns None.
+        assert_eq!(sps_dimensions(&[0x67, 0x64]), None);
+    }
+
+    // Map each access unit to the sequence of NAL types it contains (for AU-split asserts).
+    fn au_nal_types(au: &[u8]) -> Vec<u8> {
+        iter_nal_units(au).filter_map(nal_unit_type).collect()
+    }
+
+    #[test]
+    fn split_access_units_keeps_each_keyframes_sps_pps_with_its_idr() {
+        // [SPS1 PPS1 IDR1][P][SPS2 PPS2 IDR2] — every keyframe's parameter sets must stay
+        // attached to ITS IDR, not the preceding picture. Header bytes: 0x67=SPS, 0x68=PPS,
+        // 0x65=IDR, 0x41=non-IDR slice.
+        let mut s = Vec::new();
+        for nal in [
+            &[0x67, 0x11][..], // SPS1
+            &[0x68, 0x22][..], // PPS1
+            &[0x65, 0x33][..], // IDR1
+            &[0x41, 0x44][..], // P
+            &[0x67, 0x55][..], // SPS2
+            &[0x68, 0x66][..], // PPS2
+            &[0x65, 0x77][..], // IDR2
+        ] {
+            s.extend_from_slice(&SC4);
+            s.extend_from_slice(nal);
+        }
+
+        let units = split_access_units(&s);
+        let types: Vec<Vec<u8>> = units.iter().map(|u| au_nal_types(u)).collect();
+        assert_eq!(
+            types,
+            vec![
+                vec![nal_type::SPS, nal_type::PPS, nal_type::IDR_SLICE],
+                vec![nal_type::NON_IDR_SLICE],
+                vec![nal_type::SPS, nal_type::PPS, nal_type::IDR_SLICE],
+            ]
+        );
+    }
+
+    #[test]
+    fn split_access_units_groups_leading_sei_with_following_idr() {
+        // The P3 encoder emits SPS+PPS+SEI before each IDR; the SEI must group with the IDR.
+        let mut s = Vec::new();
+        for nal in [
+            &[0x67, 0x11][..], // SPS
+            &[0x68, 0x22][..], // PPS
+            &[0x06, 0x05][..], // SEI
+            &[0x65, 0x33][..], // IDR
+        ] {
+            s.extend_from_slice(&SC4);
+            s.extend_from_slice(nal);
+        }
+        let units = split_access_units(&s);
+        assert_eq!(units.len(), 1);
+        assert_eq!(
+            au_nal_types(units[0]),
+            vec![
+                nal_type::SPS,
+                nal_type::PPS,
+                nal_type::SEI,
+                nal_type::IDR_SLICE
+            ]
+        );
+    }
+
+    #[test]
+    fn split_access_units_empty_stream_is_empty() {
+        assert!(split_access_units(&[]).is_empty());
     }
 }

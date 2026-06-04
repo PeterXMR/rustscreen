@@ -56,11 +56,16 @@ jobs:
       - name: Build android-client .so
         env:
           ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+        # `--features live-decode` is REQUIRED for the shipped/device .so: it compiles the
+        # `AMediaCodec` adapter *and* the `nativeOnSurface`/`nativeOnSurfaceDestroyed` JNI
+        # entries that the Kotlin `SurfaceHolder.Callback` calls unconditionally. Without it
+        # those symbols are absent and the app crashes on launch with `UnsatisfiedLinkError`.
+        # (The host `cargo build --workspace` job above stays feature-free / dependency-free.)
         run: >
           cargo ndk
           -t arm64-v8a
           -o android/app/src/main/jniLibs
-          build -p android-client
+          build -p android-client --features live-decode
 
   # P8 packaging smoke: build the release host binary and assemble the UNSIGNED .app
   # bundle so the packaging path stays buildable. Additive and non-gating — it does

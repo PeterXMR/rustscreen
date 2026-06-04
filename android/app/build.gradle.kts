@@ -1,3 +1,5 @@
+import java.util.Properties
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
@@ -39,7 +41,7 @@ android {
     // so `./gradlew assembleRelease` still works locally for smoke-testing without
     // secrets. NEVER commit a real keystore or its passwords. See packaging/android.
     val keystorePropsFile = rootProject.file("keystore.properties")
-    val keystoreProps = java.util.Properties().apply {
+    val keystoreProps = Properties().apply {
         if (keystorePropsFile.exists()) {
             keystorePropsFile.inputStream().use { load(it) }
         }

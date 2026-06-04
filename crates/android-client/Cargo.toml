@@ -6,6 +6,14 @@ edition = "2021"
 [lib]
 crate-type = ["cdylib"]
 
+[features]
+# P4 Wave B (DEC-01): the `ndk-sys` `AMediaCodec` decode-to-surface adapter + the
+# `nativeOnSurface` JNI entry. Gated so the *default* `cargo build --workspace` pulls no
+# `ndk`/`ndk-sys`, exactly like `macos-host`'s `live-usb`/`live-inject`. The Wave-A
+# host-tested `decode` port/session is always built (no feature needed). Enable with
+# `cargo ndk -t arm64-v8a build -p android-client --features live-decode`.
+live-decode = ["dep:ndk-sys"]
+
 [dependencies]
 # Shared length-framing codec — reused verbatim by echo_loop (host-testable, not
 # cfg-gated) so the phone and the macOS host stay wire-compatible.
@@ -16,7 +24,8 @@ log = "0.4"
 
 [target.'cfg(target_os = "android")'.dependencies]
 jni = "0.21"
-ndk = "0.9"
-ndk-sys = "0.6"
-ndk-context = "0.1"
 android_logger = "0.14"
+# `ndk-sys` is the thin FFI the Wave-B `AMediaCodec` decode-to-surface adapter binds
+# against; optional + only pulled in by the `live-decode` feature so the default build
+# stays dependency-free (the Wave-A port/session need none of it).
+ndk-sys = { version = "0.6", optional = true }
