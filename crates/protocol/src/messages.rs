@@ -587,6 +587,26 @@ mod tests {
     }
 
     #[test]
+    fn decode_video_header_length_boundary() {
+        // Pin the exact off-by-one at the 9-byte header boundary that `split_at_checked` guards:
+        // 8 bytes (one short) MUST be rejected; exactly 9 bytes is a valid header with an EMPTY
+        // NAL. Guards the `split_at_checked` length check against a future <,<=,>= slip.
+        match Frame::decode(tag::VIDEO, &[0u8; 8]) {
+            Err(MessageError::ShortVideoHeader) => {}
+            other => panic!("8-byte payload: expected ShortVideoHeader, got {other:?}"),
+        }
+        assert_eq!(
+            Frame::decode(tag::VIDEO, &[0u8; 9]).unwrap(),
+            Frame::Video {
+                pts_us: 0,
+                keyframe: false,
+                nal: vec![],
+            },
+            "exactly 9 bytes is a header-only frame with an empty NAL"
+        );
+    }
+
+    #[test]
     fn decode_rejects_malformed_postcard() {
         // Garbage bytes for the Handshake struct must not panic; surfaces as a
         // Decode error that carries the underlying postcard error.
@@ -743,5 +763,27 @@ mod tests {
         let h = host(2400, 1080, 60, vec![VideoCodec::H264]);
         let c = client(2400, 1080, 60, vec![VideoCodec::H264]);
         assert!(negotiate(&h, &c).is_ok());
+    }
+
+    #[test]
+    fn negotiate_rejects_empty_host_codecs() {
+        // A malformed handshake offering no codecs at all must surface NoCommonCodec, not panic
+        // or pick a bogus default. The `.find()` over an empty host list yields None.
+        let h = host(2400, 1080, 60, vec![]);
+        let c = client(2400, 1080, 60, vec![VideoCodec::H264]);
+        assert_eq!(negotiate(&h, &c), Err(NegotiationError::NoCommonCodec));
+    }
+
+    #[test]
+    fn negotiate_version_check_precedes_codec_check() {
+        // When BOTH the version mismatches AND there is no common codec, the documented
+        // resolution order requires VersionMismatch to win (it's checked first). Pins precedence.
+        let mut h = host(2400, 1080, 60, vec![VideoCodec::Hevc]);
+        h.protocol_version = 2;
+        let c = client(2400, 1080, 60, vec![VideoCodec::H264]);
+        assert_eq!(
+            negotiate(&h, &c),
+            Err(NegotiationError::VersionMismatch { host: 2, client: 1 })
+        );
     }
 }

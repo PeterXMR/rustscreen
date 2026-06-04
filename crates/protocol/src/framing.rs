@@ -151,4 +151,24 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
         assert!(buf.is_empty(), "nothing should be written on rejection");
     }
+
+    #[test]
+    fn read_accepts_length_exactly_max() {
+        // Companion to read_rejects_length_over_max (MAX+1): a frame declaring exactly
+        // MAX_FRAME_LEN must be ACCEPTED. Pins the boundary as inclusive — the check is
+        // `len > MAX_FRAME_LEN`, so a future `>=` slip would wrongly reject the largest valid
+        // frame (a 1080p keyframe near the cap). Round-trips a real MAX-length payload.
+        let payload = vec![0xABu8; MAX_FRAME_LEN as usize];
+        let mut buf = Vec::new();
+        write_frame(&mut buf, 5, &payload).unwrap();
+        let mut cur = Cursor::new(buf);
+        let (tag, got) = read_frame(&mut cur).unwrap();
+        assert_eq!(tag, 5);
+        assert_eq!(got.len(), MAX_FRAME_LEN as usize);
+        // Assert CONTENTS too, not just length — a wrong-but-right-sized buffer must not slip.
+        assert!(
+            got.iter().all(|&b| b == 0xAB),
+            "payload bytes must round-trip intact"
+        );
+    }
 }

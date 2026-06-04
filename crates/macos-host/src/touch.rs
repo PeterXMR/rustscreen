@@ -434,6 +434,62 @@ mod tests {
             Err(MapError::NotFinite)
         );
     }
+
+    #[test]
+    fn host_map_round_trips_topleft_pixels_no_flip() {
+        // Guards the HOST mapping against a Y-flip / offset regression: a pixel normalized the
+        // way the Android client does it must map back to the same pixel — same top-left/y-down
+        // convention, NO axis flip, origin offset preserved.
+        //
+        // LIMITATION (honest): `android-client` is cdylib-only, so we can't import its real
+        // `normalize`; `android_normalize` below MIRRORS its documented formula. This therefore
+        // pins the *host* inverse (the fragile direction — the host has more arithmetic + a
+        // negative origin) but cannot catch drift on the Android side. Android-side drift is
+        // covered by android-client's own `normalize` tests; the host additionally has a grep
+        // gate forbidding `1.0 -` in this file. Keep this replica in sync with
+        // `android_client::touch::normalize`.
+        fn android_normalize(coord: f32, extent: f32) -> f32 {
+            (coord / extent).clamp(0.0, 1.0)
+        }
+        // Include a negative-origin rect so the offset (not just the scale) is exercised.
+        for rect in [
+            DisplayRect {
+                x: 0.0,
+                y: 0.0,
+                w: 2400.0,
+                h: 1080.0,
+            },
+            DisplayRect {
+                x: -2400.0,
+                y: 0.0,
+                w: 2400.0,
+                h: 1080.0,
+            },
+        ] {
+            for &(px, py) in &[
+                (0.0f32, 0.0f32),
+                (600.0, 810.0),
+                (1200.0, 540.0),
+                (2400.0, 1080.0),
+            ] {
+                let nx = android_normalize(px, rect.w as f32);
+                let ny = android_normalize(py, rect.h as f32);
+                let got = map_normalized_to_global(nx, ny, rect).unwrap();
+                // global == rect.origin + pixel (no flip); tolerance covers f32 rounding.
+                assert!(
+                    (got.x - (rect.x + px as f64)).abs() < 0.5,
+                    "x round-trip failed: px={px} rect.x={} got={}",
+                    rect.x,
+                    got.x
+                );
+                assert!(
+                    (got.y - (rect.y + py as f64)).abs() < 0.5,
+                    "y round-trip failed (Y-flip?): py={py} got={}",
+                    got.y
+                );
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -627,6 +683,28 @@ mod fsm_tests {
                     }
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn fsm_up_releases_active_so_next_pointer_can_start() {
+        // After a gesture ends with Up, `active` must be cleared so a DIFFERENT pointer can
+        // own the next gesture. Without this, a finished finger would wedge the FSM and a new
+        // touch (id=2) would be silently dropped as a "second pointer". Guards that regression.
+        let mut sm = PointerStateMachine::default();
+        sm.step(&ev(1, TouchPhase::Down, 0.1, 0.1), RECT).unwrap();
+        sm.step(&ev(1, TouchPhase::Up, 0.1, 0.1), RECT).unwrap();
+        // A brand-new pointer id must now be accepted and emit a Down.
+        let next = sm.step(&ev(2, TouchPhase::Down, 0.5, 0.5), RECT).unwrap();
+        assert_eq!(
+            next,
+            Some(PointerAction::Down {
+                at: CgPoint {
+                    x: 1200.0,
+                    y: 540.0
+                }
+            }),
+            "after Up, a new pointer must be able to start a gesture"
         );
     }
 }
