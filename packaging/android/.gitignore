@@ -1,0 +1,4 @@
+# Never commit a real keystore or signing properties that may land in this dir.
+*.keystore
+*.jks
+keystore.properties

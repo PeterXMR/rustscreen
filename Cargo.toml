@@ -1,3 +1,48 @@
 [workspace]
 resolver = "2"
 members = ["crates/protocol", "crates/macos-host", "crates/cg-virtual-display", "crates/android-client"]
+
+# Release profile for the shippable binaries (P8 packaging).
+#
+# These are conservative, distribution-oriented defaults — they affect ONLY
+# `cargo build --release` (the default debug build is unaffected). Note that CI
+# DOES exercise this profile: the `package-macos` job builds the host with
+# `cargo build --release` via packaging/macos/make_app.sh. Tuned for a small,
+# fast host binary that ships inside the notarized `.app`/DMG (see
+# `packaging/macos/`) and a small Android `.so`.
+#
+#   opt-level = "z"  — optimize for size; the host is latency-bound on the GPU/USB
+#                      path, not on scalar CPU work, so size beats a marginal speedup.
+#   lto = true       — cross-crate inlining; meaningfully smaller binaries.
+#   codegen-units = 1 — best optimization at the cost of slower release builds.
+#   strip = true     — drop symbols from the shipped binary (debuginfo not shipped).
+#
+# `panic` is intentionally left at the default `unwind`. It is a whole-build
+# profile knob that Cargo cannot override per package, and `android-client`
+# relies on `std::panic::catch_unwind` at its `extern "system"` JNI boundary
+# (BL-03) to turn a panic into a graceful error instead of aborting the host
+# Android process. Forcing `panic = "abort"` here would silently defeat that
+# guard. An `unwind` panic in the macOS host still prints and exits non-zero, so
+# a fatal bug is still surfaced.
+#
+# If you need profiling symbols on a release build, override locally with
+# `cargo build --release --config 'profile.release.strip=false'` rather than
+# editing this file.
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+
+# Shared package metadata consumed by the packaging scripts (packaging/) so the
+# app name / bundle id / version live in ONE place. Plain TOML the scripts read;
+# Cargo itself ignores [workspace.metadata.*].
+[workspace.metadata.rustscreen]
+app-name = "RustScreen"
+bundle-id = "com.rustscreen.host"
+# Keep in sync with crates/macos-host/Cargo.toml `version` and
+# android/app/build.gradle.kts `versionName`.
+version = "0.1.0"
+# Apple Developer "Developer ID Application" identity + notarization profile are
+# NOT hard-coded here — they are supplied at package time via env vars so no
+# secrets land in the repo. See packaging/macos/README.md.

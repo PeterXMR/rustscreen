@@ -225,6 +225,66 @@ non-macOS host — the macOS-only crates won't compile there.
 
 ---
 
+## Packaging & distribution
+
+> **Scaffold only.** The packaging path is wired and lint-clean, but it is **not yet
+> validated end-to-end** (no Apple Developer signing identity / Android release
+> keystore has been run through it), and because the live pipeline isn't finished, a
+> packaged app launches but does **not** yet produce a second screen. The scripts
+> exist so distribution is ready the moment the pipeline lands.
+
+A release build uses a size-optimized, LTO'd, stripped profile
+(`[profile.release]` in the workspace [`Cargo.toml`](Cargo.toml)).
+
+### macOS — `.app` bundle + notarized DMG
+
+Scripts live in [`packaging/macos/`](packaging/macos/) (see its
+[README](packaging/macos/README.md) for the full flow and credentials setup):
+
+```bash
+packaging/macos/make_app.sh --features live-capture,live-usb,live-inject  # → dist/RustScreen.app
+SIGN_IDENTITY="Developer ID Application: … (TEAMID)" NOTARY_PROFILE="rustscreen-notary" \
+  packaging/macos/sign_and_notarize.sh                                     # sign (hardened runtime) + notarize + staple
+packaging/macos/make_dmg.sh                                                # → dist/RustScreen-<version>.dmg
+```
+
+No secrets are committed — the signing identity and notary credentials are supplied
+at run time via env vars / a keychain profile.
+
+- **Distribution is via a notarized DMG, not the Mac App Store**: the virtual display
+  uses the **private** `CGVirtualDisplay` API, which MAS forbids. Notarization checks
+  signing + malware (not private-API use), so a signed binary is expected to notarize
+  (risk register R8).
+- **Open question — the hardened-runtime entitlement set.**
+  [`packaging/macos/entitlements.plist`](packaging/macos/entitlements.plist) is a
+  documented *first guess* to be pinned down empirically once the host runs under the
+  hardened runtime (does the private `CGVirtualDisplay` symbol resolve?). Screen
+  recording and Accessibility are runtime **TCC permissions**, not entitlements.
+
+### Android — release APK + signing
+
+Scripts live in [`packaging/android/`](packaging/android/) (see its
+[README](packaging/android/README.md)):
+
+```bash
+packaging/android/build_release_apk.sh   # release .so via cargo-ndk → assembleRelease
+```
+
+Release signing reads credentials from environment variables (CI) or a git-ignored
+`android/keystore.properties` (see
+[`keystore.properties.example`](packaging/android/keystore.properties.example)); with
+neither configured it falls back to the debug key (smoke-test only, never
+distribute). No keystore or password is committed.
+
+The **USB-accessory permission** is already declared in the manifest
+(`<uses-feature android:hardware.usb.accessory required="true">` + the
+`USB_ACCESSORY_ATTACHED` intent-filter). There is no install-time `<uses-permission>`
+to add — Android grants access through a runtime per-connection dialog; tick "use by
+default" to suppress it on reconnect. Details in the
+[Android packaging README](packaging/android/README.md).
+
+---
+
 ## Status & roadmap
 
 RustScreen de-risks first, then builds. This project has a strong norm against
@@ -243,7 +303,7 @@ while the phone-gated parts are deferred.
 | **P5** | Build | Wire the full live pipeline; measure glass-to-glass latency | 🟡 In progress — protocol frame codec + handshake `negotiate()` merged; **live wiring & the <50 ms measurement are not done** |
 | **P6** | Build | Touch back-channel → CGEvent injection on macOS | 🟡 In progress — both ends' cable-free logic merged (mapping + FSM + injector + Android normalization); **live wiring & the Kotlin capture shim are deferred (phone)** |
 | **P7** | Build | Robustness, UX, menu-bar app, HEVC, signing, Rust-purity upgrades | ⬜ Not started |
-| **P8** | Build | Packaging, distribution, OSS hygiene (this slice) | 🟡 In progress — OSS hygiene (this README + LICENSE + CONTRIBUTING + CI badge); packaging not done |
+| **P8** | Build | Packaging, distribution, OSS hygiene (this slice) | 🟡 In progress — OSS hygiene (README + LICENSE + CONTRIBUTING + CI badge) **and** packaging scaffolding (macOS `.app`/codesign/notarize/DMG scripts, Android release profile + signing config, release-build CI job) landed; not yet validated against a real signing identity, and final clone-to-second-screen acceptance waits on P4/P5 |
 
 **Bottom line:** you can build both halves and run all the pure-Rust tests today, and
 the individually de-risked spikes (display, USB, capture+encode) work on the Mac. You
