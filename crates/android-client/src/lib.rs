@@ -6,6 +6,11 @@
 /// android-only `AccessoryFdTransport`. `echo_loop` is NOT cfg-gated so CI exercises it.
 pub mod transport;
 
+/// Touch input core (P6): pure conversion of a raw Android `MotionEvent` sample into a
+/// normalized `protocol::messages::TouchEvent` — the inverse of the host's coordinate
+/// mapping. NOT cfg-gated, so CI exercises it (the JNI/Kotlin capture shim is glue).
+pub mod touch;
+
 #[cfg(target_os = "android")]
 mod android {
     use jni::objects::JClass;
@@ -35,6 +40,17 @@ mod android {
         fd: jni::sys::jint,
     ) {
         use std::os::fd::RawFd;
+        // Defensively reject a negative fd before the unsafe wrap below: `File::from_raw_fd`
+        // is undefined behavior on an invalid fd (the `FromRawFd` contract requires a valid,
+        // open fd) and its `Drop` would `close()` it. This makes the wrap sound regardless of
+        // what the JNI caller passes — a future caller, a test, or a platform-specific
+        // ParcelFileDescriptor that yields a bad fd. (In the normal flow the Kotlin side has
+        // already screened it; detachFd() on a live descriptor returns a valid fd and throws
+        // IllegalStateException if already closed — it does not return -1.) (BL-04)
+        if fd < 0 {
+            log::error!("nativeOnUsbFd: refusing invalid accessory fd {fd} (detachFd failed?)");
+            return;
+        }
         log::info!("nativeOnUsbFd: received accessory fd {fd}, starting echo loop");
         // BL-03: a Rust `panic!` unwinding across the `extern "system"` FFI boundary is
         // undefined behavior. Catch any panic here (and any echo error), log it, and return

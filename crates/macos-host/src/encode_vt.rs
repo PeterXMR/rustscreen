@@ -31,7 +31,7 @@ const START_CODE: [u8; 4] = [0, 0, 0, 1];
 ///
 /// AVCC frames each NAL unit as a big-endian length prefix followed by that many bytes
 /// of NAL data. The prefix width is `nal_length_size` bytes — `lengthSizeMinusOne + 1`
-/// from the `avcC` configuration record, legally **1, 2, or 4** (VideoToolbox commonly
+/// from the `avcC` configuration record, legally **1, 2, 3, or 4** (VideoToolbox commonly
 /// emits 4, but it must not be assumed; the Wave B adapter reads it from the format
 /// description and passes it here). This rewrites each unit as `00 00 00 01` + NAL data,
 /// concatenated in order, yielding a buffer `protocol::nal` can parse.
@@ -41,12 +41,18 @@ const START_CODE: [u8; 4] = [0, 0, 0, 1];
 /// zero-length unit is skipped rather than aborting the remaining buffer; an empty
 /// input yields an empty output.
 ///
-/// `nal_length_size` must be in `1..=4`; other values are a caller bug (debug-asserted).
+/// `nal_length_size` MUST be in `1..=4` (an `avcC` `lengthSizeMinusOne` of 0..=3). Any
+/// other value is a caller-contract violation and returns an empty `Vec` — critically,
+/// `nal_length_size == 0` is REJECTED here rather than entering the loop, because with a
+/// zero-width prefix `i += nal_length_size` never advances and the `len == 0` skip would
+/// spin forever (a real release-build hang — a `debug_assert!` alone is compiled out).
 pub fn avcc_to_annex_b(avcc: &[u8], nal_length_size: usize) -> Vec<u8> {
-    debug_assert!(
-        (1..=4).contains(&nal_length_size),
-        "AVCC nal_length_size must be 1..=4 (from avcC lengthSizeMinusOne), got {nal_length_size}"
-    );
+    if !(1..=4).contains(&nal_length_size) {
+        // Caller-contract violation. Returning empty (rather than panicking across a
+        // possible FFI boundary, or — for 0 — looping forever) is the safe library
+        // behavior; the contract is documented above.
+        return Vec::new();
+    }
     let mut out = Vec::with_capacity(avcc.len());
     let mut i = 0usize;
     while i + nal_length_size <= avcc.len() {
@@ -133,6 +139,17 @@ mod tests {
     #[test]
     fn avcc_empty_input_yields_empty_output() {
         assert!(avcc_to_annex_b(&[], 4).is_empty());
+    }
+
+    #[test]
+    fn avcc_invalid_length_size_returns_empty_without_hanging() {
+        // Regression: `nal_length_size == 0` previously only had a `debug_assert!` guard,
+        // so a RELEASE build would spin forever (i never advances, len==0 skip loops). It
+        // must now return empty for any size outside 1..=4 — and crucially terminate.
+        // (If this regressed, the test would hang rather than fail — that's the symptom.)
+        assert!(avcc_to_annex_b(&[1, 2, 3, 4, 5], 0).is_empty());
+        assert!(avcc_to_annex_b(&[1, 2, 3, 4, 5], 5).is_empty());
+        assert!(avcc_to_annex_b(&[1, 2, 3, 4, 5], usize::MAX).is_empty());
     }
 
     #[test]
