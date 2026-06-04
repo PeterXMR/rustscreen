@@ -103,6 +103,10 @@ pub enum Control {
     Resume,
     /// Graceful disconnect.
     Bye,
+    /// Liveness probe. Carries no semantics — the host emits it on an idle stream so a
+    /// peer disconnect surfaces as a write error even when no video frames are flowing
+    /// (a static screen produces none). Consumers treat it as a no-op.
+    Heartbeat,
 }
 
 /// The phase of a touch pointer's lifecycle.
@@ -500,6 +504,7 @@ mod tests {
             Control::Pause,
             Control::Resume,
             Control::Bye,
+            Control::Heartbeat,
         ] {
             let frame = Frame::Control(c.clone());
             assert_eq!(roundtrip(&frame), frame);

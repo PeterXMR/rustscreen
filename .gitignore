@@ -32,3 +32,6 @@ keystore.properties
 .vscode
 .idea
 *.swp
+
+# Claude Code local state (personal settings + agent worktrees — never committed)
+.claude/

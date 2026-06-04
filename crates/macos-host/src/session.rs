@@ -23,7 +23,8 @@ use std::io::{self, Read, Write};
 
 use protocol::{
     messages::{
-        AgreedConfig, ClientCaps, Frame, Handshake, MessageError, NegotiationError, VideoCodec,
+        AgreedConfig, ClientCaps, Control, Frame, Handshake, MessageError, NegotiationError,
+        VideoCodec,
     },
     nal::{self, CodecConfig},
     protocol_version,
@@ -31,7 +32,7 @@ use protocol::{
 
 use crate::{
     capture::Capturer,
-    encode::{Encoder, LatencyStats},
+    encode::{EncodedFrame, Encoder, LatencyStats},
 };
 
 // ---------------------------------------------------------------------------
@@ -237,44 +238,128 @@ pub fn run_send_session(
             break;
         };
         let encoded = encoder.encode(&captured);
-
-        // Extract and cache codec config from the first keyframe.
-        if summary.codec_config.is_none() && encoded.keyframe {
-            summary.codec_config = nal::extract_codec_config(&encoded.annex_b);
-        }
-
-        // Send VideoConfig on every keyframe (connect AND subsequent IDR recovery).
-        if encoded.keyframe {
-            if let Some(ref cfg) = summary.codec_config {
-                // Build the sps_pps Annex-B stream from the cached CodecConfig.
-                let sps_pps = codec_config_to_annex_b(cfg);
-                Frame::VideoConfig {
-                    codec: agreed.codec,
-                    sps_pps,
-                }
-                .write_to(&mut counting)?;
-            }
-        }
-
-        // Send the access unit.
-        Frame::Video {
-            pts_us: encoded.pts_us,
-            keyframe: encoded.keyframe,
-            nal: encoded.annex_b,
-        }
-        .write_to(&mut counting)?;
-
-        // Flush each frame so it reaches the peer instead of stalling in nusb's
-        // userspace write buffer (C-01). `CountingWrite` forwards flush to the
-        // transport; no-op for TcpStream/loopback, essential for the AOA bulk path.
-        counting.flush()?;
-
-        summary.latency.record(encoded.encode_micros);
+        let encode_micros = encoded.encode_micros;
+        // Shared wire contract (config-on-keyframe + Video + flush) lives in send_encoded_frame.
+        send_encoded_frame(
+            encoded,
+            &mut counting,
+            &mut summary.codec_config,
+            agreed.codec,
+        )?;
+        summary.latency.record(encode_micros);
         summary.frames += 1;
     }
 
     summary.bytes_sent = counting.total;
     Ok(summary)
+}
+
+/// Drive a host send-session from a channel of **pre-encoded** frames.
+///
+/// This is the live-pipeline counterpart to [`run_send_session`]. ScreenCaptureKit +
+/// VideoToolbox deliver encoded frames asynchronously via a delegate callback (push), which
+/// does not fit the pull-based `Capturer`/`Encoder` split. So the live bin's `SCStreamOutput`
+/// delegate pushes each [`EncodedFrame`] into `frames`, and this function pulls them off the
+/// channel and applies the **identical wire contract** as [`run_send_session`]: handshake,
+/// then `Frame::VideoConfig` before every keyframe (connect + each IDR), `Frame::Video` per
+/// access unit, flushing each frame (C-01). The loop ends when the channel closes (every
+/// sender dropped, i.e. capture stopped) or when the transport errors (peer disconnect).
+///
+/// While idle it sends a `Control::Heartbeat` every [`STREAM_HEARTBEAT_INTERVAL`]: a static
+/// screen produces no ScreenCaptureKit frames, so without this probe a peer disconnect would
+/// go undetected (no write is attempted) and the loop would block forever. The heartbeat
+/// write surfaces the disconnect as an I/O error; the phone ignores non-`Bye` control frames,
+/// so it is decoder-neutral.
+pub fn run_stream_session(
+    frames: std::sync::mpsc::Receiver<EncodedFrame>,
+    transport: &mut (impl Read + Write),
+    offer: Handshake,
+) -> Result<SendSessionSummary, SessionError> {
+    run_stream_session_inner(frames, transport, offer, STREAM_HEARTBEAT_INTERVAL)
+}
+
+/// Interval between `Control::Heartbeat` liveness probes on an idle stream.
+const STREAM_HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Implementation of [`run_stream_session`], parameterised by the heartbeat interval so tests
+/// can drive the idle/disconnect path without waiting a real second.
+fn run_stream_session_inner(
+    frames: std::sync::mpsc::Receiver<EncodedFrame>,
+    transport: &mut (impl Read + Write),
+    offer: Handshake,
+    heartbeat: std::time::Duration,
+) -> Result<SendSessionSummary, SessionError> {
+    use std::sync::mpsc::RecvTimeoutError;
+
+    let agreed = perform_handshake(transport, offer)?;
+
+    let mut counting = CountingWrite::new(transport);
+    let mut summary = SendSessionSummary {
+        frames: 0,
+        bytes_sent: 0,
+        codec_config: None,
+        latency: LatencyStats::new(),
+        agreed_config: agreed.clone(),
+    };
+
+    loop {
+        match frames.recv_timeout(heartbeat) {
+            Ok(encoded) => {
+                let encode_micros = encoded.encode_micros;
+                send_encoded_frame(
+                    encoded,
+                    &mut counting,
+                    &mut summary.codec_config,
+                    agreed.codec,
+                )?;
+                summary.latency.record(encode_micros);
+                summary.frames += 1;
+            }
+            // No frame within the heartbeat window — the screen may be static. Probe the
+            // transport so a peer disconnect is detected promptly instead of blocking
+            // forever; a write/flush error here means the peer is gone (handled by `?`).
+            Err(RecvTimeoutError::Timeout) => {
+                Frame::Control(Control::Heartbeat).write_to(&mut counting)?;
+                counting.flush()?;
+            }
+            // Every sender dropped → capture stopped: end the stream cleanly.
+            Err(RecvTimeoutError::Disconnected) => break,
+        }
+    }
+
+    summary.bytes_sent = counting.total;
+    Ok(summary)
+}
+
+/// Send one encoded access unit on the wire, applying the shared keyframe/config contract:
+/// cache the codec config from the first keyframe seen, emit `Frame::VideoConfig` before
+/// every keyframe, then the `Frame::Video`, then flush (C-01). Shared by [`run_send_session`]
+/// and [`run_stream_session`] so the wire contract lives in exactly one place.
+fn send_encoded_frame(
+    encoded: EncodedFrame,
+    out: &mut CountingWrite<'_>,
+    codec_config: &mut Option<CodecConfig>,
+    codec: VideoCodec,
+) -> Result<(), SessionError> {
+    if codec_config.is_none() && encoded.keyframe {
+        *codec_config = nal::extract_codec_config(&encoded.annex_b);
+    }
+    if encoded.keyframe {
+        if let Some(cfg) = codec_config.as_ref() {
+            let sps_pps = codec_config_to_annex_b(cfg);
+            Frame::VideoConfig { codec, sps_pps }.write_to(out)?;
+        }
+    }
+    Frame::Video {
+        pts_us: encoded.pts_us,
+        keyframe: encoded.keyframe,
+        nal: encoded.annex_b,
+    }
+    .write_to(out)?;
+    // Flush each frame so it reaches the peer instead of stalling in nusb's userspace write
+    // buffer (C-01). No-op for TcpStream/loopback; essential for the AOA bulk path.
+    out.flush()?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -503,6 +588,62 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Disconnect-after-handshake transport — models a peer that dies once the
+    // session is live. Reads serve the scripted handshake reply; the first write
+    // attempted AFTER that reply has been consumed fails, as a real AOA/TCP write
+    // would once the cable is pulled. Used to prove the idle heartbeat surfaces a
+    // disconnect instead of blocking forever.
+    // -----------------------------------------------------------------------
+
+    struct DisconnectAfterHandshake {
+        read_src: Cursor<Vec<u8>>,
+        handshake_read: bool,
+    }
+
+    impl DisconnectAfterHandshake {
+        fn new(peer_reply: Vec<u8>) -> Self {
+            Self {
+                read_src: Cursor::new(peer_reply),
+                handshake_read: false,
+            }
+        }
+    }
+
+    impl Read for DisconnectAfterHandshake {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let n = self.read_src.read(buf)?;
+            // Once the client reply has been fully consumed, the handshake is done and
+            // any later write is a post-handshake (e.g. heartbeat) write.
+            if self.read_src.position() as usize >= self.read_src.get_ref().len() {
+                self.handshake_read = true;
+            }
+            Ok(n)
+        }
+    }
+
+    impl Write for DisconnectAfterHandshake {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            if self.handshake_read {
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "peer disconnected",
+                ));
+            }
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            if self.handshake_read {
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "peer disconnected",
+                ));
+            }
+            Ok(())
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // Helpers for building scripted peer replies
     // -----------------------------------------------------------------------
 
@@ -531,6 +672,115 @@ mod tests {
 
     fn default_client_reply() -> Vec<u8> {
         make_client_reply(protocol_version(), 2400, 1080, 60, vec![VideoCodec::H264])
+    }
+
+    // -----------------------------------------------------------------------
+    // run_stream_session — push→pull bridge for the live SCK+VT pipeline.
+    // The live bin's SCStreamOutput delegate is the producer (push); this
+    // consumes pre-encoded frames from an mpsc channel and drives the same
+    // wire contract as run_send_session. Cable-free, host-tested.
+    // -----------------------------------------------------------------------
+
+    fn keyframe_encoded(pts_us: u64) -> EncodedFrame {
+        let mut annex_b = Vec::new();
+        annex_b.extend_from_slice(&[0, 0, 0, 1, 0x67, 0x42, 0x1F]); // SPS
+        annex_b.extend_from_slice(&[0, 0, 0, 1, 0x68, 0xCE]); // PPS
+        annex_b.extend_from_slice(&[0, 0, 0, 1, 0x65, 0xAA]); // IDR
+        EncodedFrame {
+            pts_us,
+            keyframe: true,
+            encode_micros: 7,
+            annex_b,
+        }
+    }
+
+    fn delta_encoded(pts_us: u64) -> EncodedFrame {
+        EncodedFrame {
+            pts_us,
+            keyframe: false,
+            encode_micros: 3,
+            annex_b: vec![0, 0, 0, 1, 0x61, 0xBB],
+        }
+    }
+
+    #[test]
+    fn stream_session_sends_videoconfig_before_each_keyframe() {
+        // The live pipeline pushes pre-encoded frames into a channel; run_stream_session
+        // handshakes, then sends VideoConfig before every keyframe and a Video frame for
+        // every access unit — the same wire contract as run_send_session, but driven by a
+        // channel rather than a pull-based Capturer (the SCK+VT pipeline is push-based).
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(keyframe_encoded(0)).unwrap();
+        tx.send(delta_encoded(16_666)).unwrap();
+        tx.send(keyframe_encoded(33_332)).unwrap();
+        drop(tx); // close the channel → stream loop ends cleanly (capture stopped)
+
+        let mut t = SplitTransport::new(default_client_reply());
+        let summary = run_stream_session(rx, &mut t, default_offer()).unwrap();
+
+        assert_eq!(summary.frames, 3);
+        assert_eq!(summary.agreed_config.codec, VideoCodec::H264);
+        assert!(summary.codec_config.is_some());
+
+        let sent = t.decode_sent_frames();
+        // Handshake offer, then: VideoConfig+Video (kf), Video (delta), VideoConfig+Video (kf).
+        assert_eq!(sent.len(), 6, "got: {sent:?}");
+        assert!(matches!(sent[0], Frame::Handshake(_)));
+        assert!(matches!(sent[1], Frame::VideoConfig { .. }));
+        assert!(matches!(sent[2], Frame::Video { keyframe: true, .. }));
+        assert!(matches!(
+            sent[3],
+            Frame::Video {
+                keyframe: false,
+                ..
+            }
+        ));
+        assert!(matches!(sent[4], Frame::VideoConfig { .. }));
+        assert!(matches!(sent[5], Frame::Video { keyframe: true, .. }));
+    }
+
+    /// C-01 on the live path: `run_stream_session` must flush every write before it blocks
+    /// on a read and before it returns, exactly like `run_send_session`. Pins the invariant
+    /// directly to the streaming function so a future divergence from the shared helper is
+    /// caught here, not only via `run_send_session`.
+    #[test]
+    fn stream_session_flushes_writes_before_reads_and_at_end() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(keyframe_encoded(0)).unwrap();
+        tx.send(delta_encoded(16_666)).unwrap();
+        drop(tx); // close channel → loop ends cleanly without any heartbeat write
+
+        let mut t = FlushAuditTransport::new(default_client_reply());
+        let summary = run_stream_session(rx, &mut t, default_offer()).unwrap();
+
+        assert_eq!(summary.frames, 2);
+        assert_eq!(
+            t.unflushed, 0,
+            "stream session returned with unflushed bytes — frames would stall in the write buffer"
+        );
+    }
+
+    /// Liveness: when no frames arrive (static screen) the session must not block forever.
+    /// The heartbeat probe writes to the transport, which surfaces a peer disconnect as an
+    /// error and ends the session instead of hanging.
+    #[test]
+    fn stream_session_heartbeat_detects_idle_disconnect() {
+        // Keep the sender alive so the channel stays open (Timeout, not Disconnected) but
+        // never send a frame — the only writes are heartbeats.
+        let (_tx, rx) = std::sync::mpsc::channel::<EncodedFrame>();
+        let mut t = DisconnectAfterHandshake::new(default_client_reply());
+
+        let result = run_stream_session_inner(
+            rx,
+            &mut t,
+            default_offer(),
+            std::time::Duration::from_millis(5),
+        );
+
+        assert!(
+            result.is_err(),
+            "an idle session over a dead transport must detect the disconnect via heartbeat, not hang"
+        );
     }
 
     // -----------------------------------------------------------------------
