@@ -81,6 +81,10 @@ rustscreen/
 **All platforms:**
 - Rust stable (`rustup` installs it; `rust-toolchain.toml` pins the version)
 
+**macOS host (display capture) only:**
+- The **Screen & System Audio Recording** permission, granted to the terminal you run the
+  capture spikes from (any terminal app). See [Building and running → macOS capture spikes](#macos-capture-spikes-p3--requires-the-screen--system-audio-recording-permission).
+
 **Android native library only:**
 - Android NDK r25 (component `25.2.9519653`)
 - `cargo-ndk`: `cargo install cargo-ndk`
@@ -110,6 +114,30 @@ cargo test
 # Run the host binary (prints version; full pipeline comes in P5)
 cargo run -p macos-host
 ```
+
+#### macOS capture spikes (P3) — requires the **Screen & System Audio Recording** permission
+
+The display-capture tools are built behind the off-by-default `live-capture` feature:
+
+```bash
+cargo build -p macos-host --features live-capture   # builds p3_probe + p3_capture
+target/debug/p3_probe      # is the virtual display visible to ScreenCaptureKit?
+target/debug/p3_capture    # does ScreenCaptureKit deliver frames from it?
+```
+
+**Required permission:** macOS gates *all* display-pixel access (ScreenCaptureKit) behind
+**System Settings → Privacy & Security → Screen & System Audio Recording**. Without it these
+tools fail with a TCC error / empty display list. This is unavoidable for any screen-capture or
+second-monitor app (DisplayLink, Duet, etc. all need it); there is no third-party way around it
+on current macOS. The app only ever captures the *virtual* display it creates — never your real
+screen — but macOS's permission is coarse (one toggle for any display capture).
+
+- Grant it to **the terminal app you run the binary from** — *any* terminal works (Terminal.app,
+  iTerm, Warp, …). Nothing in the code is terminal-specific; macOS attributes the grant to
+  whichever process launches the binary.
+- **The grant only takes effect after you fully quit (⌘Q) and reopen that terminal.**
+- In the shipped product this permission is requested by `RustScreen.app` itself (once), not a
+  terminal.
 
 ### Android native library (.so)
 

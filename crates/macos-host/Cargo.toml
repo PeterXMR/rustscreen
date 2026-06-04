@@ -22,15 +22,63 @@ live-usb = ["dep:nusb"]
 # here: this crate's CI runs on `macos-latest`, never with `--all-features`, and this
 # feature is only ever built/run on a Mac (where the cursor APIs exist).
 live-inject = ["dep:core-graphics"]
+# Live macOS capture + hardware-encode (P3 Wave B, hands-on-Mac) — pulls the all-objc2
+# (madsmtm) Apple-FFI family and compiles the ScreenCaptureKit capture adapter, the
+# CGDisplayStream fallback, the VideoToolbox encoder, and the p3_* spike bins. Off by default,
+# so the default cross-platform build / Linux CI never pulls any of these macOS-only crates.
+# Stack chosen after a supply-chain review (see DEP-DECISION.md): the objc2 family is the
+# canonical, most-trusted, pure-Rust Apple-FFI foundation (zero RUSTSEC advisories), and every
+# buffer type flows natively end-to-end (SCKit CMSampleBuffer → CVPixelBuffer → VideoToolbox).
+# Versions pinned to the 0.3 / 0.6 lines: objc2 framework crates ship breaking changes on each
+# 0.x minor, so a caret-minor pin stays on the audited line (never auto-jumps 0.3 → 0.4).
+# Like `live-inject`, this feature is macOS-only: the objc2 framework crates do NOT compile off
+# macOS, so do NOT enable it in a cross-platform `--all-features` build. CI builds it on
+# macos-latest only (never `--all-features` on a Linux leg).
+live-capture = [
+    "dep:objc2",
+    "dep:objc2-foundation",
+    "dep:block2",
+    "dep:dispatch2",
+    "dep:objc2-screen-capture-kit",
+    "dep:objc2-video-toolbox",
+    "dep:objc2-core-media",
+    "dep:objc2-core-video",
+    "dep:objc2-io-surface",
+    "dep:objc2-core-graphics",
+    "dep:cg-virtual-display",
+]
 
 [dependencies]
 protocol = { path = "../protocol" }
 log = "0.4"
 nusb = { version = "0.2", optional = true }
 core-graphics = { version = "0.24", optional = true }
+objc2 = { version = "0.6", optional = true }
+objc2-foundation = { version = "0.3", optional = true }
+block2 = { version = "0.6", optional = true }
+dispatch2 = { version = "0.3", optional = true }
+objc2-screen-capture-kit = { version = "0.3", optional = true }
+objc2-video-toolbox = { version = "0.3", optional = true }
+objc2-core-media = { version = "0.3", optional = true }
+objc2-core-video = { version = "0.3", optional = true }
+objc2-io-surface = { version = "0.3", optional = true }
+objc2-core-graphics = { version = "0.3", optional = true }
+cg-virtual-display = { version = "0.1.0", path = "../cg-virtual-display", optional = true }
 
 # P6 live cursor-injection smoke bin — compiled only under --features live-inject so the
 # default `cargo build --workspace` never pulls core-graphics.
 [[bin]]
 name = "p6_inject"
 required-features = ["live-inject"]
+
+# P3 capture probe — first hands-on-Mac milestone: bring up the P2 virtual display and ask
+# ScreenCaptureKit whether it can SEE it (the keystone FB17797423 risk) before building the
+# full encode pipeline. Compiled only under --features live-capture.
+[[bin]]
+name = "p3_probe"
+required-features = ["live-capture"]
+
+# P3 capture spike — proves SCStreamOutput delivers frames from the virtual display.
+[[bin]]
+name = "p3_capture"
+required-features = ["live-capture"]
