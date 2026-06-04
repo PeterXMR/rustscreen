@@ -190,10 +190,14 @@ screen — but macOS's permission is coarse (one toggle for any display capture)
 export ANDROID_HOME="$HOME/Library/Android/sdk"
 export ANDROID_NDK_HOME="$ANDROID_HOME/ndk/25.2.9519653"
 
-cargo ndk -t arm64-v8a -o android/app/src/main/jniLibs build -p android-client
+cargo ndk -t arm64-v8a -o android/app/src/main/jniLibs build -p android-client --features live-decode
 ```
 
 This places `libandroid_client.so` into `android/app/src/main/jniLibs/arm64-v8a/`.
+`--features live-decode` is required: it compiles the `AMediaCodec` decode-to-surface
+adapter and the `nativeOnSurface` JNI entry the Kotlin shell calls. Building without it
+produces a `.so` missing those symbols, so the app crashes on launch with
+`UnsatisfiedLinkError`.
 
 ### Android APK
 
