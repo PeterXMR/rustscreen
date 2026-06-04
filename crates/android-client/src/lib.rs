@@ -23,6 +23,11 @@ pub mod decode;
 /// `DecodeSession` / `VideoDecoder` port. NOT cfg-gated — CI exercises it in full.
 pub mod session;
 
+/// Surface↔USB rendezvous (P5 live pipeline): the one-way `WindowSlot` handoff that lets the
+/// USB decode-session thread wait for the render surface, which arrives on a separate Android
+/// callback in either order. Generic + NOT cfg-gated, so CI host-tests the handoff logic.
+pub mod rendezvous;
+
 /// P4 Wave B (DEC-01): the concrete `ndk-sys` `AMediaCodec` decode-to-surface adapter
 /// implementing the [`decode::VideoDecoder`] port. Hardware-blocked (needs the Pixel 6a),
 /// so it is `#[cfg(target_os = "android")]` AND behind the `live-decode` feature — the
@@ -51,9 +56,17 @@ mod android {
 
     /// Called from Kotlin after `UsbManager.openAccessory()` → `ParcelFileDescriptor` →
     /// `detachFd()`. Rust takes sole ownership of the detached accessory fd (T-P1-03 —
-    /// single `from_raw_fd`, no double-close) and runs the Wave-A-tested [`echo_loop`]
-    /// (echo each length-framed message back, until EOF). This entry is only the fd→Rust seam;
-    /// the echo logic lives in the platform-agnostic core (RESEARCH Pattern 3 / D0).
+    /// single `from_raw_fd`, no double-close). With `--features live-decode` (the shipped
+    /// app) this runs the **live decode session**: send the connect-hello, rendezvous with
+    /// the render surface, then drive [`crate::session::run_session`], which decodes each
+    /// received `Frame::Video` onto that surface until the host disconnects. Without
+    /// `live-decode` it falls back to the P1 [`crate::transport::echo_loop`] so a bare build
+    /// still links. This entry is only the fd→Rust seam; the session/echo logic lives in the
+    /// platform-agnostic core.
+    ///
+    /// The call BLOCKS for the whole session (Kotlin runs it on a dedicated thread and
+    /// releases its "session active" latch when this returns), so the session must run inline
+    /// here rather than on a spawned thread.
     #[no_mangle]
     pub extern "system" fn Java_com_rustscreen_client_MainActivity_nativeOnUsbFd(
         _env: JNIEnv,
@@ -63,46 +76,21 @@ mod android {
         use std::os::fd::RawFd;
         // Defensively reject a negative fd before the unsafe wrap below: `File::from_raw_fd`
         // is undefined behavior on an invalid fd (the `FromRawFd` contract requires a valid,
-        // open fd) and its `Drop` would `close()` it. This makes the wrap sound regardless of
-        // what the JNI caller passes — a future caller, a test, or a platform-specific
-        // ParcelFileDescriptor that yields a bad fd. (In the normal flow the Kotlin side has
-        // already screened it; detachFd() on a live descriptor returns a valid fd and throws
-        // IllegalStateException if already closed — it does not return -1.) (BL-04)
+        // open fd) and its `Drop` would `close()` it. (In the normal flow the Kotlin side has
+        // already screened it; detachFd() on a live descriptor returns a valid fd.) (BL-04)
         if fd < 0 {
             log::error!("nativeOnUsbFd: refusing invalid accessory fd {fd} (detachFd failed?)");
             return;
         }
-        log::info!("nativeOnUsbFd: received accessory fd {fd}, starting echo loop");
-        // BL-03: a Rust `panic!` unwinding across the `extern "system"` FFI boundary is
-        // undefined behavior. Catch any panic here (and any echo error), log it, and return
-        // cleanly so the unwind never crosses back into the JVM. `AssertUnwindSafe` is sound:
-        // on a caught panic we do not observe `transport` again — `catch_unwind` drops it,
-        // closing the fd exactly once.
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            // SAFETY: `fd` was detached on the Kotlin side via ParcelFileDescriptor.detachFd(),
-            // transferring sole ownership to this call; we wrap it exactly once. `fd >= 0` was
-            // checked above, satisfying the FromRawFd "valid, open fd" contract.
-            let mut transport =
-                unsafe { crate::transport::AccessoryFdTransport::from_raw_fd(fd as RawFd) };
-            // Connect handshake: announce readiness the instant we own the accessory fd by
-            // sending a one-frame "hello" (`protocol::HELLO_TAG`, empty payload). The host
-            // blocks reading this BEFORE it writes, so its first bulk-OUT write can't land
-            // before our reader is live and be dropped by the gadget (startup-ordering deadlock
-            // seen on the Pixel 6a). Device→host bulk IN buffers reliably, so sending first is
-            // safe even if the host reads a moment later.
-            use std::io::Write as _;
-            if let Err(e) = protocol::framing::write_frame(&mut transport, protocol::HELLO_TAG, &[])
-                .and_then(|()| transport.flush())
-            {
-                log::error!("nativeOnUsbFd: failed to send connect hello: {e}");
-                return Ok(0); // matches echo_loop's Ok(total) shape; nothing echoed
-            }
-            log::info!("nativeOnUsbFd: sent connect hello, entering echo loop");
-            crate::transport::echo_loop(&mut transport)
-        }));
+        // BL-03: never let a Rust `panic!` unwind across the `extern "system"` FFI boundary.
+        // Catch it (and any session/echo error), log it, and return cleanly. `AssertUnwindSafe`
+        // is sound: on a caught panic we do not observe the transport again — `catch_unwind`
+        // drops it, closing the fd exactly once.
+        let result =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_usb_fd(fd as RawFd)));
         match result {
-            Ok(Ok(total)) => log::info!("nativeOnUsbFd: echo loop ended, {total} bytes echoed"),
-            Ok(Err(e)) => log::error!("nativeOnUsbFd: echo loop error: {e}"),
+            Ok(Ok(n)) => log::info!("nativeOnUsbFd: session ended cleanly ({n} frames)"),
+            Ok(Err(e)) => log::error!("nativeOnUsbFd: session error: {e}"),
             Err(panic) => {
                 let msg = panic
                     .downcast_ref::<&str>()
@@ -114,34 +102,101 @@ mod android {
         }
     }
 
-    /// Set when the surface is destroyed so the decode loop ends instead of rendering into
-    /// a dead window. The decode loop checks it between access units (cooperative stop).
-    #[cfg(feature = "live-decode")]
-    static SURFACE_GONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-    /// Handle to the running decode thread. A surface re-create (rapid surfaceDestroyed ->
-    /// surfaceCreated from a rotation or app resume) stops and JOINs the previous decode
-    /// loop before starting a new one, so two decoders never render into the same
-    /// SurfaceView and no stale loop renders into a destroyed window.
-    #[cfg(feature = "live-decode")]
-    static DECODE_THREAD: std::sync::Mutex<Option<std::thread::JoinHandle<()>>> =
-        std::sync::Mutex::new(None);
-
-    /// P4 Wave B (DEC-01): called from Kotlin `SurfaceHolder.Callback.surfaceCreated` with
-    /// the `SurfaceView`'s `Surface`. We turn it into an `ANativeWindow`
-    /// (`ANativeWindow_fromSurface`) and hand it to the [`crate::mediacodec`] decode-to-
-    /// surface adapter (D3 — frames render onto this surface with no CPU copy).
+    /// Wrap the detached accessory `fd` and send the connect-hello — shared by both
+    /// [`run_usb_fd`] variants so the handshake-ordering invariant lives in exactly one place.
     ///
-    /// For the Wave-B acceptance spike the decode *source* is the P3 `out.h264` pushed to
-    /// the device (`adb push out.h264 /data/local/tmp/out.h264`); it self-configures via
-    /// in-band SPS/PPS, so no `VideoConfig` frame is needed. (When P5/C2 lands the live RX
-    /// loop, `nativeOnUsbFd` feeds the same [`crate::decode::DecodeSession`] from the wire
-    /// instead — the adapter and session are unchanged.)
+    /// The host blocks reading this one-frame hello (`protocol::HELLO_TAG`, empty payload)
+    /// BEFORE it writes its handshake offer, so its first bulk-OUT write can't be dropped by the
+    /// gadget before our reader is live (the startup-ordering deadlock seen on the Pixel 6a).
+    /// Sending first is safe because device→host bulk-IN buffers reliably.
+    fn open_with_hello(
+        fd: std::os::fd::RawFd,
+    ) -> Result<crate::transport::AccessoryFdTransport, Box<dyn std::error::Error>> {
+        use std::io::Write as _;
+        // SAFETY: `fd` was detached on the Kotlin side (sole ownership) and is >= 0 (checked in
+        // nativeOnUsbFd before this is reached); wrapped exactly once.
+        let mut transport = unsafe { crate::transport::AccessoryFdTransport::from_raw_fd(fd) };
+        protocol::framing::write_frame(&mut transport, protocol::HELLO_TAG, &[])?;
+        transport.flush()?;
+        Ok(transport)
+    }
+
+    /// Live decode session (shipped app): connect-hello → rendezvous for the render surface →
+    /// [`crate::session::run_session`] decoding to that surface until the host disconnects
+    /// (EOF) or errors.
+    #[cfg(feature = "live-decode")]
+    fn run_usb_fd(fd: std::os::fd::RawFd) -> Result<u64, Box<dyn std::error::Error>> {
+        use crate::decode::DecodeSession;
+        use crate::mediacodec::MediaCodecDecoder;
+        use crate::session::run_session;
+        use protocol::messages::{ClientCaps, VideoCodec};
+        use std::time::Duration;
+
+        log::info!("nativeOnUsbFd: received accessory fd {fd}, starting live decode session");
+        let mut transport = open_with_hello(fd)?;
+        log::info!("nativeOnUsbFd: sent connect hello; waiting for the render surface…");
+
+        // Rendezvous: the surface arrives on a separate callback, possibly after the fd.
+        let window = SURFACE_SLOT
+            .take_blocking(Duration::from_secs(10))
+            .ok_or("no render surface within 10s (SurfaceView never created?)")?;
+        log::info!("nativeOnUsbFd: surface acquired; decoding to surface");
+
+        let mut decoder = MediaCodecDecoder::new(window);
+        let mut session = DecodeSession::new();
+        // Advertise the device's H.264 decode ceiling rather than a single hardcoded mode.
+        // negotiate() only requires the client max to be >= the host's offered resolution, and
+        // the decoder sizes itself from the stream's in-band SPS regardless of what we advertise
+        // here — so a generous 4K ceiling (well within the Pixel 6a's hardware AVC decoder)
+        // accepts any realistic host offer instead of failing negotiation on anything but
+        // 2400×1080. Refresh stays at the panel's real 60 Hz. (Per-surface negotiation — reading
+        // the actual ANativeWindow dimensions — is deferred to the hotplug ladder item.)
+        let caps = ClientCaps {
+            protocol_version: protocol::protocol_version(),
+            max_width: 3840,
+            max_height: 2160,
+            max_refresh_hz: 60,
+            codecs: vec![VideoCodec::H264],
+        };
+        let summary = run_session(&mut transport, &caps, &mut session, &mut decoder)?;
+        log::info!(
+            "nativeOnUsbFd: {} frames received, {} decoded, {} keyframes",
+            summary.frames_received,
+            summary.decoded_count,
+            summary.keyframe_count
+        );
+        Ok(summary.frames_received)
+    }
+
+    /// P1 fallback (no `live-decode`): echo each framed message back until EOF, so a bare
+    /// `cargo build -p android-client` (without the decode stack) still links this JNI entry.
+    #[cfg(not(feature = "live-decode"))]
+    fn run_usb_fd(fd: std::os::fd::RawFd) -> Result<u64, Box<dyn std::error::Error>> {
+        log::info!(
+            "nativeOnUsbFd: received accessory fd {fd}, starting echo loop (no live-decode)"
+        );
+        let mut transport = open_with_hello(fd)?;
+        log::info!("nativeOnUsbFd: sent connect hello, entering echo loop");
+        Ok(crate::transport::echo_loop(&mut transport)?)
+    }
+
+    /// The render surface, deposited by `nativeOnSurface` and consumed by the USB decode
+    /// session thread ([`run_usb_fd`]). A one-way handoff so the session starts regardless of
+    /// whether the surface or the USB fd arrived first (when the app is launched by plugging
+    /// in, the fd can arrive before the `SurfaceView`'s surface is created).
+    #[cfg(feature = "live-decode")]
+    static SURFACE_SLOT: crate::rendezvous::WindowSlot<crate::mediacodec::NativeWindow> =
+        crate::rendezvous::WindowSlot::new();
+
+    /// Called from Kotlin `SurfaceHolder.Callback.surfaceCreated` with the `SurfaceView`'s
+    /// `Surface`. Turns it into an `ANativeWindow` (`ANativeWindow_fromSurface`) and deposits
+    /// it in [`SURFACE_SLOT`] for the USB decode session to claim. Returns immediately so the
+    /// UI thread never blocks — the blocking decode runs on the USB thread in [`run_usb_fd`].
     ///
-    /// FFI discipline mirrors `nativeOnUsbFd`: the `ANativeWindow` is acquired here on the
-    /// JNI thread (the `JNIEnv`/`Surface` ref are thread-local and must not escape), then
-    /// the blocking decode loop runs on a dedicated thread so the UI thread never stalls.
-    /// Any panic is caught so it never unwinds across the `extern "system"` boundary.
+    /// FFI discipline: the `ANativeWindow` is acquired here on the JNI thread (the
+    /// `JNIEnv`/`Surface` ref are thread-local and must not escape); `NativeWindow` then owns
+    /// its own `ANativeWindow` reference and is `Send`, so the slot can hand it to the session
+    /// thread.
     #[cfg(feature = "live-decode")]
     #[no_mangle]
     pub extern "system" fn Java_com_rustscreen_client_MainActivity_nativeOnSurface(
@@ -149,28 +204,10 @@ mod android {
         _class: JClass,
         surface: jni::sys::jobject,
     ) {
-        use crate::decode::DecodeSession;
-        use crate::mediacodec::{MediaCodecDecoder, NativeWindow};
+        use crate::mediacodec::NativeWindow;
 
-        // A surface is (re)created. If a previous decode thread is still running (a rapid
-        // surfaceDestroyed -> surfaceCreated from a rotation or app resume), stop and JOIN it
-        // before clearing the flag, so we never have two decode loops on the same SurfaceView
-        // nor a stale loop rendering into the now-destroyed window.
-        SURFACE_GONE.store(true, std::sync::atomic::Ordering::SeqCst);
-        if let Ok(mut guard) = DECODE_THREAD.lock() {
-            if let Some(prev) = guard.take() {
-                let _ = prev.join();
-            }
-        }
-        // The old loop has exited; allow the new one to run.
-        SURFACE_GONE.store(false, std::sync::atomic::Ordering::SeqCst);
-
-        // Acquire the native window on the JNI thread. `surface` is a local ref valid for
-        // the duration of this call; `ANativeWindow_fromSurface` takes its own reference,
-        // so the resulting `NativeWindow` outlives the local ref and is safe to move to the
-        // decode thread.
-        // SAFETY: `env` is the live JNI env for this thread; `surface` is the non-null
-        // Surface JNI passed us (Kotlin only calls this with a valid created surface).
+        // SAFETY: `env` is the live JNI env for this thread; `surface` is the non-null Surface
+        // JNI passed us (Kotlin only calls this with a valid created surface).
         let window = match unsafe { NativeWindow::from_surface(env.get_raw(), surface) } {
             Some(w) => w,
             None => {
@@ -178,110 +215,25 @@ mod android {
                 return;
             }
         };
-        log::info!("nativeOnSurface: acquired ANativeWindow, spawning decode thread");
-
-        // The decode loop blocks (file read + per-frame submit + render), so run it off the
-        // UI thread. The window's sole ownership moves into the thread.
-        let spawn = std::thread::Builder::new()
-            .name("decode-surface".into())
-            .spawn(move || {
-                // BL-03 discipline: never let a panic unwind across the FFI boundary (this
-                // closure is the thread root, but a panic here would also abort cleanly —
-                // catch it, log it, return).
-                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    let mut decoder = MediaCodecDecoder::new(window);
-                    let mut session = DecodeSession::new();
-                    run_test_h264(&mut session, &mut decoder)
-                }));
-                match result {
-                    Ok(Ok(n)) => {
-                        log::info!("nativeOnSurface: decode loop ended, {n} access units rendered")
-                    }
-                    Ok(Err(e)) => log::error!("nativeOnSurface: decode error: {e}"),
-                    Err(panic) => {
-                        let msg = panic
-                            .downcast_ref::<&str>()
-                            .map(|s| s.to_string())
-                            .or_else(|| panic.downcast_ref::<String>().cloned())
-                            .unwrap_or_else(|| "unknown panic payload".to_string());
-                        log::error!(
-                            "nativeOnSurface: caught panic, not unwinding across FFI: {msg}"
-                        );
-                    }
-                }
-            });
-        match spawn {
-            Ok(handle) => {
-                if let Ok(mut guard) = DECODE_THREAD.lock() {
-                    *guard = Some(handle);
-                }
-            }
-            Err(e) => log::error!("nativeOnSurface: failed to spawn decode thread: {e}"),
-        }
+        log::info!("nativeOnSurface: surface ready — depositing for the USB decode session");
+        SURFACE_SLOT.put(window);
     }
 
-    /// P4 Wave B: called from `SurfaceHolder.Callback.surfaceDestroyed`. Signals the decode
-    /// loop to stop (cooperatively, between access units) so it stops handing frames to a
-    /// dead window; the decode thread then drops its `MediaCodecDecoder`, which stops +
-    /// deletes the codec and releases the `ANativeWindow` reference.
+    /// Called from `SurfaceHolder.Callback.surfaceDestroyed`. Retracts any window still sitting
+    /// in [`SURFACE_SLOT`] so a session that has not yet claimed it cannot configure the decoder
+    /// onto a now-dead surface (the destroy-before-take race on the launch-by-plug path), and so
+    /// a surface deposited but never consumed does not leak its `ANativeWindow` reference.
+    ///
+    /// For the MVP single-connect pipeline a surface lost *after* a session already claimed it
+    /// still ends only when the host disconnects (USB EOF) — robust mid-session surface-recreate
+    /// is deferred to the hotplug ladder item.
     #[cfg(feature = "live-decode")]
     #[no_mangle]
     pub extern "system" fn Java_com_rustscreen_client_MainActivity_nativeOnSurfaceDestroyed(
         _env: JNIEnv,
         _class: JClass,
     ) {
-        log::info!("nativeOnSurfaceDestroyed: signalling decode loop to stop");
-        SURFACE_GONE.store(true, std::sync::atomic::Ordering::SeqCst);
-    }
-
-    /// Read the P3 acceptance clip `out.h264`, split it into per-picture access units (via
-    /// [`protocol::nal::split_access_units`]), and drive the [`crate::decode::DecodeSession`]
-    /// (which configures the decoder from the in-band SPS/PPS and submits each AU for
-    /// decode-to-surface).
-    ///
-    /// This is the Wave-B spike feeder; the live wire feeder (C2) replaces it. We split the
-    /// elementary stream at each picture boundary so each `Frame::Video` is one access unit
-    /// the session can timestamp and submit.
-    #[cfg(feature = "live-decode")]
-    fn run_test_h264(
-        session: &mut crate::decode::DecodeSession,
-        decoder: &mut dyn crate::decode::VideoDecoder,
-    ) -> Result<u64, Box<dyn std::error::Error>> {
-        use protocol::messages::Frame;
-        use protocol::nal;
-
-        // adb push out.h264 /data/local/tmp/out.h264
-        const TEST_CLIP: &str = "/data/local/tmp/out.h264";
-        let bytes = std::fs::read(TEST_CLIP)
-            .map_err(|e| format!("reading {TEST_CLIP}: {e} (adb push out.h264 there first)"))?;
-        log::info!(
-            "nativeOnSurface: read {} bytes of H.264 from {TEST_CLIP}",
-            bytes.len()
-        );
-
-        // ~60 fps cadence for the spike (presentation timestamps in microseconds). The
-        // surface renders as fast as releaseOutputBuffer(render=true) presents; the pts is
-        // carried through to the codec for ordering.
-        const FRAME_INTERVAL_US: u64 = 16_666;
-
-        let mut count: u64 = 0;
-        let mut pts_us: u64 = 0;
-        for au in nal::split_access_units(&bytes) {
-            // Cooperative stop: bail if the surface was destroyed mid-clip.
-            if SURFACE_GONE.load(std::sync::atomic::Ordering::SeqCst) {
-                log::info!("nativeOnSurface: surface gone, stopping decode loop");
-                break;
-            }
-            let keyframe = nal::is_keyframe(au);
-            let frame = Frame::Video {
-                pts_us,
-                keyframe,
-                nal: au.to_vec(),
-            };
-            session.feed(&frame, decoder)?;
-            count += 1;
-            pts_us += FRAME_INTERVAL_US;
-        }
-        Ok(count)
+        log::info!("nativeOnSurfaceDestroyed: surface gone — retracting any unclaimed window");
+        SURFACE_SLOT.clear();
     }
 }

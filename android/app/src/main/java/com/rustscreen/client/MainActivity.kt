@@ -15,6 +15,7 @@ import android.util.Log
 import android.view.Surface
 import android.view.SurfaceHolder
 import android.view.SurfaceView
+import android.view.WindowManager
 import java.util.concurrent.atomic.AtomicBoolean
 
 class MainActivity : Activity() {
@@ -69,6 +70,10 @@ class MainActivity : Activity() {
             }
         })
         setContentView(surfaceView)
+        // Keep the phone awake for the whole session — a second screen that sleeps after the
+        // display timeout is useless. Tied to this window, so it clears when the app leaves
+        // the foreground. (PR #21 "Remaining" item, folded into the live-pipeline ladder item.)
+        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         nativeInit()
         val filter = IntentFilter(ACTION_USB_PERMISSION)
         // Android 13+ requires an explicit export flag for runtime-registered receivers.
@@ -144,23 +149,25 @@ class MainActivity : Activity() {
             sessionActive.set(false)
             return
         }
-        Log.i(TAG, "accessory opened — handing fd $fd to native echo loop (background thread)")
+        Log.i(TAG, "accessory opened — handing fd $fd to native decode session (background thread)")
         // BL-02: once detachFd() returns, the raw fd is owned by nobody until nativeOnUsbFd
         // wraps it. If starting the thread throws, reclaim and close the fd (and release the
         // latch) so it isn't leaked.
         try {
             Thread({
-                nativeOnUsbFd(fd) // blocks running echo_loop until the host closes (EOF) or errors
+                // Blocks running the live decode session (rendezvous with the surface, then
+                // run_session) until the host disconnects (EOF) or errors.
+                nativeOnUsbFd(fd)
                 // Session ended: release the latch so a subsequent attach can re-attempt.
                 // (Prevents a permanent latch from sticking on a stale/half-registered
                 // accessory — see the device-side handoff race in HARDWARE-FINDINGS.md.)
-                Log.i(TAG, "echo session ended; releasing latch for re-attach")
+                Log.i(TAG, "session ended; releasing latch for re-attach")
                 sessionActive.set(false)
-            }, "usb-echo").start()
+            }, "usb-session").start()
         } catch (t: Throwable) {
             runCatching { ParcelFileDescriptor.adoptFd(fd).close() }
             sessionActive.set(false)
-            Log.e(TAG, "failed to start echo thread; reclaimed accessory fd", t)
+            Log.e(TAG, "failed to start session thread; reclaimed accessory fd", t)
         }
     }
 
