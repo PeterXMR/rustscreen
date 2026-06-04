@@ -55,6 +55,13 @@ pub fn echo_loop<T: Read + Write>(t: &mut T) -> io::Result<u64> {
     }
 }
 
+/// Largest single read issued to the accessory fd. Sourced from the shared
+/// [`protocol::BULK_TRANSFER_SIZE`] — the SAME constant the host sizes its bulk transfers to —
+/// so the device read can never end up smaller than a host packet (which would truncate it).
+/// See the read impl and `protocol::BULK_TRANSFER_SIZE` for why this is load-bearing.
+#[cfg(target_os = "android")]
+const ACCESSORY_READ_CHUNK: usize = protocol::BULK_TRANSFER_SIZE;
+
 /// Wraps the bidirectional accessory file descriptor as a `Read + Write` transport.
 ///
 /// The fd was `detachFd()`-ed on the Kotlin side, relinquishing its ownership; this type
@@ -62,8 +69,21 @@ pub fn echo_loop<T: Read + Write>(t: &mut T) -> io::Result<u64> {
 /// [`AccessoryFdTransport::from_raw_fd`] and closes it on drop — no double-close
 /// (single-ownership, threat T-P1-03). Reading receives the host's bulk-OUT, writing sends
 /// to the host's bulk-IN, so one `File` is both reader and writer.
+///
+/// **Why reads are internally buffered (load-bearing for AOA):** on the Android
+/// `f_accessory` gadget, the size passed to `read()` bounds the USB OUT request, so the
+/// host's bulk packet must fit in ONE read or the excess is dropped on overflow. The
+/// framing codec does small `read_exact`s (a 5-byte header, then the payload), so reading
+/// the fd directly would queue a tiny OUT request and silently truncate every host packet —
+/// the host's transfer still ACKs, but the device loses all but the first few bytes,
+/// deadlocking the round-trip. So we always read a full [`ACCESSORY_READ_CHUNK`] from the fd
+/// into `rbuf` and serve the codec's small reads from there.
 #[cfg(target_os = "android")]
-pub struct AccessoryFdTransport(pub std::fs::File);
+pub struct AccessoryFdTransport {
+    file: std::fs::File,
+    rbuf: Vec<u8>,
+    rpos: usize,
+}
 
 #[cfg(target_os = "android")]
 impl AccessoryFdTransport {
@@ -75,24 +95,43 @@ impl AccessoryFdTransport {
     /// call (e.g. via `ParcelFileDescriptor.detachFd()`); it must not be closed elsewhere.
     pub unsafe fn from_raw_fd(fd: std::os::fd::RawFd) -> Self {
         use std::os::fd::FromRawFd;
-        AccessoryFdTransport(std::fs::File::from_raw_fd(fd))
+        AccessoryFdTransport {
+            file: std::fs::File::from_raw_fd(fd),
+            rbuf: Vec::new(),
+            rpos: 0,
+        }
     }
 }
 
 #[cfg(target_os = "android")]
 impl Read for AccessoryFdTransport {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        self.0.read(buf)
+        // Refill from the fd with ONE large read when our buffer is drained, so the
+        // accessory OUT request is big enough for a whole host packet (see the type doc).
+        if self.rpos >= self.rbuf.len() {
+            self.rbuf.resize(ACCESSORY_READ_CHUNK, 0);
+            let n = self.file.read(&mut self.rbuf)?;
+            self.rbuf.truncate(n);
+            self.rpos = 0;
+            if n == 0 {
+                return Ok(0); // EOF — host closed the connection
+            }
+        }
+        let avail = &self.rbuf[self.rpos..];
+        let k = avail.len().min(buf.len());
+        buf[..k].copy_from_slice(&avail[..k]);
+        self.rpos += k;
+        Ok(k)
     }
 }
 
 #[cfg(target_os = "android")]
 impl Write for AccessoryFdTransport {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.0.write(buf)
+        self.file.write(buf)
     }
     fn flush(&mut self) -> io::Result<()> {
-        self.0.flush()
+        self.file.flush()
     }
 }
 

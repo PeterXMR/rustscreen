@@ -32,8 +32,10 @@ const AOA_PID_HI: u16 = 0x2D05;
 
 /// Per-transfer chunk / control timeout window.
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(1);
-/// Bulk transfer size — chunked at the 16 KiB AOA accessory buffer (Pitfall 3).
-const BULK_CHUNK: usize = 16 * 1024;
+/// Bulk transfer size — chunked at the AOA accessory buffer (Pitfall 3). Sourced from the
+/// shared [`protocol::BULK_TRANSFER_SIZE`] so the host's per-transfer size and the device's
+/// accessory read size can never drift apart (see that constant for the hardware rationale).
+const BULK_CHUNK: usize = protocol::BULK_TRANSFER_SIZE;
 
 /// The six AOA identity strings sent in control request 52, by string id (0..=5).
 ///
