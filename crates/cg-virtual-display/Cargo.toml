@@ -2,9 +2,28 @@
 name = "cg-virtual-display"
 version = "0.1.0"
 edition = "2021"
+# Match the workspace MSRV (the other crates pin the same). Keeps clippy MSRV-aware.
+rust-version = "1.80"
 
-[build-dependencies]
-cc = "1.0"
+# Pure-Rust objc2 bindings to the private CoreGraphics `CGVirtualDisplay` family (P7
+# Rust-purity upgrade — replaces the former ObjC++ `.mm` shim + `cc` build dep). These
+# are the same madsmtm objc2 crates the macos-host capture/encode path uses; versions
+# pinned to the audited 0.3 / 0.6 lines (objc2 framework crates ship breaking changes on
+# each 0.x minor, so a caret-minor pin stays on the reviewed line).
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", default-features = false, features = [
+    "std",
+    "NSString",
+    "NSArray",
+] }
+objc2-core-foundation = { version = "0.3", default-features = false, features = [
+    "std",
+    "objc2",
+    "CFCGTypes",
+] }
+block2 = "0.6"
+dispatch2 = { version = "0.3", default-features = false, features = ["std"] }
 
 [[example]]
 name = "spike"
