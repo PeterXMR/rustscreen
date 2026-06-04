@@ -1,6 +1,15 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
+    <!-- Declare the USB-accessory capability. Required by the USB Accessory integration
+         guide: without it some Android versions return null/empty from
+         UsbManager.getAccessoryList() (a candidate cause of the empty-accessoryList symptom
+         seen on the live Pixel 6a session), and Play would not filter to capable devices.
+         required=true — the whole app is a USB accessory client. -->
+    <uses-feature
+        android:name="android.hardware.usb.accessory"
+        android:required="true" />
+
     <application
         android:label="RustScreen"
         android:theme="@android:style/Theme.NoTitleBar.Fullscreen">

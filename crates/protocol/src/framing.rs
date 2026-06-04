@@ -33,8 +33,17 @@ pub fn write_frame(w: &mut dyn Write, tag: u8, payload: &[u8]) -> io::Result<()>
             "frame payload exceeds MAX_FRAME_LEN",
         ));
     }
-    w.write_all(&[tag])?;
-    w.write_all(&(payload.len() as u32).to_be_bytes())?;
+    // Assemble the 5-byte header (tag · u32 BE len) and write it in ONE `write_all`,
+    // mirroring `read_frame`'s single 5-byte header read. Three separate writes risked an
+    // orphaned partial header on a mid-write transport error (e.g. a full USB bulk
+    // endpoint): the reader would then resync onto garbage and the whole session desyncs
+    // with no way to recover short of a reconnect. A single header write makes the header
+    // atomic w.r.t. that failure mode.
+    let len = payload.len() as u32; // safe: guarded by the MAX_FRAME_LEN check above
+    let mut header = [0u8; 5];
+    header[0] = tag;
+    header[1..5].copy_from_slice(&len.to_be_bytes());
+    w.write_all(&header)?;
     w.write_all(payload)?;
     Ok(())
 }

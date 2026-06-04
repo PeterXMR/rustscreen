@@ -108,6 +108,16 @@ class MainActivity : Activity() {
             return
         }
         val fd = pfd.detachFd()
+        // Defense-in-depth: never hand a negative fd to native code — File::from_raw_fd(-1)
+        // is undefined behavior. detachFd() on this freshly-opened descriptor returns a valid
+        // fd (it throws IllegalStateException only if already closed, which can't happen right
+        // after openAccessory), so this guard is belt-and-suspenders against a platform-
+        // specific deviation; on a hit, release the latch so a later attach can retry. (BL-04)
+        if (fd < 0) {
+            Log.e(TAG, "detachFd() returned invalid fd $fd; aborting")
+            sessionActive.set(false)
+            return
+        }
         Log.i(TAG, "accessory opened — handing fd $fd to native echo loop (background thread)")
         // BL-02: once detachFd() returns, the raw fd is owned by nobody until nativeOnUsbFd
         // wraps it. If starting the thread throws, reclaim and close the fd (and release the
