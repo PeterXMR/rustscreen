@@ -14,6 +14,7 @@ pub mod capture;
 pub mod capture_select;
 pub mod encode;
 pub mod encode_vt;
+pub mod touch;
 pub mod transport;
 
 /// Live USB (AOA) host adapter — compiled only under `--features live-usb` (Wave B,

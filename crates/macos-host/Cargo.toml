@@ -15,8 +15,22 @@ rust-version = "1.80"
 # cross-platform, so a plain optional dependency keeps the feature buildable
 # everywhere while the AOA path is only *run* on macOS.
 live-usb = ["dep:nusb"]
+# Live macOS cursor injection (P6 Wave B, hands-on-Mac) — pulls `core-graphics` and
+# compiles the `touch::CgEventSink` adapter (impl of the `PointerSink` port) + the
+# `p6_inject` smoke bin. Off by default so the default cross-platform build stays clean.
+# UNLIKE `nusb` (pure-Rust, cross-platform), `core-graphics` is macOS-only — that is fine
+# here: this crate's CI runs on `macos-latest`, never with `--all-features`, and this
+# feature is only ever built/run on a Mac (where the cursor APIs exist).
+live-inject = ["dep:core-graphics"]
 
 [dependencies]
 protocol = { path = "../protocol" }
 log = "0.4"
 nusb = { version = "0.2", optional = true }
+core-graphics = { version = "0.24", optional = true }
+
+# P6 live cursor-injection smoke bin — compiled only under --features live-inject so the
+# default `cargo build --workspace` never pulls core-graphics.
+[[bin]]
+name = "p6_inject"
+required-features = ["live-inject"]

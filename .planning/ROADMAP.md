@@ -12,11 +12,11 @@ RustScreen de-risks first, then builds. The journey: scaffold the workspace (P0,
 
 - [x] **Phase P0: Workspace Scaffold & Cross-Compilation** - Cargo workspace, cross-compile, thin Kotlin shell, CI (COMPLETE — PR #1)
 - [x] **Phase P2: Create a Virtual Display from Rust** 🔬 - Keystone risk R1 RETIRED; phantom display via private `CGVirtualDisplay` (COMPLETE — branch `feat/p2-virtual-display`)
-- [~] **Phase P1: USB Byte Round-Trip** 🔬 - Wave A + Wave B code done (cable-free TDD green; AOA host + Android glue compile, cfg `live-usb`); Task B3 live 1 MB echo + D1 verdict PENDING on the Pixel 6a
-- [ ] **Phase P3: Capture + Hardware-Encode on macOS** 🔬 - Capture virtual display, VideoToolbox H.264 to a playable file (NEXT — Mac-only, unblocked)
+- [~] **Phase P1: USB Byte Round-Trip** 🔬 - Wave A + Wave B merged (PR #6/#7); **hardware-validated** — AOA from Rust with **no sudo** (A2 retired), re-enumeration + fd handoff proven on M1↔Pixel 6a. Remaining: live 1 MB echo (device-side handoff race) + D1 verdict
+- [~] **Phase P3: Capture + Hardware-Encode on macOS** 🔬 - Wave A merged (PR #4: cable-free `avcc_to_annex_b` + capture-select); Wave B (SCK/VideoToolbox/CGDisplayStream adapters → playable `.h264` + ffplay gate) is hands-on-Mac, pending
 - [ ] **Phase P4: Decode + Present on the Pixel** 🔬 - ⚠ DEFERRED (hardware-blocked: needs Pixel 6a). AMediaCodec decode-to-surface onto `ANativeWindow`
-- [ ] **Phase P5: Live End-to-End Pipeline + Latency** - Wire P1–P4 live; measure glass-to-glass < 50 ms (cable-free protocol slice planned)
-- [ ] **Phase P6: Touch Back-Channel → macOS Injection** - Tap on phone moves/clicks the Mac cursor via `CGEvent`
+- [~] **Phase P5: Live End-to-End Pipeline + Latency** - Cable-free protocol slice merged (PR #5: `Frame` codec + `negotiate()` — criterion #3 logic). Remaining: wire P1–P4 live + measure glass-to-glass < 50 ms (blocked on P1/P4)
+- [~] **Phase P6: Touch Back-Channel → macOS Injection** - Mac side done (`macos_host::touch`: normalized→global CG mapping (no Y-flip) + single-pointer FSM behind `PointerSink`, PLUS the live `CgEventSink` CGEvent injector + `AXIsProcessTrusted` gate behind `--features live-inject` + `p6_inject` smoke bin — compiles/runs on the Mac, no phone). Deferred (device): Android `AInputEvent` capture + live Touch-frame send
 - [ ] **Phase P7: Robustness, UX, Codec Options, Signing + Rust-Purity Upgrades** - Hotplug, HEVC, menu-bar, notarize, pure-Rust adapters
 - [ ] **Phase P8: Packaging, Distribution, OSS Hygiene** - Notarized DMG + release `.apk`, README/LICENSE, clone-to-second-screen
 
@@ -110,7 +110,10 @@ Plans:
   2. Dragging on the Pixel produces a click-and-drag on the Mac (mouseDown → move → mouseUp).
   3. Coordinate mapping (normalized → global CG coords) is TDD-verified; injection is gated on `AXIsProcessTrusted()` with an actionable Accessibility-permission prompt.
 **Type**: Build (TDD for coordinate mapping). Single-pointer mouse emulation only (D4).
-**Plans**: TBD
+**Plans:** 1 plan for the cable-free slice (criterion #3's coordinate-mapping-TDD clause + criteria #1/#2 LOGIC only; real CGEvent injection + `AXIsProcessTrusted()` gating + Android `AInputEvent` capture are hands-on-Mac/device-blocked, deferred behind the `PointerSink` port). In P6-01-PLAN.md.
+Plans:
+- [x] P6-01-PLAN.md — **cable-free slice DONE (2026-06-03, branch `feat/p6-touch-mapping`).** `macos_host::touch` — pure `map_normalized_to_global` (NO Y-flip: Quartz global space + normalized touch are both top-left/y-down) with clamp-finite/reject-NaN sanitation, and a single-pointer touch→mouse `PointerStateMachine` (D4) emitting `PointerAction`s behind the `PointerSink` injection port (the D0 seam the `CGEvent` adapter implements). TDD, workspace 90→105 tests; clippy/fmt clean.
+  - **+ macOS injection adapter (2026-06-04, same branch):** `CgEventSink` (first concrete `PointerSink`, via `core-graphics`) maps `Down/Move/Up` → `LeftMouseDown / MouseMoved|LeftMouseDragged / LeftMouseUp` posted to `CGEventTapLocation::HID`; `accessibility_trusted()` (`AXIsProcessTrusted()` FFI) gates construction (`InjectError::NotTrusted` — TOUCH-01 onboarding); `p6_inject` smoke bin drives a scripted tap+drag through the FSM into the live sink, sourcing the rect from `CGDisplay::main().bounds()`. All behind `--features live-inject` (off by default), mirroring `live-usb`; builds + clippy clean under default/live-usb/live-inject on macOS. Cable-free & phone-free (runs on the Mac). Deferred (device-blocked): Android `AInputEvent` capture + live Touch-frame send over USB.
 **UI hint**: yes
 
 ### Phase P7: Robustness, UX, Codec Options, Signing + Rust-Purity Upgrades
@@ -143,12 +146,16 @@ Plans:
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| P0. Workspace Scaffold | — (PR #1) | Complete | 2026-06-02 |
-| P2. Virtual Display (R1 keystone) 🔬 | spike ✓ | Complete | 2026-06-03 |
-| P1. USB Byte Round-Trip 🔬 | 0/1 | Wave A + Wave B code done (88 tests green; cfg live-usb compiles); Task B3 live echo + D1 verdict pending hardware | - |
-| P3. Capture + Encode 🔬 | 0/1 | Planned (Mac-only, next) | - |
-| P4. Decode + Present 🔬 | 0/TBD | ⚠ Deferred (needs phone) | - |
-| P5. Live Pipeline + Latency | 0/1 cable-free slice | Cable-free slice planned (live wiring blocked on P1/P4) | - |
-| P6. Touch Injection | 0/TBD | Blocked on P5 | - |
+| P0. Workspace Scaffold | — (PR #1) | ✅ Complete (merged) | 2026-06-02 |
+| P2. Virtual Display (R1 keystone) 🔬 | spike ✓ (PR #3) | ✅ Complete — R1 retired, phantom display via private `CGVirtualDisplay` (merged) | 2026-06-03 |
+| P1. USB Byte Round-Trip 🔬 | 0/1 (PR #6, #7 merged) | 🟡 Hardware-validated — AOA from Rust, **no sudo** (A2 retired), re-enumeration + fd handoff proven on M1↔Pixel 6a; 105 tests green. Remaining: live 1 MB echo (device-side handoff race) + D1 verdict | 2026-06-03 (HW) |
+| P3. Capture + Encode 🔬 | 0/1 (PR #4 merged) | 🟡 Wave A done (cable-free: `avcc_to_annex_b` + capture-select, merged); Wave B (SCK/VideoToolbox/CGDisplayStream adapters + ffplay gate) hands-on-Mac, pending | 2026-06-03 (Wave A) |
+| P4. Decode + Present 🔬 | 0/TBD | ⚠ Deferred (needs Pixel 6a) | - |
+| P5. Live Pipeline + Latency | 0/1 cable-free slice (PR #5 merged) | 🟡 Cable-free protocol slice done (`Frame` codec + `negotiate()`, merged — satisfies criterion #3 logic); live wiring + latency blocked on P1/P4 | 2026-06-03 (slice) |
+| P6. Touch Injection | 0/1 (PR #8) | 🟡 Mac side done (`macos_host::touch`: normalized→global CG mapping + single-pointer FSM behind `PointerSink`, + live `CgEventSink` CGEvent injector & `AXIsProcessTrusted` gate behind `live-inject` + `p6_inject` bin); Android `AInputEvent` capture + live wiring deferred | 2026-06-04 (Mac side) |
 | P7. Robustness + Purity | 0/TBD | Not started | - |
 | P8. Packaging + Distribution | 0/TBD | Not started | - |
+
+**Legend:** ✅ phase complete · 🟡 substantial slice landed (cable-free / de-risked), remainder hardware-blocked · ⚠ deferred (needs phone) · blank = not started.
+
+**Cable-free progress:** every Mac-only / pure-logic slice through P6 is now implemented and (P0–P5) merged to `main`; P6's slice is in PR #8. What's left is overwhelmingly **hardware-gated** — the live USB echo (P1), real capture+encode on the Mac (P3 Wave B), decode-on-Pixel (P4), and the live end-to-end wiring + latency + real cursor injection that ties P1/P3/P4 together (P5/P6 live halves).
