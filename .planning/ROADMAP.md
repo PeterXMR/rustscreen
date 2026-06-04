@@ -13,7 +13,7 @@ RustScreen de-risks first, then builds. The journey: scaffold the workspace (P0,
 - [x] **Phase P0: Workspace Scaffold & Cross-Compilation** - Cargo workspace, cross-compile, thin Kotlin shell, CI (COMPLETE — PR #1)
 - [x] **Phase P2: Create a Virtual Display from Rust** 🔬 - Keystone risk R1 RETIRED; phantom display via private `CGVirtualDisplay` (COMPLETE — branch `feat/p2-virtual-display`)
 - [x] **Phase P1: USB Byte Round-Trip** 🔬 - **COMPLETE.** Live byte-exact round-trip green on M1↔Pixel 6a over AOA (no sudo): 32B warm-up + 4× 1 MiB @ **103.0 Mbit/s**. **D1 = AOA** (NCM/TCP fallback unused); XPORT-01 met. Connect-hello handshake + 16 KiB read-buffer fixes closed the two live bugs
-- [~] **Phase P3: Capture + Hardware-Encode on macOS** 🔬 - Wave A merged (PR #4: cable-free `avcc_to_annex_b` + capture-select); Wave B (SCK/VideoToolbox/CGDisplayStream adapters → playable `.h264` + ffplay gate) is hands-on-Mac, pending
+- [~] **Phase P3: Capture + Hardware-Encode on macOS** 🔬 - Wave A merged (PR #4); Wave B **capture half PROVEN on hardware** (all-objc2 stack: SCK sees the virtual display + delivers frames, 97 fps; FB17797423 retired) — capture-foundation PR open. Remaining: VideoToolbox encode → playable `.h264` + ffplay gate
 - [ ] **Phase P4: Decode + Present on the Pixel** 🔬 - ⚠ DEFERRED (hardware-blocked: needs Pixel 6a). AMediaCodec decode-to-surface onto `ANativeWindow`
 - [~] **Phase P5: Live End-to-End Pipeline + Latency** - Cable-free protocol slice merged (PR #5: `Frame` codec + `negotiate()` — criterion #3 logic). Remaining: wire P1–P4 live + measure glass-to-glass < 50 ms (blocked on P1/P4)
 - [~] **Phase P6: Touch Back-Channel → macOS Injection** - BOTH ends' cable-free logic done: Mac side (`macos_host::touch`: normalized→global CG mapping (no Y-flip) + single-pointer FSM behind `PointerSink` + live `CgEventSink` CGEvent injector & `AXIsProcessTrusted` gate behind `--features live-inject` + `p6_inject` bin) AND Android side (`android_client::touch`: raw `MotionEvent` → normalized `TouchEvent`, the inverse mapping, host-tested + cross-compiles to arm64). Deferred (device): Kotlin `onTouchEvent`→JNI capture shim + live Touch-frame send over the session
@@ -76,7 +76,13 @@ Plans:
 **Type**: Spike. Wrap VideoToolbox/SCK behind own `Encoder`/`Capturer` traits (R3 churn); CGDisplayStream fallback. Expand into a TDD plan after the spike succeeds.
 **Plans:** 1 plan (Wave A cable-free TDD + Wave B hands-on-Mac, in P3-01-PLAN.md)
 Plans:
-- [ ] P3-01-PLAN.md — AVCC→Annex-B + capture-select (TDD, CI-green) then SCK/VideoToolbox/CGDisplayStream adapters + spike main + ffplay verify (hands-on-Mac)
+- [~] P3-01-PLAN.md — Wave A done (AVCC→Annex-B + capture-select, TDD, merged PR #4). **Wave B in progress (branch `feat/p3-capture-encode`, all-objc2 stack — see DEP rationale below):**
+  - ✅ **B0** — objc2 family wired behind off-by-default `live-capture` feature; `p3_probe` proved the `CGVirtualDisplay` is visible to ScreenCaptureKit (FB17797423 does NOT bite). Commit `3e70c0e`.
+  - ✅ **B1** — `p3_capture` proved `SCStreamOutput` delivers frames (97 frames/2s on M1↔virtual display); objc2 `define_class!` delegate on an owned GCD queue sidesteps the run-loop footgun. Commit `8cec440`. **→ capture-foundation PR.**
+  - ⏭️ **B2/B3** — VideoToolbox `VTCompressionSession` encode (CVPixelBuffer → H.264 → `to_annex_b_frame`) → `out.h264` → ffplay visual gate (criterion #1). API fully researched; next PR.
+  - **Stack note:** capture/encode built on the madsmtm **objc2** family (not doom-fish `videotoolbox`, which is 3-weeks-old/experimental, nor FFmpeg) after a supply-chain + maturity review — canonical, zero-RUSTSEC, pure-Rust, cohesive end-to-end buffer types. `CGDisplayStream` fallback is moot: obsoleted in the macOS 15 SDK, and SCK sees the virtual display anyway.
+
+**Note (D-capture, decided 2026-06-04):** capturing the virtual display REQUIRES the macOS **Screen & System Audio Recording** permission — there is no third-party bypass (DriverKit has no display family; the private `CGVirtualDisplay` delivers no frames to its creator; DisplayLink itself requires the grant). Documented in README; the shipped app will request it once for its own bundle.
 **UI hint**: yes
 
 ### Phase P4: Decode + Present on the Pixel 🔬
@@ -154,7 +160,7 @@ Plans:
 | P0. Workspace Scaffold | — (PR #1) | ✅ Complete (merged) | 2026-06-02 |
 | P2. Virtual Display (R1 keystone) 🔬 | spike ✓ (PR #3) | ✅ Complete — R1 retired, phantom display via private `CGVirtualDisplay` (merged) | 2026-06-03 |
 | P1. USB Byte Round-Trip 🔬 | 1/1 (PR #6, #7 merged + connect-hello PR) | ✅ **Complete** — live byte-exact round-trip on M1↔Pixel 6a over AOA, **no sudo** (A2 retired): 4× 1 MiB @ **103.0 Mbit/s**. **D1 = AOA**; XPORT-01 met (throughput is a synchronous-echo floor, see Phase P1 note) | 2026-06-04 (HW) |
-| P3. Capture + Encode 🔬 | 0/1 (PR #4 merged) | 🟡 Wave A done (cable-free: `avcc_to_annex_b` + capture-select, merged); Wave B (SCK/VideoToolbox/CGDisplayStream adapters + ffplay gate) hands-on-Mac, pending | 2026-06-03 (Wave A) |
+| P3. Capture + Encode 🔬 | 0/1 (PR #4 merged; capture-foundation PR open) | 🟡 Wave A done (merged); Wave B **capture half PROVEN on HW** (all-objc2: SCK sees + delivers frames from the virtual display, 97 fps; FB17797423 retired). Remaining: VideoToolbox encode → ffplay gate | 2026-06-04 (capture) |
 | P4. Decode + Present 🔬 | 0/TBD | ⚠ Deferred (needs Pixel 6a) | - |
 | P5. Live Pipeline + Latency | 0/1 cable-free slice (PR #5 merged) | 🟡 Cable-free protocol slice done (`Frame` codec + `negotiate()`, merged — satisfies criterion #3 logic); live wiring + latency blocked on P1/P4 | 2026-06-03 (slice) |
 | P6. Touch Injection | 0/1 (PR #8 merged + Android slice) | 🟡 Both ends' cable-free logic done — Mac side (`macos_host::touch`: mapping + FSM + `CgEventSink`/`AXIsProcessTrusted` behind `live-inject` + `p6_inject` bin, PR #8 merged) and Android side (`android_client::touch`: `MotionEvent`→normalized `TouchEvent`); Kotlin capture shim + live wiring deferred | 2026-06-04 (logic) |
