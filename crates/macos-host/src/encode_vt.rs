@@ -221,6 +221,24 @@ mod tests {
     }
 
     #[test]
+    fn avcc_one_byte_length_size_converts() {
+        // lengthSizeMinusOne == 0 → a 1-byte length prefix. Exercises the BE accumulation loop
+        // at its narrowest width (the kind of place a width-specific off-by-one hides).
+        // [03][67 42 1F] -> [00 00 00 01][67 42 1F]
+        let input = [0x03, 0x67, 0x42, 0x1F];
+        let out = avcc_to_annex_b(&input, 1);
+        assert_eq!(out, vec![0, 0, 0, 1, 0x67, 0x42, 0x1F]);
+    }
+
+    #[test]
+    fn avcc_three_byte_length_size_converts() {
+        // lengthSizeMinusOne == 2 → a 3-byte length prefix. [00 00 03][67 42 1F] -> start code.
+        let input = [0x00, 0x00, 0x03, 0x67, 0x42, 0x1F];
+        let out = avcc_to_annex_b(&input, 3);
+        assert_eq!(out, vec![0, 0, 0, 1, 0x67, 0x42, 0x1F]);
+    }
+
+    #[test]
     fn avcc_zero_length_unit_is_skipped_not_fatal() {
         // A stray zero-length unit must be skipped, NOT abort the rest of the buffer.
         // [00 00 00 00] (len 0) then [00 00 00 03][AA BB CC] -> the real NAL survives.
