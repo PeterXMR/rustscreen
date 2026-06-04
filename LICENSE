@@ -1,0 +1,27 @@
+RustScreen — LICENSE (NOT YET FINALIZED)
+========================================
+
+The license for this project has not been decided or written yet.
+
+Until a license is published in this file, NO general license is granted. Under
+default copyright law, all rights are reserved by the author. If you wish to use,
+copy, modify, or redistribute this project before the license is finalized, please
+contact the author for permission.
+
+
+Intended direction (non-binding statement — NOT the final license terms)
+------------------------------------------------------------------------
+
+The author intends to release RustScreen under a license that is as compatible with
+Voluntaryism as possible. The expected shape of those terms:
+
+  - Similar in spirit to the GNU GPL, BUT WITHOUT mandatory disclosure of source
+    code. You may distribute a binary without publishing its source.
+
+  - You may not prevent other people from copying, inspecting, and modifying the
+    BINARY — unless they have agreed not to do so in a written, private contract.
+
+  - Modification, redistribution, and commercial use are permitted.
+
+This section describes intent only and confers no rights. It will be replaced by the
+binding license text once finalized.
