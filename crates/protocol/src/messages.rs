@@ -54,6 +54,10 @@ pub enum VideoCodec {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct VideoConfigPayload {
     codec: VideoCodec,
+    /// SPS/PPS as an **Annex-B byte stream** (each NAL prefixed by a `00 00 01` /
+    /// `00 00 00 01` start code) — the format [`crate::nal::extract_codec_config`]
+    /// parses. A bare concatenation of the two NAL bodies is NOT valid here: with no
+    /// start codes there is no way to recover the SPS/PPS boundary.
     sps_pps: Vec<u8>,
 }
 
@@ -139,7 +143,9 @@ pub enum Frame {
     VideoConfig {
         /// Negotiated codec.
         codec: VideoCodec,
-        /// Concatenated SPS/PPS bytes (see [`crate::nal::CodecConfig`]).
+        /// SPS/PPS as an **Annex-B byte stream** (start-code-delimited NAL units), the
+        /// format [`crate::nal::extract_codec_config`] parses. NOT a bare concatenation
+        /// of the two NAL bodies — without start codes the boundary is unrecoverable.
         sps_pps: Vec<u8>,
     },
     /// One encoded access unit. Payload is raw (no serde) — see module docs.
@@ -420,21 +426,26 @@ mod tests {
 
     #[test]
     fn roundtrip_video_config() {
-        // SPS/PPS carried faithfully from a real nal::extract_codec_config output.
-        let mut stream = Vec::new();
-        stream.extend_from_slice(&[0, 0, 0, 1]);
-        stream.extend_from_slice(&[0x67, 0x42, 0x1F]); // SPS
-        stream.extend_from_slice(&[0, 0, 0, 1]);
-        stream.extend_from_slice(&[0x68, 0xCE]); // PPS
-        let cfg = nal::extract_codec_config(&stream).expect("config present");
+        // sps_pps is an Annex-B byte stream (start-code-delimited NAL units) — the
+        // format nal::extract_codec_config parses and the decoder expects. Build one,
+        // and verify it both round-trips on the wire AND re-parses back to the same
+        // SPS/PPS through the REAL parser (not just Vec == Vec — a bare concatenation
+        // would round-trip the bytes yet be unparseable, the bug this guards against).
+        let mut sps_pps = Vec::new();
+        sps_pps.extend_from_slice(&[0, 0, 0, 1]);
+        sps_pps.extend_from_slice(&[0x67, 0x42, 0x1F]); // SPS
+        sps_pps.extend_from_slice(&[0, 0, 0, 1]);
+        sps_pps.extend_from_slice(&[0x68, 0xCE]); // PPS
 
-        let mut sps_pps = cfg.sps.clone();
-        sps_pps.extend_from_slice(&cfg.pps);
         let frame = Frame::VideoConfig {
             codec: VideoCodec::H264,
-            sps_pps,
+            sps_pps: sps_pps.clone(),
         };
         assert_eq!(roundtrip(&frame), frame);
+
+        let cfg = nal::extract_codec_config(&sps_pps).expect("config parses from Annex-B");
+        assert_eq!(cfg.sps, vec![0x67, 0x42, 0x1F]);
+        assert_eq!(cfg.pps, vec![0x68, 0xCE]);
     }
 
     #[test]
@@ -620,6 +631,9 @@ mod tests {
     fn video_config_payload_wire_is_stable_struct_encoding() {
         // VideoConfig encodes via the named VideoConfigPayload struct. Pin the exact
         // postcard bytes so a future field addition can't silently change the wire.
+        // sps_pps here is opaque filler — postcard stores it as a length-prefixed byte
+        // blob, so this test pins the wire LAYOUT, not Annex-B validity (see
+        // roundtrip_video_config for a real Annex-B stream).
         let frame = Frame::VideoConfig {
             codec: VideoCodec::H264,
             sps_pps: vec![0x67, 0x42],

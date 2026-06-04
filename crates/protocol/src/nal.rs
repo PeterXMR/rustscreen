@@ -98,6 +98,97 @@ pub fn is_keyframe(stream: &[u8]) -> bool {
     iter_nal_units(stream).any(|nal| nal_unit_type(nal) == Some(nal_type::IDR_SLICE))
 }
 
+/// Whether `stream` already carries an in-band SPS **and** PPS — i.e. it is
+/// self-describing and a decoder fed only this access unit could configure itself.
+///
+/// Used by [`to_annex_b_access_unit`] to decide whether to inject the out-of-band
+/// parameter sets ahead of a keyframe (avoiding duplicate SPS/PPS when the encoder
+/// already wrote them in-band, as RustScreen's P3 encoder does before the first IDR).
+///
+/// Presence only — order is NOT checked. H.264 requires SPS before PPS (before the
+/// picture); RustScreen relies on the encoder emitting that order (P3's VideoToolbox
+/// adapter does). A pathological PPS-before-SPS stream would still report `true` here.
+pub fn has_in_band_config(stream: &[u8]) -> bool {
+    let mut has_sps = false;
+    let mut has_pps = false;
+    for nal in iter_nal_units(stream) {
+        match nal_unit_type(nal) {
+            Some(nal_type::SPS) => has_sps = true,
+            Some(nal_type::PPS) => has_pps = true,
+            _ => {}
+        }
+        if has_sps && has_pps {
+            return true;
+        }
+    }
+    false
+}
+
+/// The 4-byte Annex-B start code RustScreen emits in front of every NAL unit.
+const START_CODE: [u8; 4] = [0, 0, 0, 1];
+
+/// Why a [`Frame::Video`](crate::messages::Frame::Video) payload could not be turned
+/// into a decoder-ready access unit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AccessUnitError {
+    /// The video payload contained no NAL bytes at all — there is nothing to decode.
+    EmptyPayload,
+}
+
+impl core::fmt::Display for AccessUnitError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            AccessUnitError::EmptyPayload => write!(f, "video payload contained no NAL bytes"),
+        }
+    }
+}
+
+impl std::error::Error for AccessUnitError {}
+
+/// Build a decoder-ready Annex-B access unit from a `Frame::Video` NAL payload.
+///
+/// RustScreen's wire `nal` payload is already Annex-B start-code framed (the host writes
+/// the encoder's Annex-B output verbatim — see `macos_host::encode`). This helper makes
+/// the access unit **self-describing** so a freshly-configured `AMediaCodec` can decode
+/// it: on a **keyframe** whose payload does not already carry in-band SPS/PPS, it prepends
+/// the out-of-band [`CodecConfig`] (`00 00 00 01` + SPS, then `00 00 00 01` + PPS) ahead
+/// of the picture. When the payload already has in-band parameter sets (P3's encoder
+/// injects them before the first IDR), or when `config` is `None`, the payload is passed
+/// through unchanged — never duplicating SPS/PPS. Non-keyframes are always passed through.
+///
+/// An empty payload is rejected ([`AccessUnitError::EmptyPayload`]) rather than yielding a
+/// zero-byte buffer the decoder would choke on.
+///
+/// This is the pure, host-tested feed logic behind the Wave-B `AMediaCodec` adapter; it
+/// owns no FFI and no allocation policy beyond the obvious copy.
+pub fn to_annex_b_access_unit(
+    nal: &[u8],
+    keyframe: bool,
+    config: Option<&CodecConfig>,
+) -> Result<Vec<u8>, AccessUnitError> {
+    if nal.is_empty() {
+        return Err(AccessUnitError::EmptyPayload);
+    }
+    // Only inject on a keyframe, only when we have a config, and only when the payload
+    // isn't already self-describing (else we'd send duplicate SPS/PPS).
+    let inject = match config {
+        Some(_) if keyframe => !has_in_band_config(nal),
+        _ => false,
+    };
+    if !inject {
+        return Ok(nal.to_vec());
+    }
+    let config = config.expect("inject implies config.is_some()");
+    let mut out =
+        Vec::with_capacity(START_CODE.len() * 2 + config.sps.len() + config.pps.len() + nal.len());
+    out.extend_from_slice(&START_CODE);
+    out.extend_from_slice(&config.sps);
+    out.extend_from_slice(&START_CODE);
+    out.extend_from_slice(&config.pps);
+    out.extend_from_slice(nal);
+    Ok(out)
+}
+
 /// Find the next Annex-B start code at or after `from`. Returns
 /// `(start_code_index, data_index)` where `start_code_index` is the first byte of
 /// the start code (extended left over any extra leading zero bytes of a 4+-byte
@@ -346,5 +437,119 @@ mod tests {
         s.extend_from_slice(&SC4);
         s.extend_from_slice(&[0x61, 0x88]); // non-IDR slice only
         assert!(!is_keyframe(&s));
+    }
+
+    // --- has_in_band_config ---------------------------------------------------
+
+    #[test]
+    fn in_band_config_true_with_sps_and_pps() {
+        let mut s = Vec::new();
+        s.extend_from_slice(&SC4);
+        s.extend_from_slice(&[0x67, 0x42]); // SPS
+        s.extend_from_slice(&SC4);
+        s.extend_from_slice(&[0x68, 0xCE]); // PPS
+        s.extend_from_slice(&SC4);
+        s.extend_from_slice(&[0x65, 0x00]); // IDR
+        assert!(has_in_band_config(&s));
+    }
+
+    #[test]
+    fn in_band_config_false_with_only_sps() {
+        let mut s = Vec::new();
+        s.extend_from_slice(&SC4);
+        s.extend_from_slice(&[0x67, 0x42]); // SPS only
+        assert!(!has_in_band_config(&s));
+    }
+
+    #[test]
+    fn in_band_config_false_for_plain_slice() {
+        let mut s = Vec::new();
+        s.extend_from_slice(&SC4);
+        s.extend_from_slice(&[0x65, 0x00]); // IDR with no params in-band
+        assert!(!has_in_band_config(&s));
+    }
+
+    // --- to_annex_b_access_unit -----------------------------------------------
+
+    fn config() -> CodecConfig {
+        CodecConfig {
+            sps: vec![0x67, 0x42, 0x1F],
+            pps: vec![0x68, 0xCE],
+        }
+    }
+
+    #[test]
+    fn au_empty_payload_is_rejected() {
+        assert_eq!(
+            to_annex_b_access_unit(&[], true, Some(&config())),
+            Err(AccessUnitError::EmptyPayload)
+        );
+        // Empty is rejected regardless of keyframe / config presence.
+        assert_eq!(
+            to_annex_b_access_unit(&[], false, None),
+            Err(AccessUnitError::EmptyPayload)
+        );
+    }
+
+    #[test]
+    fn au_keyframe_without_in_band_config_injects_sps_pps() {
+        // Bare IDR picture (no params in-band) on a keyframe → config is prepended so the
+        // decoder can configure itself; extract_codec_config must then recover it.
+        let mut picture = Vec::new();
+        picture.extend_from_slice(&SC4);
+        picture.extend_from_slice(&[0x65, 0xAA, 0xBB]); // IDR
+
+        let au = to_annex_b_access_unit(&picture, true, Some(&config())).unwrap();
+
+        let cfg = extract_codec_config(&au).expect("config recovered from AU");
+        assert_eq!(cfg.sps, vec![0x67, 0x42, 0x1F]);
+        assert_eq!(cfg.pps, vec![0x68, 0xCE]);
+        let units: Vec<&[u8]> = iter_nal_units(&au).collect();
+        assert_eq!(units.len(), 3); // SPS, PPS, IDR
+        assert_eq!(nal_unit_type(units[0]), Some(nal_type::SPS));
+        assert_eq!(nal_unit_type(units[1]), Some(nal_type::PPS));
+        assert_eq!(nal_unit_type(units[2]), Some(nal_type::IDR_SLICE));
+    }
+
+    #[test]
+    fn au_keyframe_with_in_band_config_is_passed_through_no_dup() {
+        // Payload already self-describing (P3's encoder injects SPS/PPS before the first
+        // IDR): the helper must NOT prepend a second copy.
+        let mut picture = Vec::new();
+        picture.extend_from_slice(&SC4);
+        picture.extend_from_slice(&[0x67, 0x01]); // in-band SPS
+        picture.extend_from_slice(&SC4);
+        picture.extend_from_slice(&[0x68, 0x01]); // in-band PPS
+        picture.extend_from_slice(&SC4);
+        picture.extend_from_slice(&[0x65, 0x00]); // IDR
+
+        let au = to_annex_b_access_unit(&picture, true, Some(&config())).unwrap();
+
+        assert_eq!(au, picture, "already-self-describing AU must pass through");
+        let sps_count = iter_nal_units(&au)
+            .filter(|n| nal_unit_type(n) == Some(nal_type::SPS))
+            .count();
+        assert_eq!(sps_count, 1, "no duplicate SPS injected");
+    }
+
+    #[test]
+    fn au_keyframe_without_config_passes_through() {
+        // No out-of-band config available → nothing to inject; pass the keyframe through.
+        let mut picture = Vec::new();
+        picture.extend_from_slice(&SC4);
+        picture.extend_from_slice(&[0x65, 0xAA]); // bare IDR
+        let au = to_annex_b_access_unit(&picture, true, None).unwrap();
+        assert_eq!(au, picture);
+    }
+
+    #[test]
+    fn au_non_keyframe_is_passed_through() {
+        // A delta frame is never prefixed with parameter sets, even with a config present.
+        let mut picture = Vec::new();
+        picture.extend_from_slice(&SC4);
+        picture.extend_from_slice(&[0x61, 0xCC]); // non-IDR slice
+        let au = to_annex_b_access_unit(&picture, false, Some(&config())).unwrap();
+        assert_eq!(au, picture);
+        assert_eq!(extract_codec_config(&au), None);
     }
 }

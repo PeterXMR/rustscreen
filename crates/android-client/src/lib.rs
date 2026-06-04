@@ -11,6 +11,13 @@ pub mod transport;
 /// mapping. NOT cfg-gated, so CI exercises it (the JNI/Kotlin capture shim is glue).
 pub mod touch;
 
+/// Decode core (P4 Wave A): the platform-agnostic `VideoDecoder` port + `DecodeSession`
+/// orchestrator that turns protocol `Frame`s into configure/decode calls. NOT cfg-gated,
+/// so CI exercises it against a fake. The `AMediaCodec` decode-to-surface adapter, JNI
+/// surface plumbing, and Kotlin `SurfaceView` (P4 Wave B) are hardware-blocked (the Pixel)
+/// and drop in behind the port — see the module docs.
+pub mod decode;
+
 #[cfg(target_os = "android")]
 mod android {
     use jni::objects::JClass;
