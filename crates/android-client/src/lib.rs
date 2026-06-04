@@ -18,6 +18,11 @@ pub mod touch;
 /// and drop in behind the port — see the module docs.
 pub mod decode;
 
+/// Client receive-session orchestrator (P5 PIPE-01 criterion #3): platform-agnostic
+/// receive loop that performs the client handshake and routes protocol `Frame`s into the
+/// `DecodeSession` / `VideoDecoder` port. NOT cfg-gated — CI exercises it in full.
+pub mod session;
+
 #[cfg(target_os = "android")]
 mod android {
     use jni::objects::JClass;
