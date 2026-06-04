@@ -10,11 +10,13 @@ crate-type = ["cdylib"]
 # Shared length-framing codec — reused verbatim by echo_loop (host-testable, not
 # cfg-gated) so the phone and the macOS host stay wire-compatible.
 protocol = { path = "../protocol" }
+# `log` is the platform-agnostic logging facade — needed by the non-cfg-gated echo_loop
+# (a silent no-op on the host without a logger; captured by android_logger on device).
+log = "0.4"
 
 [target.'cfg(target_os = "android")'.dependencies]
 jni = "0.21"
 ndk = "0.9"
 ndk-sys = "0.6"
 ndk-context = "0.1"
-log = "0.4"
 android_logger = "0.14"

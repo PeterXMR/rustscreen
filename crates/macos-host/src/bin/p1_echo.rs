@@ -23,7 +23,7 @@ fn main() -> std::io::Result<()> {
     let args: Vec<String> = std::env::args().collect();
 
     // Number of 1 MiB echoes; ≥ several MB amortizes per-transfer overhead (Pitfall 5).
-    const ITERS: usize = 16;
+    const ITERS: usize = 4;
     let pattern = make_pattern(1 << 20);
 
     let mut transport: Box<dyn Transport> = if args.get(1).map(String::as_str) == Some("--ncm") {
@@ -42,23 +42,30 @@ fn main() -> std::io::Result<()> {
             .open()
             .wait()
             .map_err(|e| std::io::Error::other(format!("open candidate: {e}")))?;
-        let iface = dev.claim_interface(0).wait().map_err(|e| {
-            // ME-02: actionable message — macOS may need sudo or the device is in use.
-            std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                format!(
-                    "claim candidate interface 0 failed ({e}). On macOS the device may be in \
-                     use by another process or require elevated privileges — try `sudo`."
-                ),
-            )
-        })?;
-        aoa::handshake(&iface)?;
+        // Handshake via DEVICE-LEVEL control transfers — do NOT claim interface 0 here.
+        // macOS binds a class driver to the phone's interface 0 and rejects the claim with
+        // kIOReturnExclusiveAccess; the AOA requests only need the default control endpoint.
+        println!("sending AOA handshake (req 51/52/53) via control endpoint…");
+        aoa::handshake(&dev)?;
         // Drop the pre-handshake handle; never reuse it across re-enumeration (Pitfall 2).
-        drop(iface);
         drop(dev);
-        let acc = aoa::reacquire(Duration::from_secs(5))?;
+        println!("waiting for the device to re-enumerate in accessory mode…");
+        let acc = aoa::reacquire(Duration::from_secs(20))?;
         Box::new(aoa::open_transport(&acc)?)
     };
+
+    eprintln!("transport ready (accessory interface claimed — no sudo needed)");
+
+    // Warm-up: prove ANY bytes round-trip before the 1 MiB stress test. This bisects a
+    // large-transfer/buffering bug (32 B works, 1 MiB hangs) from a fundamental no-bytes-
+    // flow bug (even 32 B hangs).
+    eprintln!("warm-up: echoing 32 bytes…");
+    let warm = make_pattern(32);
+    let w = echo_roundtrip(transport.as_mut(), &warm)?;
+    eprintln!(
+        "warm-up OK: {} bytes round-tripped in {:?}",
+        w.bytes, w.elapsed
+    );
 
     let mut total_bytes = 0usize;
     let mut total_elapsed = Duration::ZERO;
