@@ -14,6 +14,9 @@ Cargo.lock.bak
 *.apk
 *.aab
 *.keystore
+# Signing credentials (passwords to the keystore). build.gradle.kts reads
+# android/keystore.properties; never commit it. The .example template is fine.
+keystore.properties
 
 # macOS
 .DS_Store

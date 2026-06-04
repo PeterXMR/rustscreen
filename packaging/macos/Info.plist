@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Info.plist template for RustScreen.app (P8 packaging scaffold).
+
+  __VERSION__ is substituted by packaging/macos/make_app.sh from the workspace
+  metadata. This is a CONFIG file (not code) — the same kind of irreducible
+  platform descriptor as AndroidManifest.xml.
+
+  Notes / open questions to resolve empirically once the live pipeline is wired:
+    * NSScreenCaptureUsageDescription — required string shown when the app first
+      requests the Screen & System Audio Recording permission (ScreenCaptureKit).
+      Capture is not wired into the shipped binary yet, but the key is harmless to
+      ship early and avoids a re-notarization once capture lands.
+    * The app currently has no GUI; LSUIElement=true keeps it out of the Dock,
+      which matches the planned menu-bar status-item shape (roadmap D5, P7). Flip
+      to false if a windowed UI is ever added.
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleName</key>
+    <string>RustScreen</string>
+    <key>CFBundleDisplayName</key>
+    <string>RustScreen</string>
+    <key>CFBundleIdentifier</key>
+    <string>com.rustscreen.host</string>
+    <key>CFBundleVersion</key>
+    <string>__VERSION__</string>
+    <key>CFBundleShortVersionString</key>
+    <string>__VERSION__</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleExecutable</key>
+    <string>macos-host</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>13.0</string>
+    <key>LSUIElement</key>
+    <true/>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+    <!-- Shown on the first ScreenCaptureKit permission prompt (capture lands in P5). -->
+    <key>NSScreenCaptureUsageDescription</key>
+    <string>RustScreen captures the virtual display it creates so it can stream it to your phone. It never captures your real screens.</string>
+</dict>
+</plist>

@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Hardened-runtime entitlements for RustScreen.app (P8 packaging scaffold).
+
+  ⚠️ OPEN QUESTION — the exact entitlement set is unproven and MUST be determined
+  empirically once the live pipeline runs under the hardened runtime. This file is
+  a STARTING POINT, not a verified final set.
+
+  Risk register R8 (architecture roadmap §5): the host creates a virtual display
+  via the PRIVATE `CGVirtualDisplay` ObjC class. Notarization checks signing and
+  malware, not private-API use, so notarization itself should pass (R8 likelihood
+  Low) — but the private symbols may or may not resolve under the hardened runtime.
+  Two knobs below exist to unblock that, in increasing order of how much they relax
+  the sandbox; enable the MINIMUM that works and document the result here:
+
+    1. com.apple.security.cs.disable-library-validation
+         Lets the process load libraries/frameworks not signed by Apple or the same
+         team. Try this FIRST if private-CoreGraphics symbol resolution fails under
+         the hardened runtime. Currently ENABLED as the conservative first guess.
+
+    2. com.apple.security.cs.allow-dyld-environment-variables
+         Only if dyld env-var injection is needed for debugging — should NOT ship.
+         Left OUT.
+
+  Other boundaries:
+    * Screen recording (ScreenCaptureKit) is a TCC permission, NOT an entitlement —
+      it is requested at runtime and granted by the user; no entitlement key gates
+      it for a non-MAS, notarized app. (Do not add com.apple.security.device.camera.)
+    * Accessibility (CGEvent injection, roadmap P6) is likewise a TCC permission
+      (AXIsProcessTrusted), not an entitlement.
+    * USB (nusb / AOA) on a notarized non-MAS app needs no com.apple.security.device.usb
+      entitlement (that key is MAS-sandbox only, and RustScreen is distributed via
+      DMG, not the Mac App Store — see roadmap P2 risk).
+
+  TODO(empirical): after the first hardened-runtime run on a real Mac, replace this
+  comment block with the VERIFIED minimal set and the macOS version it was tested on.
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Conservative first guess for private-CoreGraphics symbol resolution under
+         the hardened runtime. Remove if testing shows it is not needed. -->
+    <key>com.apple.security.cs.disable-library-validation</key>
+    <true/>
+</dict>
+</plist>
