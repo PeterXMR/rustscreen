@@ -45,6 +45,7 @@ live-capture = [
     "dep:objc2-core-video",
     "dep:objc2-io-surface",
     "dep:objc2-core-graphics",
+    "dep:objc2-core-foundation",
     "dep:cg-virtual-display",
 ]
 
@@ -64,6 +65,7 @@ objc2-core-video = { version = "0.3", optional = true }
 objc2-io-surface = { version = "0.3", optional = true }
 objc2-core-graphics = { version = "0.3", optional = true }
 cg-virtual-display = { version = "0.1.0", path = "../cg-virtual-display", optional = true }
+objc2-core-foundation = { version = "0.3", optional = true }
 
 # P6 live cursor-injection smoke bin — compiled only under --features live-inject so the
 # default `cargo build --workspace` never pulls core-graphics.
@@ -81,4 +83,9 @@ required-features = ["live-capture"]
 # P3 capture spike — proves SCStreamOutput delivers frames from the virtual display.
 [[bin]]
 name = "p3_capture"
+required-features = ["live-capture"]
+
+# P3 encode spike — capture + VideoToolbox H.264 → out.h264 (ffplay visual gate, criterion #1).
+[[bin]]
+name = "p3_encode"
 required-features = ["live-capture"]
