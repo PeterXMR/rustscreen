@@ -15,6 +15,7 @@ pub mod capture_select;
 pub mod encode;
 pub mod encode_vt;
 pub mod latency;
+pub mod session;
 pub mod touch;
 pub mod transport;
 
