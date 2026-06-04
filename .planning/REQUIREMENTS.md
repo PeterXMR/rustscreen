@@ -33,7 +33,7 @@ Each requirement corresponds to one phase (P0–P8) of the master architecture r
 
 ### Touch Injection
 
-- [ ] **TOUCH-01**: Tapping/dragging on the Pixel moves and clicks the macOS cursor at the correct location on the virtual display — `AInputEvent` touch captured and normalized on Android, mapped normalized→global CG coords (TDD), injected via `CGEvent`, gated on `AXIsProcessTrusted()` with actionable onboarding.
+- [~] **TOUCH-01**: Tapping/dragging on the Pixel moves and clicks the macOS cursor at the correct location on the virtual display — `AInputEvent` touch captured and normalized on Android, mapped normalized→global CG coords (TDD), injected via `CGEvent`, gated on `AXIsProcessTrusted()` with actionable onboarding. _(Mac side DONE — P6-01, branch `feat/p6-touch-mapping`: `macos_host::touch` normalized→global CG mapping TDD-verified (no Y-flip) + single-pointer touch→mouse FSM behind `PointerSink`, PLUS the live `CgEventSink` `CGEvent` injector + `AXIsProcessTrusted()` gate/onboarding behind `--features live-inject` (+ `p6_inject` smoke bin) — compile-checked & hand-runnable on the Mac, no phone. DEFERRED device-side: Android `AInputEvent` capture + live Touch-frame send over USB.)_
 
 ### Robustness & Purity
 
@@ -78,7 +78,7 @@ Phases execute in agreed (non-numeric) order: **P0 → P2 → P1 → P3 → P4 �
 | ENC-01 | P3 | Pending |
 | DEC-01 | P4 | Pending |
 | PIPE-01 | P5 | Pending |
-| TOUCH-01 | P6 | Pending |
+| TOUCH-01 | P6 | In Progress (cable-free slice done; injection + Android capture deferred) |
 | ROBUST-01 | P7 | Pending |
 | PURITY-01 | P7 | Pending |
 | PKG-01 | P8 | Pending |
