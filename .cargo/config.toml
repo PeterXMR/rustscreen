@@ -1,0 +1,12 @@
+# Align Android native libraries to 16 KB ELF LOAD segments.
+#
+# Android 15+ (and Google Play from Nov 2025) runs on 16 KB memory pages; native .so
+# libraries must have their LOAD segments aligned to 16 KB or the loader rejects/warns
+# them ("ELF alignment check failed"). NDK r28+ defaults to this; we're on r25c, which
+# defaults to 4 KB — so we pass the linker flag explicitly. (No effect on the macOS host
+# or other targets.)
+[target.aarch64-linux-android]
+rustflags = ["-C", "link-arg=-Wl,-z,max-page-size=16384"]
+
+[target.armv7-linux-androideabi]
+rustflags = ["-C", "link-arg=-Wl,-z,max-page-size=16384"]

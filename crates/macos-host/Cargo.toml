@@ -2,6 +2,9 @@
 name = "macos-host"
 version = "0.1.0"
 edition = "2021"
+# Match the workspace MSRV (protocol pins the same). Also makes clippy MSRV-aware, so it
+# won't suggest stdlib APIs newer than this (e.g. u32::is_multiple_of, stable 1.87).
+rust-version = "1.80"
 
 [features]
 # Live USB (AOA) host path — enables the optional nusb dep and compiles the

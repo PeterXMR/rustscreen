@@ -28,15 +28,29 @@ use protocol::framing::{read_frame, write_frame};
 /// the host uses and the seam P5 rides — so host and phone are guaranteed wire-compatible.
 pub fn echo_loop<T: Read + Write>(t: &mut T) -> io::Result<u64> {
     let mut total: u64 = 0;
+    let mut n: u32 = 0;
     loop {
+        log::info!("echo_loop: waiting for frame #{n} (blocking read)…");
         match read_frame(t) {
             Ok((tag, payload)) => {
+                log::info!(
+                    "echo_loop: READ frame #{n} tag={tag} {} bytes — echoing back",
+                    payload.len()
+                );
                 write_frame(t, tag, &payload)?;
+                log::info!("echo_loop: WROTE frame #{n} back ({} bytes)", payload.len());
                 total += payload.len() as u64;
+                n += 1;
             }
             // Host closed the connection at a frame boundary — clean shutdown.
-            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(total),
-            Err(e) => return Err(e),
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                log::info!("echo_loop: EOF at frame boundary — {total} bytes echoed total");
+                return Ok(total);
+            }
+            Err(e) => {
+                log::warn!("echo_loop: read error: {e}");
+                return Err(e);
+            }
         }
     }
 }

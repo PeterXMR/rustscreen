@@ -1,29 +1,69 @@
 package com.rustscreen.client
 
 import android.app.Activity
+import android.app.PendingIntent
+import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.hardware.usb.UsbAccessory
 import android.hardware.usb.UsbManager
+import android.os.Build
 import android.os.Bundle
 import android.os.ParcelFileDescriptor
+import android.util.Log
 import android.view.SurfaceView
+import java.util.concurrent.atomic.AtomicBoolean
 
 class MainActivity : Activity() {
+
+    private val usb by lazy { getSystemService(Context.USB_SERVICE) as UsbManager }
+
+    // "An echo session is in progress" latch (BL-01). `maybeHandleAccessory`/`openAndRun`
+    // are reachable from onCreate, onResume, onNewIntent AND the permission BroadcastReceiver,
+    // so `AtomicBoolean.compareAndSet` makes "claim the accessory exactly once" a single
+    // atomic step — two paths can't both open it / double-detach the fd / spawn two echo
+    // threads. It is RELEASED when a session ends (echo loop returns) or any open attempt
+    // fails, so a later attach can re-attempt. This deliberately is NOT a permanent one-shot:
+    // a permanent latch could latch onto a stale/half-registered accessory (the device-side
+    // handoff race in HARDWARE-FINDINGS.md) and then never retry.
+    private val sessionActive = AtomicBoolean(false)
+
+    // Receives the result of UsbManager.requestPermission() (the "Allow?" dialog).
+    private val permissionReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            if (intent.action != ACTION_USB_PERMISSION) return
+            val accessory: UsbAccessory? = intent.getParcelableExtra(UsbManager.EXTRA_ACCESSORY)
+            val granted = intent.getBooleanExtra(UsbManager.EXTRA_PERMISSION_GRANTED, false)
+            Log.i(TAG, "USB permission result: granted=$granted accessory=$accessory")
+            if (granted && accessory != null) openAndRun(accessory)
+        }
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(SurfaceView(this))
         nativeInit()
+        val filter = IntentFilter(ACTION_USB_PERMISSION)
+        // Android 13+ requires an explicit export flag for runtime-registered receivers.
+        if (Build.VERSION.SDK_INT >= 33) {
+            registerReceiver(permissionReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
+        } else {
+            @Suppress("UnspecifiedRegisterReceiverFlag")
+            registerReceiver(permissionReceiver, filter)
+        }
         maybeHandleAccessory()
     }
 
-    // HI-01: after the user taps "Allow" on the USB permission dialog, Android does NOT
-    // re-run onCreate — it resumes the existing (singleTop) instance via onNewIntent and/or
-    // onResume. We re-check the accessory in BOTH so the fd is never dropped.
+    override fun onDestroy() {
+        super.onDestroy()
+        runCatching { unregisterReceiver(permissionReceiver) }
+    }
+
+    // HI-01: after the user taps "Allow", Android resumes the existing (singleTop) instance
+    // via onNewIntent/onResume rather than re-running onCreate — re-check in both.
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
-        // Adopt the freshest intent so getParcelableExtra(EXTRA_ACCESSORY) reads from it.
         setIntent(intent)
         maybeHandleAccessory()
     }
@@ -33,22 +73,65 @@ class MainActivity : Activity() {
         maybeHandleAccessory()
     }
 
-    // Glue only (D0): receive the accessory attach, open it, detach the fd, hand it to Rust.
-    // The echo loop itself lives in the Rust core behind the Transport seam — NOT here.
-    // Idempotent-ish: openAccessory returns null until permission is granted (so repeated
-    // calls before "Allow" are harmless no-ops); the single open→detachFd→nativeOnUsbFd path
-    // is centralized here and invoked from onCreate, onNewIntent and onResume.
+    // Find the accessory (from the launch intent, or the live accessory list) and either
+    // open it (if already permitted) or REQUEST permission — which pops the on-phone
+    // "Allow RustScreen to access the USB accessory?" dialog. The implicit grant from the
+    // USB_ACCESSORY_ATTACHED intent filter is per-install and resets on reinstall, so we
+    // must be able to request it explicitly (otherwise openAccessory silently returns null).
     private fun maybeHandleAccessory() {
-        val usb = getSystemService(Context.USB_SERVICE) as UsbManager
+        if (sessionActive.get()) return // cheap early-out; openAndRun does the authoritative claim
         val accessory: UsbAccessory =
-            intent.getParcelableExtra(UsbManager.EXTRA_ACCESSORY) ?: return
-        // openAccessory returns null until the user grants the on-phone permission dialog.
-        val pfd: ParcelFileDescriptor = usb.openAccessory(accessory) ?: return
-        // detachFd() transfers sole ownership of the fd to native code (single-ownership).
-        nativeOnUsbFd(pfd.detachFd())
+            intent.getParcelableExtra(UsbManager.EXTRA_ACCESSORY)
+                ?: usb.accessoryList?.firstOrNull()
+                ?: return
+        if (usb.hasPermission(accessory)) {
+            openAndRun(accessory)
+        } else {
+            Log.i(TAG, "no accessory permission yet — requesting (shows the Allow dialog)")
+            val flags = if (Build.VERSION.SDK_INT >= 31) PendingIntent.FLAG_MUTABLE else 0
+            val pi = PendingIntent.getBroadcast(
+                this, 0, Intent(ACTION_USB_PERMISSION).setPackage(packageName), flags
+            )
+            usb.requestPermission(accessory, pi)
+        }
+    }
+
+    // Glue only (D0): open the accessory, detach the fd, hand it to Rust. The blocking echo
+    // loop MUST run off the UI thread (else the app ANRs and the echo dies), so spawn a
+    // dedicated thread; the fd's sole ownership moves into native code there.
+    private fun openAndRun(accessory: UsbAccessory) {
+        // BL-01: claim the session atomically and exactly once, BEFORE any side effect.
+        if (!sessionActive.compareAndSet(false, true)) return
+        val pfd: ParcelFileDescriptor = usb.openAccessory(accessory) ?: run {
+            Log.w(TAG, "openAccessory returned null even though permission is granted")
+            sessionActive.set(false) // release so a later attach can retry
+            return
+        }
+        val fd = pfd.detachFd()
+        Log.i(TAG, "accessory opened — handing fd $fd to native echo loop (background thread)")
+        // BL-02: once detachFd() returns, the raw fd is owned by nobody until nativeOnUsbFd
+        // wraps it. If starting the thread throws, reclaim and close the fd (and release the
+        // latch) so it isn't leaked.
+        try {
+            Thread({
+                nativeOnUsbFd(fd) // blocks running echo_loop until the host closes (EOF) or errors
+                // Session ended: release the latch so a subsequent attach can re-attempt.
+                // (Prevents a permanent latch from sticking on a stale/half-registered
+                // accessory — see the device-side handoff race in HARDWARE-FINDINGS.md.)
+                Log.i(TAG, "echo session ended; releasing latch for re-attach")
+                sessionActive.set(false)
+            }, "usb-echo").start()
+        } catch (t: Throwable) {
+            runCatching { ParcelFileDescriptor.adoptFd(fd).close() }
+            sessionActive.set(false)
+            Log.e(TAG, "failed to start echo thread; reclaimed accessory fd", t)
+        }
     }
 
     companion object {
+        private const val TAG = "RustScreen"
+        private const val ACTION_USB_PERMISSION = "com.rustscreen.client.USB_PERMISSION"
+
         init {
             System.loadLibrary("android_client")
         }

@@ -55,12 +55,17 @@ fn io_err<E: std::fmt::Display>(ctx: &str, e: E) -> io::Error {
     io::Error::other(format!("{ctx}: {e}"))
 }
 
-/// Drive the AOA handshake on an already-claimed interface of the *pre-accessory* device:
-/// req 51 (assert protocol >= 1), req 52 for each identity string (exact UTF-8 bytes, no
-/// trailing NUL — HI-02), req 53 to start. After this returns the device re-enumerates —
-/// call [`reacquire`].
-pub fn handshake(iface: &Interface) -> io::Result<u16> {
-    let ver = iface
+/// Drive the AOA handshake via **device-level control transfers** on the *pre-accessory*
+/// device — deliberately WITHOUT claiming an interface. AOA requests are addressed to the
+/// device's default control endpoint (recipient = Device), so claiming interface 0 is
+/// unnecessary, and on macOS it is actively harmful: the OS binds a class driver to the
+/// phone's interface 0 and rejects `claim_interface` with `kIOReturnExclusiveAccess`
+/// (0xe00002c5). `Device::control_*` sidesteps that entirely (no `sudo` needed). req 51
+/// (assert protocol >= 1), req 52 for each identity string (exact UTF-8 bytes, no trailing
+/// NUL — HI-02), req 53 to start. After this the device re-enumerates — call [`reacquire`],
+/// then claim the *accessory* interface (vendor-specific, no macOS driver bound).
+pub fn handshake(dev: &Device) -> io::Result<u16> {
+    let ver = dev
         .control_in(
             ControlIn {
                 control_type: ControlType::Vendor,
@@ -87,7 +92,7 @@ pub fn handshake(iface: &Interface) -> io::Result<u16> {
             format!("device reports AOA protocol {proto}, need >= 1"),
         ));
     }
-    log::info!("AOA protocol version {proto}");
+    eprintln!("  req 51 get-protocol → AOA version {proto}");
 
     for (idx, s) in IDENTITY {
         // HI-02: send the EXACT UTF-8 bytes with wLength = bytes.len() and NO manually
@@ -100,38 +105,36 @@ pub fn handshake(iface: &Interface) -> io::Result<u16> {
         // `len + 1` with a single trailing 0 byte instead (try both before concluding the
         // strings are wrong).
         let data = s.as_bytes();
-        iface
-            .control_out(
-                ControlOut {
-                    control_type: ControlType::Vendor,
-                    recipient: Recipient::Device,
-                    request: AOA_SEND_STRING,
-                    value: 0,
-                    index: idx,
-                    data,
-                },
-                CONTROL_TIMEOUT,
-            )
-            .wait()
-            .map_err(|e| io_err("AOA send-string (req 52)", e))?;
-    }
-    log::info!("AOA identity strings sent");
-
-    iface
-        .control_out(
+        dev.control_out(
             ControlOut {
                 control_type: ControlType::Vendor,
                 recipient: Recipient::Device,
-                request: AOA_START,
+                request: AOA_SEND_STRING,
                 value: 0,
-                index: 0,
-                data: &[],
+                index: idx,
+                data,
             },
             CONTROL_TIMEOUT,
         )
         .wait()
-        .map_err(|e| io_err("AOA start (req 53)", e))?;
-    log::info!("AOA start sent — device will re-enumerate");
+        .map_err(|e| io_err("AOA send-string (req 52)", e))?;
+    }
+    eprintln!("  req 52 identity strings sent");
+
+    dev.control_out(
+        ControlOut {
+            control_type: ControlType::Vendor,
+            recipient: Recipient::Device,
+            request: AOA_START,
+            value: 0,
+            index: 0,
+            data: &[],
+        },
+        CONTROL_TIMEOUT,
+    )
+    .wait()
+    .map_err(|e| io_err("AOA start (req 53)", e))?;
+    eprintln!("  req 53 start sent — device should now re-enumerate in accessory mode");
     Ok(proto)
 }
 
@@ -170,25 +173,45 @@ pub fn find_candidate() -> io::Result<DeviceInfo> {
 /// appears, then open a NEW handle (never reuse the pre-handshake one — Pitfall 2).
 pub fn reacquire(timeout: Duration) -> io::Result<Device> {
     let deadline = Instant::now() + timeout;
+    let mut tick = 0u32;
     loop {
-        let found = nusb::list_devices()
+        let devices: Vec<DeviceInfo> = nusb::list_devices()
             .wait()
             .map_err(|e| io_err("list_devices (reacquire)", e))?
-            .find(|d| {
-                d.vendor_id() == AOA_VID && (AOA_PID_LO..=AOA_PID_HI).contains(&d.product_id())
-            });
-        if let Some(info) = found {
-            log::info!(
-                "accessory re-enumerated as {:04x}:{:04x}",
+            .collect();
+
+        if let Some(info) = devices.iter().find(|d| {
+            d.vendor_id() == AOA_VID && (AOA_PID_LO..=AOA_PID_HI).contains(&d.product_id())
+        }) {
+            eprintln!(
+                "  accessory re-enumerated as {:04x}:{:04x} ✓",
                 info.vendor_id(),
                 info.product_id()
             );
             return info.open().wait().map_err(|e| io_err("open accessory", e));
         }
+
+        // Once per ~second, print what IS on the bus so we can see what the phone became
+        // (e.g. reverted to its normal Google PID, or dropped off entirely).
+        // (`% 10 == 0`, not `is_multiple_of`, to stay within the project's 1.80 MSRV.)
+        if tick % 10 == 0 {
+            let google: Vec<String> = devices
+                .iter()
+                .filter(|d| d.vendor_id() == AOA_VID)
+                .map(|d| format!("{:04x}:{:04x}", d.vendor_id(), d.product_id()))
+                .collect();
+            eprintln!(
+                "  …waiting for accessory PID {AOA_PID_LO:#06x}..={AOA_PID_HI:#06x}; on bus now: {} total dev, Google: [{}]",
+                devices.len(),
+                if google.is_empty() { "none".into() } else { google.join(", ") }
+            );
+        }
+        tick += 1;
+
         if Instant::now() >= deadline {
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
-                "accessory-mode device did not re-enumerate within timeout",
+                "accessory-mode device did not re-enumerate within timeout (see the bus snapshots above — if the phone reverted to its normal PID it rejected accessory mode; if it vanished it may need a replug)",
             ));
         }
         std::thread::sleep(Duration::from_millis(100));
