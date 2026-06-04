@@ -24,6 +24,11 @@ impl<T: Read + Write + Send> Transport for T {}
 /// it reads — but defined once here so host and phone agree on a value for diagnostics.
 pub const ECHO_TAG: u8 = 1;
 
+/// Frame tag for the connect "hello" (see [`protocol::HELLO_TAG`] for the full rationale).
+/// Re-exported here so existing `transport::HELLO_TAG` call sites keep working while the value
+/// lives in one shared place that both host and device read.
+pub use protocol::HELLO_TAG;
+
 /// Deterministic 1 MiB-style test pattern: byte `i` is `(i % 256) as u8`. A mismatch on
 /// echo therefore points straight at the first corrupted offset (via [`first_mismatch`]).
 pub fn make_pattern(len: usize) -> Vec<u8> {
@@ -88,6 +93,24 @@ pub fn echo_roundtrip<T: Transport + ?Sized>(t: &mut T, pattern: &[u8]) -> io::R
         bytes: pattern.len(),
         elapsed,
     })
+}
+
+/// Read exactly one length-framed message `(tag, payload)` from a transport. Used by the
+/// host to consume the device's connect [`HELLO_TAG`] frame before it writes anything, so
+/// the peer's reader is provably live first (see `HELLO_TAG`). Blocks until a full frame
+/// arrives. Reuses the same `ByRef` adapter as [`echo_roundtrip`] for the `?Sized` case.
+pub fn recv_frame<T: Transport + ?Sized>(t: &mut T) -> io::Result<(u8, Vec<u8>)> {
+    let mut framed = ByRef(t);
+    protocol::framing::read_frame(&mut framed)
+}
+
+/// Write one length-framed message and flush it. The flush is essential on the AOA bulk
+/// path: nusb's `EndpointWrite` buffers, so a trailing partial (<16 KiB) chunk would sit in
+/// the host's userspace buffer and the peer's `read_frame` would block forever (C-01).
+pub fn send_frame<T: Transport + ?Sized>(t: &mut T, tag: u8, payload: &[u8]) -> io::Result<()> {
+    let mut framed = ByRef(t);
+    protocol::framing::write_frame(&mut framed, tag, payload)?;
+    framed.flush()
 }
 
 /// A `Sized` reborrow adapter so a `&mut T` (with `T: ?Sized`) can be passed to the
@@ -326,5 +349,23 @@ mod tests {
         let (tag, got) = read_frame(&mut t).unwrap();
         assert_eq!(tag, 7);
         assert_eq!(got, payload);
+    }
+
+    #[test]
+    fn recv_frame_reads_one_framed_message() {
+        // Host-side connect "hello" read: a frame written by the device is returned verbatim.
+        use protocol::framing::write_frame;
+        let mut t = LoopbackTransport::default();
+        write_frame(&mut t, HELLO_TAG, &[]).unwrap();
+        let (tag, payload) = recv_frame(&mut t).unwrap();
+        assert_eq!(tag, HELLO_TAG);
+        assert!(payload.is_empty());
+    }
+
+    #[test]
+    fn hello_and_echo_tags_are_distinct() {
+        // The spike reads the hello, then echoes ECHO_TAG frames. If the two tags ever
+        // collided a hello could be mistaken for an echo frame (and vice-versa), so guard it.
+        assert_ne!(HELLO_TAG, ECHO_TAG);
     }
 }

@@ -59,9 +59,24 @@ mod android {
         // closing the fd exactly once.
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             // SAFETY: `fd` was detached on the Kotlin side via ParcelFileDescriptor.detachFd(),
-            // transferring sole ownership to this call; we wrap it exactly once.
+            // transferring sole ownership to this call; we wrap it exactly once. `fd >= 0` was
+            // checked above, satisfying the FromRawFd "valid, open fd" contract.
             let mut transport =
                 unsafe { crate::transport::AccessoryFdTransport::from_raw_fd(fd as RawFd) };
+            // Connect handshake: announce readiness the instant we own the accessory fd by
+            // sending a one-frame "hello" (`protocol::HELLO_TAG`, empty payload). The host
+            // blocks reading this BEFORE it writes, so its first bulk-OUT write can't land
+            // before our reader is live and be dropped by the gadget (startup-ordering deadlock
+            // seen on the Pixel 6a). Device→host bulk IN buffers reliably, so sending first is
+            // safe even if the host reads a moment later.
+            use std::io::Write as _;
+            if let Err(e) = protocol::framing::write_frame(&mut transport, protocol::HELLO_TAG, &[])
+                .and_then(|()| transport.flush())
+            {
+                log::error!("nativeOnUsbFd: failed to send connect hello: {e}");
+                return Ok(0); // matches echo_loop's Ok(total) shape; nothing echoed
+            }
+            log::info!("nativeOnUsbFd: sent connect hello, entering echo loop");
             crate::transport::echo_loop(&mut transport)
         }));
         match result {

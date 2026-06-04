@@ -23,7 +23,7 @@ fn main() -> std::io::Result<()> {
     let args: Vec<String> = std::env::args().collect();
 
     // Number of 1 MiB echoes; ≥ several MB amortizes per-transfer overhead (Pitfall 5).
-    const ITERS: usize = 4;
+    const ITERS: usize = 16;
     let pattern = make_pattern(1 << 20);
 
     let mut transport: Box<dyn Transport> = if args.get(1).map(String::as_str) == Some("--ncm") {
@@ -50,22 +50,35 @@ fn main() -> std::io::Result<()> {
         // Drop the pre-handshake handle; never reuse it across re-enumeration (Pitfall 2).
         drop(dev);
         println!("waiting for the device to re-enumerate in accessory mode…");
-        let acc = aoa::reacquire(Duration::from_secs(20))?;
+        let acc = aoa::reacquire(Duration::from_secs(5))?;
         Box::new(aoa::open_transport(&acc)?)
     };
 
     eprintln!("transport ready (accessory interface claimed — no sudo needed)");
 
-    // Warm-up: prove ANY bytes round-trip before the 1 MiB stress test. This bisects a
-    // large-transfer/buffering bug (32 B works, 1 MiB hangs) from a fundamental no-bytes-
-    // flow bug (even 32 B hangs).
-    eprintln!("warm-up: echoing 32 bytes…");
-    let warm = make_pattern(32);
-    let w = echo_roundtrip(transport.as_mut(), &warm)?;
+    // Connect handshake: the DEVICE sends a one-frame hello the instant it opens the
+    // accessory; block until we read it so we KNOW the app's reader is live before we write.
+    // Without this, our first bulk-OUT write can land before the app has opened
+    // /dev/usb_accessory and the gadget drops it — a startup-ordering deadlock observed live
+    // on the Pixel 6a (host wrote ~2-4 s before the app opened; both sides then hung).
+    // (NCM/TCP has no such race, but the hello is harmless there — the app sends it anyway.)
+    eprintln!("waiting for device hello (app opened the accessory)…");
+    let (_tag, hello) = macos_host::transport::recv_frame(transport.as_mut())?;
     eprintln!(
-        "warm-up OK: {} bytes round-tripped in {:?}",
-        w.bytes, w.elapsed
+        "device hello received ({} bytes) — app reader is live",
+        hello.len()
     );
+
+    // Warm-up: prove a small frame round-trips both directions before the 1 MiB stress test.
+    // A failure here localizes to the transport handshake rather than the bulk loop.
+    use macos_host::transport::{recv_frame, send_frame, ECHO_TAG};
+    let warm = make_pattern(32);
+    send_frame(transport.as_mut(), ECHO_TAG, &warm)?;
+    let (_t, got) = recv_frame(transport.as_mut())?;
+    if got != warm {
+        return Err(std::io::Error::other("warm-up echo mismatch"));
+    }
+    println!("warm-up OK: 32B frame echoed byte-for-byte");
 
     let mut total_bytes = 0usize;
     let mut total_elapsed = Duration::ZERO;
