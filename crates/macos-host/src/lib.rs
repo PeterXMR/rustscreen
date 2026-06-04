@@ -14,3 +14,9 @@ pub mod capture;
 pub mod capture_select;
 pub mod encode;
 pub mod encode_vt;
+pub mod transport;
+
+/// Live USB (AOA) host adapter — compiled only under `--features live-usb` (Wave B,
+/// hands-on-Mac). Excluded from default CI so Wave A stays cross-platform.
+#[cfg(feature = "live-usb")]
+pub mod aoa;

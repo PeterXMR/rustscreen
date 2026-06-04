@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  USB accessory filter. manufacturer/model/version MUST equal the AOA control-request-52
+  identity strings in crates/macos-host/src/aoa.rs (IDENTITY: string 0 = manufacturer,
+  string 1 = model, string 3 = version) verbatim, or Android never fires the
+  USB_ACCESSORY_ATTACHED intent (RESEARCH Pitfall 4). The description/uri/serial strings
+  are sent in the handshake but are NOT matched by this filter.
+-->
+<resources>
+    <usb-accessory
+        manufacturer="RustScreen"
+        model="RustScreen Host"
+        version="1.0" />
+</resources>
