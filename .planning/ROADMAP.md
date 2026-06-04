@@ -12,7 +12,7 @@ RustScreen de-risks first, then builds. The journey: scaffold the workspace (P0,
 
 - [x] **Phase P0: Workspace Scaffold & Cross-Compilation** - Cargo workspace, cross-compile, thin Kotlin shell, CI (COMPLETE — PR #1)
 - [x] **Phase P2: Create a Virtual Display from Rust** 🔬 - Keystone risk R1 RETIRED; phantom display via private `CGVirtualDisplay` (COMPLETE — branch `feat/p2-virtual-display`)
-- [ ] **Phase P1: USB Byte Round-Trip** 🔬 - ⚠ DEFERRED (hardware-blocked: needs Pixel 6a on USB). 1 MB echoes both directions; resolves D1 (AOA vs NCM)
+- [~] **Phase P1: USB Byte Round-Trip** 🔬 - Wave A + Wave B code done (cable-free TDD green; AOA host + Android glue compile, cfg `live-usb`); Task B3 live 1 MB echo + D1 verdict PENDING on the Pixel 6a
 - [ ] **Phase P3: Capture + Hardware-Encode on macOS** 🔬 - Capture virtual display, VideoToolbox H.264 to a playable file (NEXT — Mac-only, unblocked)
 - [ ] **Phase P4: Decode + Present on the Pixel** 🔬 - ⚠ DEFERRED (hardware-blocked: needs Pixel 6a). AMediaCodec decode-to-surface onto `ANativeWindow`
 - [ ] **Phase P5: Live End-to-End Pipeline + Latency** - Wire P1–P4 live; measure glass-to-glass < 50 ms (cable-free protocol slice planned)
@@ -55,7 +55,11 @@ RustScreen de-risks first, then builds. The journey: scaffold the workspace (P0,
   2. The round-trip reproduces reliably across cable replug.
   3. Measured throughput is documented with ≥ ~200 Mbit/s headroom for 1080p H.264, and D1 (AOA vs NCM/TCP) is decided with recorded rationale.
 **Type**: Spike (dual sub-spike: A = AOA via `nusb` + `jni` `UsbManager.openAccessory()`, lead; B = NCM/TCP fallback). Expand into a TDD plan after the spike succeeds.
-**Plans**: TBD
+**Plans:** 1 plan (Wave A cable-free TDD + Wave B hands-on, in P1-01-PLAN.md). D1 verdict + measured throughput recorded here on completion.
+Plans:
+- [~] P1-01-PLAN.md — **Wave A + Wave B code DONE (2026-06-03, branch `feat/p1-usb-roundtrip`, not merged); Task B3 live hardware PENDING.** Landed: `Transport` seam + echo/pattern/throughput/chunking + framing regression + Android `echo_loop` (TDD, 77→88 workspace tests green); `nusb 0.2.3` gated behind `live-usb` (default build nusb-free); AOA host (`aoa.rs` handshake 51/52/53 + reacquire + `AoaTransport`/`NcmTransport`) + `p1_echo` spike (compiles under `--features live-usb`); Android accessory glue (`nativeOnUsbFd` JNI + `accessory_filter.xml` + manifest intent-filter + `openAccessory`→`detachFd`, arm64 cross-build clean). Pending (Task B3, needs Pixel 6a): LIVE 1 MB echo byte-for-byte / replug / measured throughput / **D1 verdict**.
+
+**D1 verdict: NOT YET DECIDED** — awaits the live Task B3 echo. Measured throughput unrecorded; whether macOS needs `sudo` to `claim_interface` (A2) unrecorded. To be filled in here on B3 completion.
 
 ### Phase P3: Capture + Hardware-Encode on macOS 🔬
 **Goal**: The virtual display is captured and hardware-encoded to H.264, producing a playable file, with codec config and per-frame latency observable.
@@ -141,7 +145,7 @@ Plans:
 |-------|----------------|--------|-----------|
 | P0. Workspace Scaffold | — (PR #1) | Complete | 2026-06-02 |
 | P2. Virtual Display (R1 keystone) 🔬 | spike ✓ | Complete | 2026-06-03 |
-| P1. USB Byte Round-Trip 🔬 | 0/TBD | ⚠ Deferred (needs phone) | - |
+| P1. USB Byte Round-Trip 🔬 | 0/1 | Wave A + Wave B code done (88 tests green; cfg live-usb compiles); Task B3 live echo + D1 verdict pending hardware | - |
 | P3. Capture + Encode 🔬 | 0/1 | Planned (Mac-only, next) | - |
 | P4. Decode + Present 🔬 | 0/TBD | ⚠ Deferred (needs phone) | - |
 | P5. Live Pipeline + Latency | 0/1 cable-free slice | Cable-free slice planned (live wiring blocked on P1/P4) | - |

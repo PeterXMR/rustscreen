@@ -3,5 +3,17 @@ name = "macos-host"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+# Live USB (AOA) host path — enables the optional nusb dep and compiles the
+# aoa module + p1_echo bin. Off by default so the default Wave A build stays
+# clean (no nusb pulled). nusb is `optional` (below), NOT target-gated: a
+# target-gated optional dep makes `--features live-usb` fail to resolve `dep:nusb`
+# on non-macOS hosts (e.g. `--all-features` on Linux CI). nusb is pure-Rust and
+# cross-platform, so a plain optional dependency keeps the feature buildable
+# everywhere while the AOA path is only *run* on macOS.
+live-usb = ["dep:nusb"]
+
 [dependencies]
 protocol = { path = "../protocol" }
+log = "0.4"
+nusb = { version = "0.2", optional = true }

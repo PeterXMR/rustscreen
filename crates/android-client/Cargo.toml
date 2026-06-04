@@ -6,6 +6,11 @@ edition = "2021"
 [lib]
 crate-type = ["cdylib"]
 
+[dependencies]
+# Shared length-framing codec — reused verbatim by echo_loop (host-testable, not
+# cfg-gated) so the phone and the macOS host stay wire-compatible.
+protocol = { path = "../protocol" }
+
 [target.'cfg(target_os = "android")'.dependencies]
 jni = "0.21"
 ndk = "0.9"

@@ -5,13 +5,28 @@
         android:label="RustScreen"
         android:theme="@android:style/Theme.NoTitleBar.Fullscreen">
 
+        <!-- singleTop: after the user taps "Allow" on the USB permission dialog, Android
+             resumes the EXISTING instance (onNewIntent + onResume) rather than re-running
+             onCreate. The activity re-checks the accessory in both, so the fd is never
+             dropped (HI-01). -->
         <activity
             android:name=".MainActivity"
+            android:launchMode="singleTop"
             android:exported="true">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
+
+            <!-- Launch on USB accessory attach. The action AND the meta-data name are the
+                 ACCESSORY constant (NOT the device variant); the resource points at the
+                 manufacturer/model/version filter matching aoa.rs IDENTITY (Pitfall 4). -->
+            <intent-filter>
+                <action android:name="android.hardware.usb.action.USB_ACCESSORY_ATTACHED" />
+            </intent-filter>
+            <meta-data
+                android:name="android.hardware.usb.action.USB_ACCESSORY_ATTACHED"
+                android:resource="@xml/accessory_filter" />
         </activity>
 
     </application>
