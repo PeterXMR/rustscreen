@@ -20,6 +20,38 @@ RustScreen de-risks first, then builds. The journey: scaffold the workspace (P0,
 - [ ] **Phase P7: Robustness, UX, Codec Options, Signing + Rust-Purity Upgrades** - Hotplug, HEVC, menu-bar, notarize, pure-Rust adapters
 - [ ] **Phase P8: Packaging, Distribution, OSS Hygiene** - Notarized DMG + release `.apk`, README/LICENSE, clone-to-second-screen
 
+## Delivery PR Ladder (functional → usable → shippable)
+
+Once the spikes (P1–P4) are merged, the remaining work ships as a priority-ordered ladder
+of PRs. Earlier = more essential to a working, usable product. Each PR names the **feature
+a user gets** and the phase it draws from. Items marked ⭐NEW were added on user request
+(2026-06-04); they are largely **verification + polish on capability that already exists**
+(the cursor is already composited via `setShowsCursor(true)`; the virtual display already
+presents as a named, arrangeable monitor per P2), surfaced only once the live pipeline runs.
+
+| Item | GH PR | Title | Phase | Feature it brings | Depends on |
+|---|---|---|---|---|---|
+| 1 | **#21** (open) | **Live video pipeline** | P5 | The Mac desktop appears live on the phone — it becomes a second screen | P4 decode (merged PR #20) |
+| 2 | #22 | **⭐NEW Phone presents as a real, arrangeable external display** | P2→P5/P7 | The phone sits in System Settings ▸ Displays as a named monitor you arrange (choose which side); held alive for the whole session; stable identity so macOS remembers its position; HiDPI scaling option (D6); removed cleanly on disconnect | item 1; coordinate with the `cg-virtual-display` objc2 work (merged PR #18) — same crate |
+| 3 | #23 | **⭐NEW Mouse cursor visible on the external screen** | P5 | Your Mac cursor shows on the phone when you move it onto that display (carry `setShowsCursor(true)` into the live capture path; verify on device; handle HiDPI cursor scaling + cursor-only-update frames) | item 1 (rides directly on it) |
+| 4 | #24 | **Live touch back-channel** | P6 | Tap/drag on the phone moves and clicks the Mac cursor (the inverse direction of item 3) | item 1 |
+| 5 | #25 | **Hotplug / reconnect / clean teardown** | P7 | Survive cable pulls; phantom display vanishes on disconnect; auto-reconnect | item 1 (shares `session.rs`/`lib.rs` with item 4 — serialize) |
+| 6 | #26 | **Latency proof + stream tuning** | P5 | Smooth, measured-responsive stream (jitter buffer, drop-to-keyframe, adaptive bitrate); proves glass-to-glass < 50 ms | item 1 |
+| 7 | #27 | **Menu-bar app + onboarding** | P7/D5 | Launch from the menu bar; connect/disconnect, resolution picker, latency readout; permission prompts | item 1 (ideally item 4) |
+| 8 | #28 | **Resolution / orientation / landscape lock** | P7 | Rotate the phone and the display follows; landscape lock; pick resolution | item 1/item 4 |
+| 9 | #29 | **HEVC codec toggle** | P7 | Optional HEVC for better quality / lower bandwidth, H.264 fallback | item 1 |
+| 10 | #30 | **NativeActivity purity swap** | P7 | No user-facing change; drops the Kotlin shell (Rust-source purity ~99%) | all Android items (1, 4, 8) merged — rewrites their files |
+| 11 | #31 | **Signing, notarization & release** | P7/P8 | A new user can clone, install, plug in, and get a second screen following only the README | items 1–8 functional |
+
+**PR-number anchor (2026-06-04):** latest merged = **PR #20**; ladder item 1 = **open PR #21**. The GH PR numbers for items 2–11 (**#22–#31**) are *projected* — they assume the items are opened in ladder order with nothing interleaved. GitHub assigns the real number at creation, so if other PRs land between, shift these accordingly. The **Item** column is the stable identifier; **Depends on** references ladder items as "item N" and real GitHub PRs as "#N".
+
+**Milestones:** item 1 = "works as a screen." items 1–3 = a real, arrangeable second monitor you can
+see your cursor on. items 1–4 = the full README promise (touch-capable live monitor). Through item 7 =
+daily-usable app. Through item 11 = shippable to other people.
+
+**Two usability gaps folded into the ladder** (not previously explicit in the architecture doc):
+keep-the-phone-screen-awake (`FLAG_KEEP_SCREEN_ON`, fold into item 1) and landscape orientation lock (item 8).
+
 ## Phase Details
 
 ### Phase P0: Workspace Scaffold & Cross-Compilation

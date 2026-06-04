@@ -89,3 +89,10 @@ required-features = ["live-capture"]
 [[bin]]
 name = "p3_encode"
 required-features = ["live-capture"]
+
+# P5 live-streaming host (item 1 / PR #21) — virtual display → capture → encode → push→pull
+# bridge → run_stream_session over the live AOA transport → phone. Needs BOTH the capture/encode
+# stack and the USB host path, so it requires both live features.
+[[bin]]
+name = "p5_stream"
+required-features = ["live-capture", "live-usb"]
