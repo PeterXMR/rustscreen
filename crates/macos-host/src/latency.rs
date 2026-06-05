@@ -11,6 +11,144 @@
 //! sub-microsecond resolution. The accumulator is generic over what is being timed —
 //! it only records numbers.
 
+use std::collections::VecDeque;
+
+use crate::encode::LatencyStats;
+use protocol::clock::ClockOffset;
+
+/// Host-side per-frame stage timestamps (host clock, microseconds), held until the
+/// matching phone [`protocol::messages::Frame::Stats`] arrives.
+#[derive(Debug, Clone, Copy)]
+struct HostStamps {
+    pts_us: u64,
+    capture_us: u64,
+    encode_done_us: u64,
+    send_done_us: u64,
+}
+
+/// A completed per-stage + glass-to-glass latency report (each field µs).
+#[derive(Debug, Clone, Default)]
+pub struct LatencyReport {
+    pub capture_to_encode: LatencyStats,
+    pub encode_to_send: LatencyStats,
+    pub send_to_arrive: LatencyStats,
+    pub arrive_to_decode: LatencyStats,
+    pub decode_to_present: LatencyStats,
+    pub glass_to_glass: LatencyStats,
+    /// Count of samples with a negative computed interval (clock jitter), clamped to 0.
+    pub anomalies: u64,
+}
+
+/// Fuses host-side and phone-side per-frame timestamps (correlated by `pts_us`) into a
+/// per-stage + glass-to-glass [`LatencyReport`]. Host timestamps wait in a bounded FIFO
+/// keyed by `pts_us` until the phone's `Frame::Stats` arrives (or they are evicted).
+#[derive(Debug)]
+pub struct PipelineLatency {
+    inflight: VecDeque<HostStamps>,
+    capacity: usize,
+    report: LatencyReport,
+}
+
+impl PipelineLatency {
+    /// New accumulator retaining at most `capacity` un-matched host records.
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            inflight: VecDeque::with_capacity(capacity),
+            capacity: capacity.max(1),
+            report: LatencyReport::default(),
+        }
+    }
+
+    /// Record the host-side stage times for one frame (host clock, µs). Evicts the oldest
+    /// un-matched record when over capacity.
+    pub fn record_host(
+        &mut self,
+        pts_us: u64,
+        capture_us: u64,
+        encode_done_us: u64,
+        send_done_us: u64,
+    ) {
+        if self.inflight.len() >= self.capacity {
+            self.inflight.pop_front();
+        }
+        self.inflight.push_back(HostStamps {
+            pts_us,
+            capture_us,
+            encode_done_us,
+            send_done_us,
+        });
+    }
+
+    /// Record the phone's `Frame::Stats` for one frame, converting its (phone-clock) times
+    /// to host time via `offset`, then fusing with the matching host record. A report whose
+    /// `pts_us` has no in-flight host record is dropped.
+    pub fn record_stats(
+        &mut self,
+        pts_us: u64,
+        arrive_us: u64,
+        decode_us: u64,
+        present_us: u64,
+        offset: ClockOffset,
+    ) {
+        let Some(idx) = self.inflight.iter().position(|h| h.pts_us == pts_us) else {
+            return;
+        };
+        let h = self
+            .inflight
+            .remove(idx)
+            .expect("index from position is valid");
+
+        // Phone clock → host clock: host = phone - offset.
+        let to_host = |phone: u64| phone as i128 - offset.offset_us as i128;
+        let arrive_h = to_host(arrive_us);
+        let decode_h = to_host(decode_us);
+        let present_h = to_host(present_us);
+
+        let mut anomaly = false;
+        let mut gap = |stats: &mut LatencyStats, from: i128, to: i128| {
+            let d = to - from;
+            if d < 0 {
+                anomaly = true;
+                stats.record(0);
+            } else {
+                stats.record(d as u64);
+            }
+        };
+
+        gap(
+            &mut self.report.capture_to_encode,
+            h.capture_us as i128,
+            h.encode_done_us as i128,
+        );
+        gap(
+            &mut self.report.encode_to_send,
+            h.encode_done_us as i128,
+            h.send_done_us as i128,
+        );
+        gap(
+            &mut self.report.send_to_arrive,
+            h.send_done_us as i128,
+            arrive_h,
+        );
+        gap(&mut self.report.arrive_to_decode, arrive_h, decode_h);
+        gap(&mut self.report.decode_to_present, decode_h, present_h);
+        gap(
+            &mut self.report.glass_to_glass,
+            h.capture_us as i128,
+            present_h,
+        );
+
+        if anomaly {
+            self.report.anomalies += 1;
+        }
+    }
+
+    /// The accumulated report so far (cheap clone of the stage stats).
+    pub fn report(&self) -> LatencyReport {
+        self.report.clone()
+    }
+}
+
 /// Accumulates per-sample latency measurements (microseconds) and reports
 /// count / mean / min / max.
 ///
@@ -88,6 +226,60 @@ impl LatencyAccum {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn offset(us: i64) -> protocol::clock::ClockOffset {
+        protocol::clock::ClockOffset {
+            offset_us: us,
+            rtt_us: 0,
+        }
+    }
+
+    #[test]
+    fn fuses_host_and_phone_into_glass_to_glass() {
+        let mut p = PipelineLatency::new(16);
+        // Host stages for pts 1000 (host clock, µs): cap=0, enc=8, send=10.
+        p.record_host(1000, 0, 8, 10);
+        // Phone stages (phone clock): arrive=110, decode=120, present=130, offset=+100.
+        // Converted to host clock: arrive=10, decode=20, present=30.
+        p.record_stats(1000, 110, 120, 130, offset(100));
+        let r = p.report();
+        assert_eq!(r.glass_to_glass.count(), 1);
+        // present_host(30) - capture(0) = 30 µs.
+        assert_eq!(r.glass_to_glass.max(), Some(30));
+        assert_eq!(r.capture_to_encode.max(), Some(8));
+        assert_eq!(r.encode_to_send.max(), Some(2));
+        assert_eq!(r.send_to_arrive.max(), Some(0));
+        assert_eq!(r.arrive_to_decode.max(), Some(10));
+        assert_eq!(r.decode_to_present.max(), Some(10));
+    }
+
+    #[test]
+    fn stats_without_matching_host_record_is_dropped() {
+        let mut p = PipelineLatency::new(16);
+        p.record_stats(999, 100, 110, 120, offset(0)); // no host record for 999
+        assert_eq!(p.report().glass_to_glass.count(), 0);
+    }
+
+    #[test]
+    fn bounded_map_evicts_oldest() {
+        let mut p = PipelineLatency::new(2); // capacity 2 in-flight
+        p.record_host(1, 0, 1, 2);
+        p.record_host(2, 0, 1, 2);
+        p.record_host(3, 0, 1, 2); // evicts pts 1
+        p.record_stats(1, 10, 11, 12, offset(0)); // evicted → dropped
+        p.record_stats(3, 10, 11, 12, offset(0)); // retained → fuses
+        assert_eq!(p.report().glass_to_glass.count(), 1);
+    }
+
+    #[test]
+    fn negative_interval_clamps_to_zero_and_counts_anomaly() {
+        let mut p = PipelineLatency::new(16);
+        p.record_host(1, 0, 1, 2);
+        p.record_stats(1, 50, 50, 50, offset(100)); // present_host = 50-100 = -50
+        let r = p.report();
+        assert_eq!(r.glass_to_glass.max(), Some(0), "negative G2G clamps to 0");
+        assert_eq!(r.anomalies, 1);
+    }
 
     #[test]
     fn new_accum_has_no_samples() {
