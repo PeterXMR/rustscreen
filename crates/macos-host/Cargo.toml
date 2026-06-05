@@ -14,7 +14,9 @@ rust-version = "1.80"
 # on non-macOS hosts (e.g. `--all-features` on Linux CI). nusb is pure-Rust and
 # cross-platform, so a plain optional dependency keeps the feature buildable
 # everywhere while the AOA path is only *run* on macOS.
-live-usb = ["dep:nusb"]
+# Also pulls `libc` for the `rustscreen` daemon's signal handler + `kill(pid,0)` liveness
+# check (the bin requires live-usb, so libc rides along here rather than as its own feature).
+live-usb = ["dep:nusb", "dep:libc"]
 # Live macOS cursor injection (P6 Wave B, hands-on-Mac) — pulls `core-graphics` and
 # compiles the `touch::CgEventSink` adapter (impl of the `PointerSink` port) + the
 # `p6_inject` smoke bin. Off by default so the default cross-platform build stays clean.
@@ -53,6 +55,7 @@ live-capture = [
 protocol = { path = "../protocol" }
 log = "0.4"
 nusb = { version = "0.2", optional = true }
+libc = { version = "0.2", optional = true }
 core-graphics = { version = "0.24", optional = true }
 objc2 = { version = "0.6", optional = true }
 objc2-foundation = { version = "0.3", optional = true }
@@ -95,4 +98,12 @@ required-features = ["live-capture"]
 # stack and the USB host path, so it requires both live features.
 [[bin]]
 name = "p5_stream"
+required-features = ["live-capture", "live-usb"]
+
+# rustscreen terminal CLI (Active-Priority 1) — controller + detached worker. `start` spawns a
+# detached `__serve` worker (own process group, stdio → ~/.rustscreen/rustscreen.log) that runs
+# serve::run_host; `stop`/`status` act on the PID file. Needs both live features (it drives the
+# full host pipeline) and the gated libc (signal handler + kill liveness).
+[[bin]]
+name = "rustscreen"
 required-features = ["live-capture", "live-usb"]
