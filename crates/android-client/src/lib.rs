@@ -2,6 +2,18 @@
 //! All app logic lives here in Rust; the Kotlin shell is glue only and will be replaced by
 //! NativeActivity in a later phase.
 
+use std::sync::OnceLock;
+use std::time::Instant;
+
+static CLOCK_START: OnceLock<Instant> = OnceLock::new();
+
+/// Process-global monotonic phone clock in microseconds. All latency timestamps
+/// (arrive/decode/present + clock-sync t1/t2) MUST use this single epoch so they are
+/// comparable and consistent with the host's clock-sync offset.
+pub fn now_us() -> u64 {
+    CLOCK_START.get_or_init(Instant::now).elapsed().as_micros() as u64
+}
+
 /// Transport core: the platform-agnostic `echo_loop` (host-testable) plus the
 /// android-only `AccessoryFdTransport`. `echo_loop` is NOT cfg-gated so CI exercises it.
 pub mod transport;

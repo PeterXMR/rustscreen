@@ -34,7 +34,6 @@
 
 use std::ffi::CStr;
 use std::ptr::NonNull;
-use std::time::Instant;
 
 use ndk_sys as sys;
 use protocol::messages::VideoCodec;
@@ -126,12 +125,6 @@ pub struct MediaCodecDecoder {
     window: Option<NativeWindow>,
     /// The running decoder, created lazily on the first `configure`.
     codec: Option<Codec>,
-    /// Session-start reference for the monotonic phone clock. `Instant` is monotonic on
-    /// Android (backed by `CLOCK_MONOTONIC`); `decode_us`/`present_us` in each
-    /// [`PresentedFrame`] are microseconds elapsed since this instant. The host only needs
-    /// the *differences* between the phone's arrive/decode/present stamps and a clock-sync
-    /// offset, so a session-relative epoch is sufficient (and avoids wall-clock skew).
-    epoch: Instant,
 }
 
 impl MediaCodecDecoder {
@@ -141,13 +134,7 @@ impl MediaCodecDecoder {
         MediaCodecDecoder {
             window: Some(window),
             codec: None,
-            epoch: Instant::now(),
         }
-    }
-
-    /// Microseconds on the monotonic phone clock since session start ([`Self::epoch`]).
-    fn now_us(&self) -> u64 {
-        self.epoch.elapsed().as_micros() as u64
     }
 }
 
@@ -375,10 +362,12 @@ impl MediaCodecDecoder {
     ///
     /// Loops until the decoder reports `TRY_AGAIN_LATER` (no more output ready), so a
     /// burst of buffered output is flushed in one call without unbounded blocking. Each
-    /// rendered buffer is stamped with the monotonic phone clock: `decode_us` when the
-    /// output buffer is dequeued (decode complete), `present_us` right after
-    /// `releaseOutputBuffer(render = true)` (the present), keyed by the buffer's
-    /// `presentationTimeUs` (the originating `Frame::Video.pts_us`).
+    /// rendered buffer is stamped with the process-global monotonic phone clock
+    /// ([`crate::now_us`]): `decode_us` when the output buffer is dequeued (decode
+    /// complete), `present_us` right after `releaseOutputBuffer(render = true)` (the
+    /// present), keyed by the buffer's `presentationTimeUs` (the originating
+    /// `Frame::Video.pts_us`). Using the global clock ensures these timestamps share the
+    /// same epoch as `arrive_us` and the ClockPong t1/t2 values stamped in `run_session`.
     fn drain_output(
         &self,
         codec: *mut sys::AMediaCodec,
@@ -400,13 +389,15 @@ impl MediaCodecDecoder {
                 // A decoded output buffer is ready: stamp decode-complete now (the dequeue
                 // is the decode), then release it WITH render so it composites onto the
                 // ANativeWindow (D3 — no CPU copy back to us), and stamp present right after.
-                let decode_us = self.now_us();
+                // Use the process-global clock so these timestamps share the same epoch as
+                // arrive_us (stamped in run_session) and the ClockPong t1/t2 values.
+                let decode_us = crate::now_us();
                 // SAFETY: `out_index` is a valid output buffer index just dequeued.
                 let status = unsafe {
                     sys::AMediaCodec_releaseOutputBuffer(codec, out_index as usize, true)
                 };
                 check(status, "releaseOutputBuffer(render=true)")?;
-                let present_us = self.now_us();
+                let present_us = crate::now_us();
                 // `presentationTimeUs` is the pts we queued with this access unit; the cast
                 // is safe because we only ever queue non-negative `u64` pts values.
                 presented.push(PresentedFrame {

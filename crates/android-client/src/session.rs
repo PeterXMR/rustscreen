@@ -36,7 +36,6 @@
 
 use std::collections::VecDeque;
 use std::io::{self, Read, Write};
-use std::time::Instant;
 
 use protocol::messages::{
     AgreedConfig, ClientCaps, Control, Frame, Handshake, MessageError, NegotiationError,
@@ -221,7 +220,10 @@ const STATS_TRACKER_CAPACITY: usize = 64;
 ///
 /// Returns [`SessionSummary`] on clean exit; [`SessionError`] on any unrecoverable error.
 ///
-/// The clock is [`Instant::now`]-based (monotonic on Android, backed by `CLOCK_MONOTONIC`);
+/// The clock is the process-global [`crate::now_us`] (a single `OnceLock<Instant>` epoch,
+/// monotonic on Android, backed by `CLOCK_MONOTONIC`). This ensures that `arrive_us`,
+/// `ClockPong` t1/t2, and the adapter's `decode_us`/`present_us` all share one epoch so
+/// the host's clock-sync offset converts them correctly.
 /// [`run_session_with_clock`] takes an injectable clock so the latency orchestration is
 /// deterministically testable without a device.
 pub fn run_session<T: Read + Write>(
@@ -230,9 +232,13 @@ pub fn run_session<T: Read + Write>(
     decode_session: &mut DecodeSession,
     decoder: &mut dyn VideoDecoder,
 ) -> Result<SessionSummary, SessionError> {
-    let epoch = Instant::now();
-    let now_us = move || epoch.elapsed().as_micros() as u64;
-    run_session_with_clock(transport, client_caps, decode_session, decoder, now_us)
+    run_session_with_clock(
+        transport,
+        client_caps,
+        decode_session,
+        decoder,
+        crate::now_us,
+    )
 }
 
 /// [`run_session`] with an injectable monotonic clock (`now_us`), for deterministic tests.
