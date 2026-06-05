@@ -24,3 +24,9 @@ pub mod transport;
 /// hands-on-Mac). Excluded from default CI so Wave A stays cross-platform.
 #[cfg(feature = "live-usb")]
 pub mod aoa;
+
+/// The live host pipeline (`serve::run_host`) — virtual display → capture → encode → AOA → phone.
+/// Extracted from the `p5_stream` spike; both `p5_stream` and the `rustscreen` daemon drive it.
+/// Needs both the capture/encode stack and the USB host path, so it is gated on both features.
+#[cfg(all(feature = "live-capture", feature = "live-usb"))]
+pub mod serve;
