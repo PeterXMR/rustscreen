@@ -455,7 +455,9 @@ pub fn run_stream_session_instrumented(
     report_each: std::time::Duration,
     mut now_us: impl FnMut() -> u64,
     mut on_report: impl FnMut(&crate::latency::LatencyReport),
+    stop: &std::sync::atomic::AtomicBool,
 ) -> Result<SendSessionSummary, SessionError> {
+    use std::sync::atomic::Ordering;
     use std::sync::mpsc::RecvTimeoutError;
     use std::time::Instant;
 
@@ -474,6 +476,12 @@ pub fn run_stream_session_instrumented(
     };
 
     loop {
+        // External stop (e.g. `rustscreen stop` → SIGTERM) breaks the live stream so the
+        // normal teardown below runs (final stats drain + byte tally). Checked between whole
+        // frames, never mid-write, so the wire framing stays intact.
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
         match frames.recv_timeout(heartbeat) {
             Ok(first) => {
                 // Drain everything that piled up in the channel while the previous (slow) USB
@@ -1050,6 +1058,7 @@ mod tests {
             std::time::Duration::from_secs(3600), // no periodic report during the test
             now,
             |_r| {},
+            &std::sync::atomic::AtomicBool::new(false),
         )
         .unwrap();
 
@@ -1076,6 +1085,48 @@ mod tests {
             sent.iter().any(|f| matches!(f, Frame::VideoConfig { .. })),
             "VideoConfig still precedes the surviving keyframe"
         );
+    }
+
+    #[test]
+    fn instrumented_session_returns_when_stop_flag_set() {
+        use std::sync::atomic::AtomicBool;
+        // A deep backlog is queued, but the stop flag is already set: the loop must break on
+        // its first iteration (before draining any frame) and return cleanly — proving an
+        // external `rustscreen stop` (SIGTERM) tears down an active stream promptly.
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(keyframe_encoded(0)).unwrap();
+        tx.send(delta_encoded(16_666)).unwrap();
+        tx.send(keyframe_encoded(33_332)).unwrap();
+        // Keep the sender alive: a closed channel would also end the loop, masking the stop path.
+        let _keep = tx;
+
+        let (_stats_tx, stats_rx) = std::sync::mpsc::channel();
+        let mut t = 0u64;
+        let now = move || {
+            t += 10;
+            t
+        };
+        let mut pipeline = PipelineLatency::new(16);
+        let mut sink: Vec<u8> = Vec::new();
+        let stop = AtomicBool::new(true); // stop already requested
+
+        let summary = run_stream_session_instrumented(
+            rx,
+            &mut sink,
+            default_agreed(),
+            None,
+            &stats_rx,
+            &mut pipeline,
+            std::time::Duration::from_millis(5),
+            std::time::Duration::from_secs(3600),
+            now,
+            |_r| {},
+            &stop,
+        )
+        .unwrap();
+
+        assert_eq!(summary.frames, 0, "stop breaks before any frame is sent");
+        assert!(sink.is_empty(), "no bytes written once stop is observed");
     }
 
     #[test]
@@ -1233,6 +1284,7 @@ mod tests {
             std::time::Duration::from_secs(3600), // no periodic report during the test
             now,
             |_r| {},
+            &std::sync::atomic::AtomicBool::new(false),
         )
         .unwrap();
         producer.join().unwrap();
@@ -1314,6 +1366,7 @@ mod tests {
             std::time::Duration::from_secs(3600),
             now,
             |_r| {},
+            &std::sync::atomic::AtomicBool::new(false),
         )
         .unwrap();
 
@@ -1376,6 +1429,7 @@ mod tests {
             std::time::Duration::from_secs(3600),
             now,
             |_r| {},
+            &std::sync::atomic::AtomicBool::new(false),
         )
         .unwrap();
 
@@ -1450,6 +1504,7 @@ mod tests {
             std::time::Duration::from_secs(3600),
             now,
             |_r| {},
+            &std::sync::atomic::AtomicBool::new(false),
         )
         .unwrap();
 

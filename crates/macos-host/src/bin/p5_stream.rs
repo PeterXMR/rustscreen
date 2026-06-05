@@ -691,6 +691,7 @@ fn main() {
         Duration::from_secs(2), // print a latency report every ~2 s
         now_us,
         |report| print_report(report, offset),
+        &std::sync::atomic::AtomicBool::new(false),
     );
 
     println!(
