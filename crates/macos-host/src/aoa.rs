@@ -295,6 +295,61 @@ impl Write for AoaTransport {
     }
 }
 
+impl AoaTransport {
+    /// Split into independent read and write halves so the host can read inbound `Frame::Stats`
+    /// on a dedicated thread while the main thread streams video on the write half. Each half
+    /// owns one nusb endpoint.
+    ///
+    /// The claimed `Interface` is dropped here: each `EndpointWrite`/`EndpointRead` keeps its own
+    /// endpoint (and thereby the interface claim) alive independently, so the duplex link survives
+    /// the split.
+    pub fn split(self) -> (AoaReadHalf, AoaWriteHalf) {
+        (AoaReadHalf(self.reader), AoaWriteHalf(self.writer))
+    }
+}
+
+/// The read half of a split [`AoaTransport`] — owns the bulk IN endpoint. Lives on the
+/// stats-reader thread, which loops `Frame::read_from(&mut read_half)`.
+pub struct AoaReadHalf(nusb::io::EndpointRead<Bulk>);
+
+impl AoaReadHalf {
+    /// Bound how long a blocking `read()` waits for a transfer before returning
+    /// [`io::ErrorKind::TimedOut`]. nusb does NOT cancel the pending transfer on timeout — it
+    /// may complete later if the read is retried — so a timeout that fires while *no* bytes of a
+    /// frame have been consumed is harmless: the reader can poll a stop flag and re-issue the
+    /// read without losing data. The reader thread uses this so it can notice teardown promptly
+    /// while it is idle between whole frames, instead of blocking forever on a bulk IN that the
+    /// phone will never satisfy once capture has stopped.
+    pub fn set_read_timeout(&mut self, timeout: std::time::Duration) {
+        self.0.set_read_timeout(timeout);
+    }
+
+    /// Cancel any pending IN transfer so a blocking `read()` unwinds to EOF. Used on teardown as
+    /// a hard backstop in case the reader is parked inside a transfer.
+    pub fn cancel_all(&mut self) {
+        self.0.cancel_all();
+    }
+}
+
+impl Read for AoaReadHalf {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.0.read(buf)
+    }
+}
+
+/// The write half of a split [`AoaTransport`] — owns the bulk OUT endpoint. Lives on the main
+/// thread, which streams `VideoConfig`/`Video` frames over it.
+pub struct AoaWriteHalf(nusb::io::EndpointWrite<Bulk>);
+
+impl Write for AoaWriteHalf {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.0.write(buf)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.0.flush()
+    }
+}
+
 /// NCM/TCP fallback transport (RESEARCH Pattern 5). A `TcpStream` is already
 /// `Read + Write + Send`; this newtype exists only to name the D1 fallback path. The same
 /// `echo_roundtrip` drives it unchanged.
@@ -317,7 +372,40 @@ impl Write for NcmTransport {
 
 impl NcmTransport {
     /// Connect a TCP stream to the phone's NCM-tethered listener.
+    ///
+    /// Disables Nagle's algorithm (`TCP_NODELAY`) on the connected stream: the
+    /// framing writes a small length-prefixed header immediately followed by the
+    /// payload, and Nagle would coalesce those bursty back-to-back writes, adding up
+    /// to ~40 ms of delay on this latency-critical fallback path (latency TODO #11).
     pub fn connect(addr: &str) -> io::Result<Self> {
-        Ok(NcmTransport(TcpStream::connect(addr)?))
+        let stream = TcpStream::connect(addr)?;
+        stream.set_nodelay(true)?;
+        Ok(NcmTransport(stream))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::TcpListener;
+
+    /// Latency TODO #11: the NCM/TCP fallback must disable Nagle's algorithm
+    /// (`TCP_NODELAY`) so the bursty header+payload writes are not coalesced (up to
+    /// ~40 ms added). Bind a loopback listener, connect through `NcmTransport`, and
+    /// assert the connected stream has `nodelay() == true`. Fully off-hardware.
+    #[test]
+    fn connect_sets_tcp_nodelay() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback listener");
+        let addr = listener
+            .local_addr()
+            .expect("listener local addr")
+            .to_string();
+
+        let t = NcmTransport::connect(&addr).expect("connect to loopback listener");
+
+        assert!(
+            t.0.nodelay().expect("query TCP_NODELAY"),
+            "NcmTransport::connect must set TCP_NODELAY (Nagle off) on the fallback stream"
+        );
     }
 }

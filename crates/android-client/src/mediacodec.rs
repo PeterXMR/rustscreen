@@ -32,6 +32,7 @@
 //! window handles are freed in `Drop`. This module never panics across the JNI boundary —
 //! `nativeOnSurface` wraps it in a `catch_unwind` (mirroring `nativeOnUsbFd`).
 
+use std::cell::Cell;
 use std::ffi::CStr;
 use std::ptr::NonNull;
 
@@ -39,7 +40,7 @@ use ndk_sys as sys;
 use protocol::messages::VideoCodec;
 use protocol::nal::CodecConfig;
 
-use crate::decode::{DecodeError, DecoderInput, VideoDecoder};
+use crate::decode::{DecodeError, DecoderInput, PresentedFrame, VideoDecoder};
 
 // Link the NDK media library. `ndk-sys` only declares the FFI signatures and links
 // `libandroid` (for `ANativeWindow_*`), NOT `libmediandk` — so the `AMediaCodec_*` /
@@ -125,6 +126,10 @@ pub struct MediaCodecDecoder {
     window: Option<NativeWindow>,
     /// The running decoder, created lazily on the first `configure`.
     codec: Option<Codec>,
+    /// Access units handed to `queueInputBuffer` so far (latency item A depth accounting).
+    queued: Cell<u64>,
+    /// Output buffers pulled from `dequeueOutputBuffer` so far (rendered or dropped).
+    dequeued: Cell<u64>,
 }
 
 impl MediaCodecDecoder {
@@ -134,6 +139,8 @@ impl MediaCodecDecoder {
         MediaCodecDecoder {
             window: Some(window),
             codec: None,
+            queued: Cell::new(0),
+            dequeued: Cell::new(0),
         }
     }
 }
@@ -228,6 +235,22 @@ impl VideoDecoder for MediaCodecDecoder {
                 // width/height (from the SPS): required by the C2 decoder at configure time.
                 sys::AMediaFormat_setInt32(format, sys::AMEDIAFORMAT_KEY_WIDTH, width as i32);
                 sys::AMediaFormat_setInt32(format, sys::AMEDIAFORMAT_KEY_HEIGHT, height as i32);
+                // Low-latency decode (item 6 step 2). Tell the HW decoder to emit each frame as
+                // soon as it is decoded instead of buffering a reorder/lookahead window. On the
+                // Pixel 6a the default behaviour holds ~15+ frames internally (~290 ms measured),
+                // which dominated glass-to-glass; with this set, arrive→decode collapses toward the
+                // raw per-frame decode time. The key exists from API 31; the Pixel 6a (API 33+)
+                // honours it. (libmediandk resolves the symbol at load — fine on the target device;
+                // a future minSdk<31 build would gate this behind a runtime API check.)
+                sys::AMediaFormat_setInt32(format, sys::AMEDIAFORMAT_KEY_LOW_LATENCY, 1);
+                // The Pixel 6a's decoder is `c2.exynos.h264.decoder` (Google Tensor), which
+                // IGNORES the generic KEY_LOW_LATENCY above — the measured ~290+ ms input-queue
+                // residence is the symptom. The Exynos C2 component honours this *vendor* key
+                // instead (Moonlight sets per-SoC vendor keys for exactly this reason). Setting
+                // an unknown vendor key on another decoder is silently ignored, so this is safe
+                // to set unconditionally. Verify on-device via logcat (CCodec component name).
+                const VENDOR_LOW_LATENCY_KEY: &CStr = c"vendor.rtc-ext-dec-low-latency.enable";
+                sys::AMediaFormat_setInt32(format, VENDOR_LOW_LATENCY_KEY.as_ptr(), 1);
                 // csd-0 = SPS+PPS. The decoder copies the buffer, so our `csd0` can drop
                 // after this call.
                 sys::AMediaFormat_setBuffer(
@@ -279,13 +302,18 @@ impl VideoDecoder for MediaCodecDecoder {
         Ok(())
     }
 
-    fn decode(&mut self, input: &DecoderInput) -> Result<(), DecodeError> {
+    fn decode(&mut self, input: &DecoderInput) -> Result<Vec<PresentedFrame>, DecodeError> {
         let codec = self
             .codec
             .as_ref()
             .ok_or_else(|| DecodeError::Adapter("decode called before configure".into()))?
             .ptr
             .as_ptr();
+
+        // Accumulates every frame released-with-render during this call (both while
+        // draining to free an input slot below and in the final drain), reported up so the
+        // session layer can emit per-frame latency `Stats` (Task 7).
+        let mut presented: Vec<PresentedFrame> = Vec::new();
 
         // Acquire an input slot. `dequeueInputBuffer` returning < 0 is INFO_TRY_AGAIN_LATER:
         // no slot is free *yet* because the codec is still working through queued frames —
@@ -301,7 +329,7 @@ impl VideoDecoder for MediaCodecDecoder {
                 }
                 // No input slot yet: drain ready output (renders frames + frees input slots),
                 // then retry — so the stall error below only fires after a drain attempt.
-                self.drain_output(codec)?;
+                self.drain_output(codec, &mut presented)?;
                 attempts += 1;
                 if attempts >= MAX_INPUT_DEQUEUE_ATTEMPTS {
                     return Err(DecodeError::Adapter(
@@ -341,21 +369,60 @@ impl VideoDecoder for MediaCodecDecoder {
             let status =
                 sys::AMediaCodec_queueInputBuffer(codec, in_index, 0, au.len(), input.pts_us, 0);
             check(status, "queueInputBuffer")?;
+            self.queued.set(self.queued.get() + 1);
         }
 
         // Drain whatever output is ready and render it onto the surface. We do not block
         // for output beyond a short timeout: at steady state one input yields ~one output,
         // and rendering is the point (decode-to-surface), so we render every ready frame.
-        self.drain_output(codec)
+        self.drain_output(codec, &mut presented)?;
+        Ok(presented)
+    }
+
+    fn in_flight(&self) -> usize {
+        // Saturating: dequeued can briefly equal queued; never underflow.
+        self.queued.get().saturating_sub(self.dequeued.get()) as usize
+    }
+
+    fn pump(&mut self) -> Result<Vec<PresentedFrame>, DecodeError> {
+        // Drain ready output without submitting input — used when the session's pacer drops an
+        // incoming frame but the codec should keep draining so the surface stays current.
+        let codec = self
+            .codec
+            .as_ref()
+            .ok_or_else(|| DecodeError::Adapter("pump called before configure".into()))?
+            .ptr
+            .as_ptr();
+        let mut presented = Vec::new();
+        self.drain_output(codec, &mut presented)?;
+        Ok(presented)
     }
 }
 
 impl MediaCodecDecoder {
-    /// Pull ready decoded frames and render them onto the surface (`render = true`).
+    /// Pull ready decoded frames and render them onto the surface (`render = true`),
+    /// appending one [`PresentedFrame`] per rendered buffer to `presented`.
     ///
     /// Loops until the decoder reports `TRY_AGAIN_LATER` (no more output ready), so a
-    /// burst of buffered output is flushed in one call without unbounded blocking.
-    fn drain_output(&self, codec: *mut sys::AMediaCodec) -> Result<(), DecodeError> {
+    /// burst of buffered output is flushed in one call without unbounded blocking. Each
+    /// rendered buffer is stamped with the process-global monotonic phone clock
+    /// ([`crate::now_us`]): `decode_us` when the output buffer is dequeued (decode
+    /// complete), `present_us` right after `releaseOutputBuffer(render = true)` (the
+    /// present), keyed by the buffer's `presentationTimeUs` (the originating
+    /// `Frame::Video.pts_us`). Using the global clock ensures these timestamps share the
+    /// same epoch as `arrive_us` and the ClockPong t1/t2 values stamped in `run_session`.
+    fn drain_output(
+        &self,
+        codec: *mut sys::AMediaCodec,
+        presented: &mut Vec<PresentedFrame>,
+    ) -> Result<(), DecodeError> {
+        // First collect every output buffer that is ready RIGHT NOW (without blocking past the
+        // first not-ready dequeue), each with its decode-complete stamp. We then present only the
+        // NEWEST and drop the rest (item 6 step 2): for a live mirror the freshest decodable frame
+        // wins — rendering stale frames just to "show every frame" re-introduces exactly the
+        // present-queue latency we are removing. With LOW_LATENCY the decoder rarely buffers ahead,
+        // so in steady state this collects a single buffer and drops nothing.
+        let mut ready: Vec<(usize, u64, u64)> = Vec::new(); // (out_index, pts_us, decode_us)
         loop {
             let mut info = sys::AMediaCodecBufferInfo {
                 offset: 0,
@@ -369,19 +436,22 @@ impl MediaCodecDecoder {
             };
 
             if out_index >= 0 {
-                // A decoded frame: release it WITH render so it composites onto the
-                // ANativeWindow (D3 — no CPU copy back to us).
-                // SAFETY: `out_index` is a valid output buffer index just dequeued.
-                let status = unsafe {
-                    sys::AMediaCodec_releaseOutputBuffer(codec, out_index as usize, true)
-                };
-                check(status, "releaseOutputBuffer(render=true)")?;
-                // Keep draining: more frames may be queued.
+                // Decoded buffer ready: stamp decode-complete now (the dequeue IS the decode).
+                // Defer the present decision until we know whether a fresher buffer is also ready.
+                let decode_us = crate::now_us();
+                // `presentationTimeUs` is the pts we queued with this access unit; the cast is
+                // safe because we only ever queue non-negative `u64` pts values.
+                ready.push((
+                    out_index as usize,
+                    info.presentationTimeUs as u64,
+                    decode_us,
+                ));
+                // Keep draining: more frames may already be decoded and waiting.
                 continue;
             }
 
             match out_index {
-                INFO_TRY_AGAIN_LATER => return Ok(()),
+                INFO_TRY_AGAIN_LATER => break,
                 // Format / buffer changes are informational for decode-to-surface; the
                 // surface adapts automatically. Keep draining.
                 INFO_OUTPUT_FORMAT_CHANGED | INFO_OUTPUT_BUFFERS_CHANGED => continue,
@@ -392,5 +462,41 @@ impl MediaCodecDecoder {
                 }
             }
         }
+
+        // Depth accounting (latency item A): every dequeued output — whether we render it or
+        // drop it as stale — leaves the codec's pipeline, so it counts against in-flight.
+        self.dequeued.set(self.dequeued.get() + ready.len() as u64);
+
+        let Some((&(newest_idx, newest_pts, newest_decode_us), stale)) = ready.split_last() else {
+            return Ok(()); // nothing decoded this round
+        };
+
+        // Drop every buffer older than the newest: release WITHOUT render (frees the buffer, no
+        // present). This is what keeps the surface current under oversupply.
+        for &(idx, ..) in stale {
+            // SAFETY: `idx` is a valid output buffer index just dequeued and not yet released.
+            let status = unsafe { sys::AMediaCodec_releaseOutputBuffer(codec, idx, false) };
+            check(status, "releaseOutputBuffer(render=false drop)")?;
+        }
+        if !stale.is_empty() {
+            log::debug!(
+                "MediaCodecDecoder: dropped {} late frame(s) to stay current",
+                stale.len()
+            );
+        }
+
+        // Present the newest decoded buffer WITH render so it composites onto the ANativeWindow
+        // (D3 — no CPU copy back to us); stamp present right after. The global clock keeps these
+        // timestamps in the same epoch as arrive_us / ClockPong t1,t2.
+        // SAFETY: `newest_idx` is a valid output buffer index just dequeued and not yet released.
+        let status = unsafe { sys::AMediaCodec_releaseOutputBuffer(codec, newest_idx, true) };
+        check(status, "releaseOutputBuffer(render=true)")?;
+        let present_us = crate::now_us();
+        presented.push(PresentedFrame {
+            pts_us: newest_pts,
+            decode_us: newest_decode_us,
+            present_us,
+        });
+        Ok(())
     }
 }

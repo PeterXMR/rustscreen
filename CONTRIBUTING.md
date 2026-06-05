@@ -91,7 +91,10 @@ export ANDROID_HOME="$HOME/Library/Android/sdk"
 export ANDROID_NDK_HOME="$ANDROID_HOME/ndk/25.2.9519653"
 rustup target add aarch64-linux-android   # one-time
 cargo install cargo-ndk                    # one-time
-cargo ndk -t arm64-v8a -o android/app/src/main/jniLibs build -p android-client
+# --features live-decode is REQUIRED for a working device build: it compiles the
+# AMediaCodec decode-to-surface adapter. WITHOUT it the .so falls back to the P1 echo
+# loop, which links and connects but decodes nothing → the phone shows a black screen.
+cargo ndk -t arm64-v8a -o android/app/src/main/jniLibs build -p android-client --features live-decode
 ```
 
 The APK (Gradle) build needs a pinned JDK (17–21); see the README for details.

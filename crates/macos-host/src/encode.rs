@@ -13,6 +13,7 @@
 //! — the pipeline that drives an `Encoder`, codec-config extraction, latency logging
 //! — is tested here with a fake encoder, so the adapter drops in behind the seam.
 
+use std::collections::VecDeque;
 use std::io::{self, Write};
 
 use protocol::nal::{self, CodecConfig};
@@ -24,6 +25,11 @@ use crate::capture::{CapturedFrame, Capturer};
 pub struct EncodedFrame {
     /// Presentation timestamp in microseconds (carried through from capture).
     pub pts_us: u64,
+    /// Monotonic host time (µs) when the frame was captured/delivered by ScreenCaptureKit,
+    /// before encode. Stamped in the capture delegate so the `capture→encode` stage and the
+    /// glass-to-glass total measure real wall time (including any mpsc-channel queueing),
+    /// rather than being derived from `encode_micros`.
+    pub capture_us: u64,
     /// Whether this access unit is a keyframe (IDR; carries SPS/PPS).
     pub keyframe: bool,
     /// Wall-clock time the encoder took to produce this frame, in microseconds.
@@ -40,20 +46,37 @@ pub trait Encoder {
     fn encode(&mut self, frame: &CapturedFrame) -> EncodedFrame;
 }
 
+/// Maximum number of individual latency samples retained for percentile computation.
+///
+/// Percentiles are reported over the **most-recent `MAX_RETAINED_SAMPLES` window** so the
+/// per-sample buffer can't grow without bound during a long session (the old unbounded
+/// `Vec` reached ~3.5 MB / 2 h and cloned+sorted the whole thing every `percentile` call).
+/// `count`/`sum`/`min`/`max` are still computed over the FULL history — only the windowed
+/// percentiles see just the tail. At 60 fps, 16384 samples is ~4.5 minutes of frames,
+/// which comfortably covers any tail-latency reporting window.
+const MAX_RETAINED_SAMPLES: usize = 16_384;
+
 /// Accumulating per-frame encode-latency statistics (microseconds).
 ///
-/// Tracks count/sum/min/max for cheap aggregates and retains the individual samples so
-/// tail-latency percentiles can be reported. For RustScreen's sub-50 ms glass-to-glass
-/// budget the **tail** (p95/p99) is what matters — a healthy mean can still hide a
-/// stall that ruins the experience — so [`percentile`](Self::percentile) is the headline
-/// metric, not [`mean`](Self::mean).
+/// Tracks count/sum/min/max for cheap aggregates and retains the most-recent
+/// [`MAX_RETAINED_SAMPLES`] individual samples (in a bounded ring) so tail-latency
+/// percentiles can be reported without unbounded growth. For RustScreen's sub-50 ms
+/// glass-to-glass budget the **tail** (p95/p99) is what matters — a healthy mean can still
+/// hide a stall that ruins the experience — so [`percentile`](Self::percentile) is the
+/// headline metric, not [`mean`](Self::mean).
+///
+/// `count`/`sum`/`min`/`max`/`mean` reflect the **full** recorded history; the percentile
+/// family reflects only the most-recent [`MAX_RETAINED_SAMPLES`] window. For any session
+/// with ≤ `MAX_RETAINED_SAMPLES` frames the window is the full history, so behavior is
+/// identical to the old unbounded implementation.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LatencyStats {
     count: u64,
     sum: u64,
     min: Option<u64>,
     max: Option<u64>,
-    samples: Vec<u64>,
+    /// Bounded ring of the most-recent samples (capped at [`MAX_RETAINED_SAMPLES`]).
+    samples: VecDeque<u64>,
 }
 
 impl LatencyStats {
@@ -68,7 +91,17 @@ impl LatencyStats {
         self.sum += micros;
         self.min = Some(self.min.map_or(micros, |m| m.min(micros)));
         self.max = Some(self.max.map_or(micros, |m| m.max(micros)));
-        self.samples.push(micros);
+        // Bounded retention: keep at most the last MAX_RETAINED_SAMPLES, evicting oldest.
+        if self.samples.len() == MAX_RETAINED_SAMPLES {
+            self.samples.pop_front();
+        }
+        self.samples.push_back(micros);
+    }
+
+    /// Number of samples currently retained in the percentile window (test inspector).
+    #[cfg(test)]
+    fn retained_len(&self) -> usize {
+        self.samples.len()
     }
 
     /// Number of frames recorded.
@@ -98,13 +131,17 @@ impl LatencyStats {
     /// The `p`-th percentile latency (microseconds) using the nearest-rank method,
     /// or `None` if no frames were recorded. `p` is clamped to `0.0..=100.0`.
     ///
+    /// Computed over the **most-recent [`MAX_RETAINED_SAMPLES`] window** (the bounded ring),
+    /// not the full history; for sessions with ≤ `MAX_RETAINED_SAMPLES` frames this is the
+    /// entire history.
+    ///
     /// Nearest-rank: rank = ceil(p/100 * n), 1-indexed into the sorted samples (p == 0
     /// maps to the smallest sample). Useful for tail latency, e.g. `percentile(95.0)`.
     pub fn percentile(&self, p: f64) -> Option<u64> {
         if self.samples.is_empty() {
             return None;
         }
-        let mut sorted = self.samples.clone();
+        let mut sorted: Vec<u64> = self.samples.iter().copied().collect();
         sorted.sort_unstable();
         let n = sorted.len();
         let p = p.clamp(0.0, 100.0);
@@ -230,6 +267,45 @@ mod tests {
     }
 
     #[test]
+    fn latency_retention_is_bounded_to_max_samples() {
+        // Record more than the retention window; the ring must cap at MAX_RETAINED_SAMPLES
+        // even though count() keeps the TOTAL.
+        let mut s = LatencyStats::new();
+        let total = MAX_RETAINED_SAMPLES + 100;
+        for v in 0..total as u64 {
+            s.record(v);
+        }
+        assert_eq!(
+            s.count(),
+            total as u64,
+            "count() reports the TOTAL recorded"
+        );
+        assert_eq!(
+            s.retained_len(),
+            MAX_RETAINED_SAMPLES,
+            "retention is capped at MAX_RETAINED_SAMPLES"
+        );
+    }
+
+    #[test]
+    fn latency_percentile_is_over_recent_window() {
+        // After overflow, percentiles reflect only the most-recent N samples. Record N
+        // ones, then N zeros: the window holds only the zeros, so every percentile is 0.
+        let mut s = LatencyStats::new();
+        for _ in 0..MAX_RETAINED_SAMPLES {
+            s.record(1);
+        }
+        for _ in 0..MAX_RETAINED_SAMPLES {
+            s.record(0);
+        }
+        assert_eq!(s.retained_len(), MAX_RETAINED_SAMPLES);
+        assert_eq!(s.percentile(0.0), Some(0));
+        assert_eq!(s.p50(), Some(0));
+        assert_eq!(s.p99(), Some(0));
+        assert_eq!(s.percentile(100.0), Some(0));
+    }
+
+    #[test]
     fn latency_reports_tail_percentiles() {
         // Samples 10..=100 (n=10). Nearest-rank: rank = ceil(p/100 * n), 1-indexed
         // into the ascending samples. Recorded out of order to prove sorting.
@@ -288,6 +364,7 @@ mod tests {
             self.frame_index += 1;
             EncodedFrame {
                 pts_us: frame.pts_us,
+                capture_us: 0,
                 keyframe,
                 encode_micros: 5,
                 annex_b,
@@ -346,6 +423,7 @@ mod tests {
             self.frame_index += 1;
             EncodedFrame {
                 pts_us: frame.pts_us,
+                capture_us: 0,
                 keyframe,
                 encode_micros: 1,
                 annex_b,
