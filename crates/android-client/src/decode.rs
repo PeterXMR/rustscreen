@@ -35,6 +35,30 @@ pub struct DecoderInput {
     pub annex_b: Vec<u8>,
 }
 
+/// One decoded-and-presented frame reported back up from the decoder, so the session layer
+/// (which owns the transport) can build the `Frame::Stats` to send to the host (Task 7).
+///
+/// The decode-to-surface present happens deep in the [`VideoDecoder`] adapter
+/// (`releaseOutputBuffer(render = true)`), far from the transport write in
+/// [`crate::session::run_session`]. The port therefore reports the timing *up*: each
+/// `decode` call returns zero or more `PresentedFrame`s (a single `decode` may drain
+/// several ready output buffers, or none while the decoder is still buffering), each
+/// carrying its presentation timestamp and the phone-clock instants the decode and present
+/// completed at.
+///
+/// All timestamps are microseconds on a single monotonic phone clock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PresentedFrame {
+    /// The presentation timestamp (`pts_us`) of the access unit this output frame came
+    /// from — the same value carried in the originating `Frame::Video`, used to key the
+    /// per-frame stats record.
+    pub pts_us: u64,
+    /// Phone-clock instant (µs) when the decoded output buffer was dequeued.
+    pub decode_us: u64,
+    /// Phone-clock instant (µs) at/after `releaseOutputBuffer(render = true)` — the present.
+    pub present_us: u64,
+}
+
 /// The Pixel decode seam (R4 — owning the MediaCodec wrapper rather than a stale crate).
 ///
 /// The simplest-now adapter is `AMediaCodec` decode-to-surface. Both methods return a
@@ -45,8 +69,13 @@ pub trait VideoDecoder {
     /// Called once before the first access unit, and again if the config changes.
     fn configure(&mut self, codec: VideoCodec, config: &CodecConfig) -> Result<(), DecodeError>;
 
-    /// Submit one decoder-ready access unit for decode (decode-to-surface in Wave B).
-    fn decode(&mut self, input: &DecoderInput) -> Result<(), DecodeError>;
+    /// Submit one decoder-ready access unit for decode (decode-to-surface in Wave B) and
+    /// return any frames that became decoded-and-presented as a result.
+    ///
+    /// A hardware decoder pipelines: queuing one input may release 0..N ready output
+    /// buffers. Each released (rendered) buffer yields one [`PresentedFrame`] stamped with
+    /// the phone clock, so the caller can report per-frame latency `Stats` to the host.
+    fn decode(&mut self, input: &DecoderInput) -> Result<Vec<PresentedFrame>, DecodeError>;
 }
 
 /// Why driving the decoder failed.
@@ -164,13 +193,16 @@ impl DecodeSession {
 
     /// Feed one protocol [`Frame`] to the session, driving `decoder` as needed.
     ///
-    /// Returns `Ok(())` for handled and ignored frames alike; returns a [`DecodeError`]
-    /// when a `Video` cannot be decoded (no config, empty payload, or an adapter error).
+    /// Returns the [`PresentedFrame`]s the decoder produced as a result (only a `Video`
+    /// frame can decode-and-present; every other variant returns an empty `Vec`), or a
+    /// [`DecodeError`] when a `Video` cannot be decoded (no config, empty payload, or an
+    /// adapter error). The session layer uses the returned frames to emit per-frame
+    /// latency `Stats` to the host (Task 7).
     pub fn feed(
         &mut self,
         frame: &Frame,
         decoder: &mut dyn VideoDecoder,
-    ) -> Result<(), DecodeError> {
+    ) -> Result<Vec<PresentedFrame>, DecodeError> {
         match frame {
             Frame::VideoConfig { codec, sps_pps } => {
                 if let Some(config) = nal::extract_codec_config(sps_pps) {
@@ -191,7 +223,7 @@ impl DecodeSession {
                 // A VideoConfig whose bytes carry no usable SPS+PPS is ignored: the next
                 // in-band keyframe can still establish the config. (Defensive — the host
                 // always sends a valid pair.)
-                Ok(())
+                Ok(Vec::new())
             }
             Frame::Video {
                 pts_us,
@@ -204,7 +236,7 @@ impl DecodeSession {
             | Frame::Control(_)
             | Frame::ClockPing { .. }
             | Frame::ClockPong { .. }
-            | Frame::Stats { .. } => Ok(()),
+            | Frame::Stats { .. } => Ok(Vec::new()),
         }
     }
 
@@ -214,7 +246,7 @@ impl DecodeSession {
         keyframe: bool,
         nal: &[u8],
         decoder: &mut dyn VideoDecoder,
-    ) -> Result<(), DecodeError> {
+    ) -> Result<Vec<PresentedFrame>, DecodeError> {
         // The `keyframe` flag is trusted from the protocol (the host is authoritative);
         // it is not cross-checked against nal::is_keyframe(nal).
         // A keyframe carrying its own in-band SPS/PPS can configure the decoder even if no
@@ -237,12 +269,12 @@ impl DecodeSession {
             keyframe,
             annex_b,
         };
-        decoder.decode(&input)?;
+        let presented = decoder.decode(&input)?;
         self.decoded += 1;
         if keyframe {
             self.keyframes += 1;
         }
-        Ok(())
+        Ok(presented)
     }
 }
 
@@ -278,14 +310,20 @@ mod tests {
             Ok(())
         }
 
-        fn decode(&mut self, input: &DecoderInput) -> Result<(), DecodeError> {
+        fn decode(&mut self, input: &DecoderInput) -> Result<Vec<PresentedFrame>, DecodeError> {
             let idx = self.decode_index;
             self.decode_index += 1;
             if self.fail_on_decode_index == Some(idx) {
                 return Err(DecodeError::Adapter("simulated codec failure".into()));
             }
             self.calls.push(Call::Decode(input.clone()));
-            Ok(())
+            // Synthetic present: one frame echoing the input pts, with deterministic
+            // decode/present stamps so the orchestration above is provable without a device.
+            Ok(vec![PresentedFrame {
+                pts_us: input.pts_us,
+                decode_us: input.pts_us + 1,
+                present_us: input.pts_us + 2,
+            }])
         }
     }
 

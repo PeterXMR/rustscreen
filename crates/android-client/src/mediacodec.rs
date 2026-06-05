@@ -34,12 +34,13 @@
 
 use std::ffi::CStr;
 use std::ptr::NonNull;
+use std::time::Instant;
 
 use ndk_sys as sys;
 use protocol::messages::VideoCodec;
 use protocol::nal::CodecConfig;
 
-use crate::decode::{DecodeError, DecoderInput, VideoDecoder};
+use crate::decode::{DecodeError, DecoderInput, PresentedFrame, VideoDecoder};
 
 // Link the NDK media library. `ndk-sys` only declares the FFI signatures and links
 // `libandroid` (for `ANativeWindow_*`), NOT `libmediandk` — so the `AMediaCodec_*` /
@@ -125,6 +126,12 @@ pub struct MediaCodecDecoder {
     window: Option<NativeWindow>,
     /// The running decoder, created lazily on the first `configure`.
     codec: Option<Codec>,
+    /// Session-start reference for the monotonic phone clock. `Instant` is monotonic on
+    /// Android (backed by `CLOCK_MONOTONIC`); `decode_us`/`present_us` in each
+    /// [`PresentedFrame`] are microseconds elapsed since this instant. The host only needs
+    /// the *differences* between the phone's arrive/decode/present stamps and a clock-sync
+    /// offset, so a session-relative epoch is sufficient (and avoids wall-clock skew).
+    epoch: Instant,
 }
 
 impl MediaCodecDecoder {
@@ -134,7 +141,13 @@ impl MediaCodecDecoder {
         MediaCodecDecoder {
             window: Some(window),
             codec: None,
+            epoch: Instant::now(),
         }
+    }
+
+    /// Microseconds on the monotonic phone clock since session start ([`Self::epoch`]).
+    fn now_us(&self) -> u64 {
+        self.epoch.elapsed().as_micros() as u64
     }
 }
 
@@ -279,13 +292,18 @@ impl VideoDecoder for MediaCodecDecoder {
         Ok(())
     }
 
-    fn decode(&mut self, input: &DecoderInput) -> Result<(), DecodeError> {
+    fn decode(&mut self, input: &DecoderInput) -> Result<Vec<PresentedFrame>, DecodeError> {
         let codec = self
             .codec
             .as_ref()
             .ok_or_else(|| DecodeError::Adapter("decode called before configure".into()))?
             .ptr
             .as_ptr();
+
+        // Accumulates every frame released-with-render during this call (both while
+        // draining to free an input slot below and in the final drain), reported up so the
+        // session layer can emit per-frame latency `Stats` (Task 7).
+        let mut presented: Vec<PresentedFrame> = Vec::new();
 
         // Acquire an input slot. `dequeueInputBuffer` returning < 0 is INFO_TRY_AGAIN_LATER:
         // no slot is free *yet* because the codec is still working through queued frames —
@@ -301,7 +319,7 @@ impl VideoDecoder for MediaCodecDecoder {
                 }
                 // No input slot yet: drain ready output (renders frames + frees input slots),
                 // then retry — so the stall error below only fires after a drain attempt.
-                self.drain_output(codec)?;
+                self.drain_output(codec, &mut presented)?;
                 attempts += 1;
                 if attempts >= MAX_INPUT_DEQUEUE_ATTEMPTS {
                     return Err(DecodeError::Adapter(
@@ -346,16 +364,26 @@ impl VideoDecoder for MediaCodecDecoder {
         // Drain whatever output is ready and render it onto the surface. We do not block
         // for output beyond a short timeout: at steady state one input yields ~one output,
         // and rendering is the point (decode-to-surface), so we render every ready frame.
-        self.drain_output(codec)
+        self.drain_output(codec, &mut presented)?;
+        Ok(presented)
     }
 }
 
 impl MediaCodecDecoder {
-    /// Pull ready decoded frames and render them onto the surface (`render = true`).
+    /// Pull ready decoded frames and render them onto the surface (`render = true`),
+    /// appending one [`PresentedFrame`] per rendered buffer to `presented`.
     ///
     /// Loops until the decoder reports `TRY_AGAIN_LATER` (no more output ready), so a
-    /// burst of buffered output is flushed in one call without unbounded blocking.
-    fn drain_output(&self, codec: *mut sys::AMediaCodec) -> Result<(), DecodeError> {
+    /// burst of buffered output is flushed in one call without unbounded blocking. Each
+    /// rendered buffer is stamped with the monotonic phone clock: `decode_us` when the
+    /// output buffer is dequeued (decode complete), `present_us` right after
+    /// `releaseOutputBuffer(render = true)` (the present), keyed by the buffer's
+    /// `presentationTimeUs` (the originating `Frame::Video.pts_us`).
+    fn drain_output(
+        &self,
+        codec: *mut sys::AMediaCodec,
+        presented: &mut Vec<PresentedFrame>,
+    ) -> Result<(), DecodeError> {
         loop {
             let mut info = sys::AMediaCodecBufferInfo {
                 offset: 0,
@@ -369,13 +397,23 @@ impl MediaCodecDecoder {
             };
 
             if out_index >= 0 {
-                // A decoded frame: release it WITH render so it composites onto the
-                // ANativeWindow (D3 — no CPU copy back to us).
+                // A decoded output buffer is ready: stamp decode-complete now (the dequeue
+                // is the decode), then release it WITH render so it composites onto the
+                // ANativeWindow (D3 — no CPU copy back to us), and stamp present right after.
+                let decode_us = self.now_us();
                 // SAFETY: `out_index` is a valid output buffer index just dequeued.
                 let status = unsafe {
                     sys::AMediaCodec_releaseOutputBuffer(codec, out_index as usize, true)
                 };
                 check(status, "releaseOutputBuffer(render=true)")?;
+                let present_us = self.now_us();
+                // `presentationTimeUs` is the pts we queued with this access unit; the cast
+                // is safe because we only ever queue non-negative `u64` pts values.
+                presented.push(PresentedFrame {
+                    pts_us: info.presentationTimeUs as u64,
+                    decode_us,
+                    present_us,
+                });
                 // Keep draining: more frames may be queued.
                 continue;
             }
