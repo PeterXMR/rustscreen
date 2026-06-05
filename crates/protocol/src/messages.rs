@@ -35,6 +35,12 @@ pub mod tag {
     pub const TOUCH: u8 = 4;
     /// [`Frame::Control`]
     pub const CONTROL: u8 = 5;
+    /// [`Frame::ClockPing`]
+    pub const CLOCK_PING: u8 = 6;
+    /// [`Frame::ClockPong`]
+    pub const CLOCK_PONG: u8 = 7;
+    /// [`Frame::Stats`]
+    pub const STATS: u8 = 8;
 }
 
 /// Video codec identifier. `Hevc` is reserved; only `H264` is exercised now (D2).
@@ -138,6 +144,26 @@ pub struct TouchEvent {
     pub ny: f32,
 }
 
+/// On-wire payload of [`Frame::ClockPong`]. Named struct so the postcard wire shape is
+/// pinned in one place (same rationale as [`VideoConfigPayload`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+struct ClockPongPayload {
+    t0_us: u64,
+    t1_us: u64,
+    t2_us: u64,
+}
+
+/// On-wire payload of [`Frame::Stats`] — the client's per-frame timing report, keyed by the
+/// `pts_us` it received on the corresponding [`Frame::Video`]. All times are in the client's
+/// (phone) clock; the host converts them with the estimated [`crate::clock::ClockOffset`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+struct StatsPayload {
+    pts_us: u64,
+    arrive_us: u64,
+    decode_us: u64,
+    present_us: u64,
+}
+
 /// One application message. Encodes to exactly one [`framing`] frame.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Frame {
@@ -165,12 +191,39 @@ pub enum Frame {
     Touch(TouchEvent),
     /// Either-direction control message.
     Control(Control),
+    /// Host → client clock-sync probe. `t0_us` is the host send time (host clock).
+    ClockPing {
+        /// Host send time, microseconds (host clock).
+        t0_us: u64,
+    },
+    /// Client → host clock-sync reply carrying the host's `t0_us` plus the client's
+    /// receive (`t1_us`) and send (`t2_us`) times (client clock). Feeds
+    /// [`crate::clock::estimate`].
+    ClockPong {
+        /// Echoed host send time.
+        t0_us: u64,
+        /// Client receive time, microseconds (client clock).
+        t1_us: u64,
+        /// Client send time, microseconds (client clock).
+        t2_us: u64,
+    },
+    /// Client → host per-frame timing report (client clock), correlated by `pts_us`.
+    Stats {
+        /// The `pts_us` of the `Frame::Video` this report is for.
+        pts_us: u64,
+        /// Time the full access unit finished arriving (client clock).
+        arrive_us: u64,
+        /// Time decode produced the output frame (client clock).
+        decode_us: u64,
+        /// Time the frame was released to the surface for display (client clock).
+        present_us: u64,
+    },
 }
 
 /// Errors produced when encoding or decoding a [`Frame`].
 #[derive(Debug)]
 pub enum MessageError {
-    /// A framing-frame tag outside the 1–5 registry.
+    /// A framing-frame tag outside the 1–8 registry.
     UnknownTag(u8),
     /// A `Video` payload shorter than its 9-byte fixed header.
     ShortVideoHeader,
@@ -271,6 +324,38 @@ impl Frame {
                 let payload = postcard::to_allocvec(c).map_err(MessageError::Encode)?;
                 Ok((tag::CONTROL, payload))
             }
+            Frame::ClockPing { t0_us } => {
+                let payload = postcard::to_allocvec(t0_us).map_err(MessageError::Encode)?;
+                Ok((tag::CLOCK_PING, payload))
+            }
+            Frame::ClockPong {
+                t0_us,
+                t1_us,
+                t2_us,
+            } => {
+                let payload = postcard::to_allocvec(&ClockPongPayload {
+                    t0_us: *t0_us,
+                    t1_us: *t1_us,
+                    t2_us: *t2_us,
+                })
+                .map_err(MessageError::Encode)?;
+                Ok((tag::CLOCK_PONG, payload))
+            }
+            Frame::Stats {
+                pts_us,
+                arrive_us,
+                decode_us,
+                present_us,
+            } => {
+                let payload = postcard::to_allocvec(&StatsPayload {
+                    pts_us: *pts_us,
+                    arrive_us: *arrive_us,
+                    decode_us: *decode_us,
+                    present_us: *present_us,
+                })
+                .map_err(MessageError::Encode)?;
+                Ok((tag::STATS, payload))
+            }
         }
     }
 
@@ -307,6 +392,26 @@ impl Frame {
             }
             tag::TOUCH => Ok(Frame::Touch(decode_canonical(payload)?)),
             tag::CONTROL => Ok(Frame::Control(decode_canonical(payload)?)),
+            tag::CLOCK_PING => Ok(Frame::ClockPing {
+                t0_us: decode_canonical(payload)?,
+            }),
+            tag::CLOCK_PONG => {
+                let p: ClockPongPayload = decode_canonical(payload)?;
+                Ok(Frame::ClockPong {
+                    t0_us: p.t0_us,
+                    t1_us: p.t1_us,
+                    t2_us: p.t2_us,
+                })
+            }
+            tag::STATS => {
+                let p: StatsPayload = decode_canonical(payload)?;
+                Ok(Frame::Stats {
+                    pts_us: p.pts_us,
+                    arrive_us: p.arrive_us,
+                    decode_us: p.decode_us,
+                    present_us: p.present_us,
+                })
+            }
             other => Err(MessageError::UnknownTag(other)),
         }
     }
@@ -804,5 +909,52 @@ mod tests {
             negotiate(&h, &c),
             Err(NegotiationError::VersionMismatch { host: 2, client: 1 })
         );
+    }
+
+    #[test]
+    fn roundtrip_clock_ping() {
+        let frame = Frame::ClockPing {
+            t0_us: 0x0102_0304_0506_0708,
+        };
+        assert_eq!(roundtrip(&frame), frame);
+    }
+
+    #[test]
+    fn roundtrip_clock_pong() {
+        let frame = Frame::ClockPong {
+            t0_us: 1,
+            t1_us: 2,
+            t2_us: 3,
+        };
+        assert_eq!(roundtrip(&frame), frame);
+    }
+
+    #[test]
+    fn roundtrip_stats() {
+        let frame = Frame::Stats {
+            pts_us: 42,
+            arrive_us: 1000,
+            decode_us: 1010,
+            present_us: 1025,
+        };
+        assert_eq!(roundtrip(&frame), frame);
+    }
+
+    #[test]
+    fn new_tags_do_not_collide_with_existing() {
+        let tags = [
+            tag::HANDSHAKE,
+            tag::VIDEO_CONFIG,
+            tag::VIDEO,
+            tag::TOUCH,
+            tag::CONTROL,
+            tag::CLOCK_PING,
+            tag::CLOCK_PONG,
+            tag::STATS,
+        ];
+        let mut seen = std::collections::HashSet::new();
+        for t in tags {
+            assert!(seen.insert(t), "duplicate tag {t}");
+        }
     }
 }
