@@ -32,6 +32,7 @@
 //! There is no `ndk`, no JNI, no `cfg(target_os = "android")` gate — host CI exercises
 //! this in full.
 
+use std::collections::VecDeque;
 use std::io::{self, Read, Write};
 
 use protocol::messages::{
@@ -42,6 +43,65 @@ use crate::decode::{DecodeError, DecodeSession, VideoDecoder};
 
 // Re-export negotiate so callers that need it don't have to reach into protocol directly.
 use protocol::messages::negotiate;
+
+/// Phone-side per-frame timing, keyed by `pts_us`, accumulated as a frame moves through
+/// arrive → decode → present. On `present` it produces the `Frame::Stats` to send to the
+/// host. Bounded FIFO so a frame that never presents (dropped by the decoder) cannot leak.
+pub struct StatsTracker {
+    inflight: VecDeque<(u64, u64, Option<u64>)>, // (pts_us, arrive_us, decode_us)
+    capacity: usize,
+}
+
+impl StatsTracker {
+    /// New tracker retaining at most `capacity` in-flight frames.
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            inflight: VecDeque::with_capacity(capacity),
+            capacity: capacity.max(1),
+        }
+    }
+
+    /// Record arrival of the full access unit for `pts_us` (phone clock, µs).
+    pub fn on_arrive(&mut self, pts_us: u64, arrive_us: u64) {
+        if self.inflight.len() >= self.capacity {
+            self.inflight.pop_front();
+        }
+        self.inflight.push_back((pts_us, arrive_us, None));
+    }
+
+    /// Record decode completion for `pts_us`.
+    pub fn on_decode(&mut self, pts_us: u64, decode_us: u64) {
+        if let Some(e) = self.inflight.iter_mut().find(|(p, ..)| *p == pts_us) {
+            e.2 = Some(decode_us);
+        }
+    }
+
+    /// Record present for `pts_us` and, if arrive+decode were seen, produce the `Frame::Stats`.
+    pub fn on_present(&mut self, pts_us: u64, present_us: u64) -> Option<Frame> {
+        let idx = self.inflight.iter().position(|(p, ..)| *p == pts_us)?;
+        let (_, arrive_us, decode) = self.inflight.remove(idx)?;
+        let decode_us = decode?;
+        Some(Frame::Stats {
+            pts_us,
+            arrive_us,
+            decode_us,
+            present_us,
+        })
+    }
+}
+
+/// If `frame` is a `ClockPing`, build the matching `ClockPong` from the client's receive
+/// time `t1_us` and send time `t2_us` (client clock, µs). Otherwise `None`.
+pub fn pong_for_ping(frame: Frame, t1_us: u64, t2_us: u64) -> Option<Frame> {
+    match frame {
+        Frame::ClockPing { t0_us } => Some(Frame::ClockPong {
+            t0_us,
+            t1_us,
+            t2_us,
+        }),
+        _ => None,
+    }
+}
 
 /// Why the client session failed.
 #[derive(Debug)]
@@ -220,9 +280,14 @@ pub fn run_session<T: Read + Write>(
                 // RequestKeyframe / Pause / Resume — the session-layer above handles
                 // these; here we just continue reading (no write-back at this layer).
             }
-            // Handshake mid-stream (unexpected) and Touch are not part of the
-            // inbound decode path; silently ignore.
-            Frame::Handshake(_) | Frame::Touch(_) => {}
+            // Handshake mid-stream (unexpected), Touch, and clock/stats frames are
+            // not part of the inbound decode path; silently ignore here (the live
+            // decode loop handles ClockPing/Stats via StatsTracker + pong_for_ping).
+            Frame::Handshake(_)
+            | Frame::Touch(_)
+            | Frame::ClockPing { .. }
+            | Frame::ClockPong { .. }
+            | Frame::Stats { .. } => {}
         }
     }
 
@@ -713,6 +778,45 @@ mod tests {
             }
             other => panic!("expected Handshake reply, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn stats_tracker_builds_stats_frame_for_pts() {
+        let mut t = StatsTracker::new(8);
+        t.on_arrive(1000, 50);
+        t.on_decode(1000, 60);
+        let frame = t
+            .on_present(1000, 75)
+            .expect("complete record yields a Stats frame");
+        assert_eq!(
+            frame,
+            Frame::Stats {
+                pts_us: 1000,
+                arrive_us: 50,
+                decode_us: 60,
+                present_us: 75
+            }
+        );
+    }
+
+    #[test]
+    fn present_without_arrive_yields_none() {
+        let mut t = StatsTracker::new(8);
+        assert!(t.on_present(2000, 75).is_none());
+    }
+
+    #[test]
+    fn pong_for_ping_carries_receive_and_send_times() {
+        let pong = pong_for_ping(Frame::ClockPing { t0_us: 7 }, 100, 105);
+        assert_eq!(
+            pong,
+            Some(Frame::ClockPong {
+                t0_us: 7,
+                t1_us: 100,
+                t2_us: 105
+            })
+        );
+        assert!(pong_for_ping(Frame::Control(protocol::messages::Control::Bye), 1, 2).is_none());
     }
 
     #[test]

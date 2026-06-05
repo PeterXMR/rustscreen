@@ -199,7 +199,12 @@ impl DecodeSession {
                 nal,
             } => self.feed_video(*pts_us, *keyframe, nal, decoder),
             // Not part of the decode path; the session layer routes these elsewhere.
-            Frame::Handshake(_) | Frame::Touch(_) | Frame::Control(_) => Ok(()),
+            Frame::Handshake(_)
+            | Frame::Touch(_)
+            | Frame::Control(_)
+            | Frame::ClockPing { .. }
+            | Frame::ClockPong { .. }
+            | Frame::Stats { .. } => Ok(()),
         }
     }
 
