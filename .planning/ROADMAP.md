@@ -4,6 +4,77 @@
 
 RustScreen de-risks first, then builds. The journey: scaffold the workspace (P0, done), then immediately attack the three scary unknowns as spikes — create a virtual display from Rust (P2, the keystone), move bytes over USB both ways (P1), capture+encode on macOS (P3), decode+present on the Pixel (P4) — before wiring them into a live sub-50 ms pipeline (P5), adding the touch back-channel (P6), and finally hardening, raising Rust purity, and packaging for distribution (P7, P8). The authoritative design source (full acceptance criteria, seam table, risk register) is `docs/superpowers/plans/2026-06-02-rustscreen-architecture-roadmap.md`; this ROADMAP.md is the execution tracker.
 
+## Active Priorities — user-set 2026-06-05 (READ THIS FIRST; supersedes the PR-ladder ordering below)
+
+The live pipeline already works (the Mac desktop renders on the phone; PRs #21–#24). What's left to make it a tool the user actually uses daily is, **in this exact priority order**, the three goals below. The PR ladder and Phase Details further down stay valid as reference detail, but **when choosing what to work on next, follow THIS list first.** Each goal is rephrased here in implementation terms so any session can pick it up cold.
+
+### Priority 1 — `rustscreen` terminal app: install once, drive it with `start` / `stop`
+
+**Goal (user's words, rephrased):** Install the host on the Mac somehow, then control it entirely from the terminal. `rustscreen start` runs the host locally as a background process; the moment the phone app is open, streaming begins on its own — no extra steps. `rustscreen stop` kills the local host.
+
+**What that means in code:**
+- One installable CLI binary named **`rustscreen`** (today the host is only `cargo run --bin p5_stream`, a *debug* build). Ship a **release** build (debug materially worsens encode/copy latency) onto `PATH` — via `cargo install --path`, a copied release binary, or later a Homebrew formula / signed `.app` (P8).
+- **`rustscreen start`** — launch the capture→encode→send host as a background process and return the prompt. It must:
+  - acquire / verify the macOS **Screen & System Audio Recording** grant and fail with a clear, actionable message if it's missing — never a silent black screen (folds in usability gap **U3**);
+  - **wait for the phone**: if the AOA accessory isn't present yet, idle until it appears, then auto-start streaming (no manual trigger);
+  - record its PID (or use a daemon/launch-agent) so `stop` can find and kill it.
+- **`rustscreen stop`** — terminate the running host and tear down the virtual display cleanly so the Mac desktop reflows.
+- Reframes old **ladder item 7** (was a menu-bar app) into a **terminal-first** interface, and absorbs **U2** (one-click launch) + **U3** (permission clarity).
+
+**Done when:** from a fresh terminal on a clean machine, `rustscreen start` turns the phone into a second screen with no other steps, and `rustscreen stop` cleanly ends it.
+
+### Priority 2 — Automatic reconnect (self-healing handshake)
+
+**Goal (user's words, rephrased):** If either side goes away and comes back, it just reconnects — no restart dance. Close and reopen the phone app → reconnects. `rustscreen stop` then `start` again → reconnects. Unplug and replug the cable → reconnects. As long as the app is running on **both** Mac and phone, the link re-establishes itself automatically (the handshake).
+
+**What that means in code:**
+- `rustscreen start` (Priority 1) is **not** a one-shot that dies when the phone disappears — it is a **supervisor loop**: wait-for-accessory → run the handshake (`connect-hello` + `negotiate()`, both already built) → stream → on disconnect, tear that session down and **return to waiting**, re-arming for the next connect. The loop only exits on `rustscreen stop`.
+- Detect disconnect on all three triggers: phone app closed (accessory fd closes / read error), host restarted (phone re-offers the accessory), cable replug (USB re-enumeration into accessory mode).
+- Idempotent setup/teardown each cycle: drop the virtual display on disconnect, re-create on reconnect; no leaked threads, no wedged USB endpoint, no stale `needs_keyframe` state.
+- This **is** old **ladder item 5** (hotplug / reconnect / clean teardown), promoted to second priority. The one-shot handshake already exists; the missing piece is the supervision loop + idempotent re-arm.
+
+**Done when:** with `rustscreen start` left running, the user can close/reopen the phone app, restart the host, and replug the cable any number of times, and the screen comes back on its own within a couple of seconds each time.
+
+### Priority 3 — "Native" feel: mouse moves on the Mac appear on the phone instantly
+
+**Goal (user's words, rephrased):** Moving the mouse (or dragging a window) on the Mac should show on the phone with no perceptible lag — ideally it feels like one continuous screen.
+
+**What that means in code:** keep driving glass-to-glass latency toward the **< 50 ms target** (practical floor ~43 ms; the Mac's locked-60 Hz `CGVirtualDisplay` and the phone's 60 Hz panel make sub-~30 ms unreachable on this hardware — **do not chase sub-floor numbers**). Already shipped (`48c1b05`): host encoder in-flight pacing + VideoToolbox low-latency rate control + phone input pacing, which took best-case to **~80 ms p50**. Remaining levers, highest-impact first:
+1. **Non-blocking USB writes** (`aoa.rs:267`, `session.rs:595`): the per-frame **blocking** `flush()` costs ~22 ms where the wire itself needs only ~1–2 ms. Multiple in-flight bulk transfers (`set_num_transfers(3–4)`) + a non-waiting flush — preserving the **C-01** "no unflushed partial frame before a blocking read" invariant — is **~18 ms off glass-to-glass, the single biggest remaining win.**
+2. **Real-time thread scheduling** for the capture / encode / USB threads → removes the 30–60 ms p95/p99 jitter spikes (the "occasionally feels laggy" cases), not the median.
+3. **Phone decoder hints** (`KEY_PRIORITY=0`, `operating-rate=60` in `mediacodec.rs`) → one line each, cheap, A/B-test on device.
+4. **Present-time pacing** (`releaseOutputBufferAtTime`) → marginal now (~0–3 ms), future-proofing.
+
+Verify **every** latency change against the on-device per-stage report (the `run-on-device` skill prints capture/encode/send/decode/present + glass-to-glass), not by assumption. This is old **ladder item 6 step 2** plus the documented frontier TODOs.
+
+**Done when:** measured glass-to-glass is consistently < 50 ms p50 with no visible spikes, and dragging a window / moving the cursor on the Mac looks real-time on the phone.
+
+---
+
+**Why this re-ordering vs. the ladder below:** the original ladder front-loaded latency (item 6) and feature breadth (cursor, HEVC, orientation). The user's call is that **usability comes first** — an installable, self-reconnecting tool (Priorities 1–2) is worth more than more features, and latency (Priority 3) is the finishing polish on top. Items not in the three priorities above (cursor visibility #3, live touch #4, orientation #8, HEVC #9, purity swap #10) are **deferred behind them**; HEVC (#9) in particular is *anti*-latency (higher encode cost on Tensor, no decode win) and should not be picked up while Priority 3 is open.
+
+### Implementation backlog — concrete sub-tasks (single source of truth)
+
+The specifics below came from two research sweeps (latency-frontier + whole-UX). Those separate TODO docs were **deleted on 2026-06-05** and their actionable content folded here so this ROADMAP is the one place to look. Grouped under the priority each serves. (The *why/findings* behind the latency work still live in `docs/superpowers/research/2026-06-05-glass-to-glass-latency-root-cause.md`, kept as a reference record — not a to-do list.)
+
+**Priority 1 (CLI `start`/`stop`) sub-tasks**
+- Ship a **release** build, not debug (debug worsens encode/copy latency).
+- Persistent permission path: the Android `USB_ACCESSORY_ATTACHED` launch intent carries a once-ever grant — guide the user to tick "use by default" so plug-in is hands-free after the first grant.
+- Cold-start trims: replace the fixed `sleep(500ms)` at `p5_stream.rs` setup with a poll of `SCShareableContent`; lower the ~10 s rendezvous to ~3 s (~350 ms faster cold start, no phantom-display hang).
+
+**Priority 2 (auto-reconnect) sub-tasks**
+- ⭐ **Host auto-reconnect loop:** wrap AOA bring-up → handshake → stream in a retry loop; **keep the virtual display alive across reconnects** so the Mac desktop doesn't reflow each cycle. Don't leak `nusb` handles per iteration.
+- **`nusb` hotplug** instead of the 100 ms poll (`aoa.rs:176-220` → `nusb::watch_devices()`, IOKit-backed): instant re-detect, ~50 ms off each connect; subscribe before req53 to avoid a missed-event race; keep the poll as fallback.
+- **Android foreground service** (`connectedDevice` type) holding the session + wake lock, so it survives app-switch / notification shade instead of going black.
+- **Force-keyframe on (re)connect** + actually wire `Control::RequestKeyframe` (both ends ignore it today): clean image within ~16 ms on every connect instead of garbage until the next GOP. Shares mechanism with the latency keyframe path.
+
+**Priority 3 (latency) — ranked levers** (detail in the Priority 3 section above): non-blocking USB writes (~18 ms) → real-time thread scheduling (p95 spikes) → phone decoder hints (`KEY_PRIORITY`, `operating-rate`) → present-time pacing. **The unifying bug across the whole pipeline:** an unbounded queue at any stage = pure latency on a lossless USB link — bound it to 1–2, drop-oldest (drop-to-keyframe for coded video), never block waiting to drain. **Ruled out, do NOT chase:** HEVC (anti-latency on Tensor), 90 Hz Pixel panel unlock (firmware-locked, brick risk, ~5 ms), >60 fps source (`CGVirtualDisplay` hard-locked to 60 Hz on Apple Silicon). Floor ≈ 43 ms; < 50 ms reachable, ~30 ms not.
+
+**Deferred backlog — real work, but behind Priorities 1–3:**
+- **Live touch (the read-only-monitor fix)** — the full touch chain exists and is CI-tested (`android-client/src/touch.rs` → `Frame::Touch` → `macos-host/src/touch.rs` FSM + `CgEventSink`), but nothing captures a finger or injects in a *live* session: `MainActivity.kt` has no `onTouchEvent`, and `p5_stream.rs`'s reader thread **discards** inbound `Frame::Touch`. Wiring the existing FSM turns the read-only monitor interactive. (Old ladder item 4.)
+- Cursor visibility on phone (item 3); orientation / landscape lock (item 8); HEVC toggle (item 9 — anti-latency); NativeActivity purity swap (item 10 — hot-path rewrite risk, no user value); packaging / signing / notarization (P7/P8).
+- **Power note (settles "fixture vs novelty"):** in AOA the Mac is the USB host and supplies 5 V / ~500 mA, so the phone trickle-charges (~break-even vs decode + screen-on draw) — lower idle brightness to swing net-positive. Verify with `adb shell dumpsys battery`.
+
 ## Phases
 
 **Phase Numbering:** Phases use the source roadmap's P0–P8 labels (not 1–N). Spikes are marked 🔬.
@@ -21,6 +92,8 @@ RustScreen de-risks first, then builds. The journey: scaffold the workspace (P0,
 - [ ] **Phase P8: Packaging, Distribution, OSS Hygiene** - Notarized DMG + release `.apk`, README/LICENSE, clone-to-second-screen
 
 ## Delivery PR Ladder (functional → usable → shippable)
+
+> **⚠️ Superseded ordering (2026-06-05):** the **Active Priorities** section near the top of this file is now the authoritative sequencing. This ladder remains accurate as a *catalogue* of the work items and their dependencies, but the *order* to do them in is Priority 1 (CLI `start`/`stop`, folds in items 7/U2/U3) → Priority 2 (auto-reconnect, = item 5) → Priority 3 (latency, = item 6 step 2). Items 3, 4, 8, 9, 10 are deferred behind those.
 
 Once the spikes (P1–P4) are merged, the remaining work ships as a priority-ordered ladder
 of PRs. Earlier = more essential to a working, usable product. Each PR names the **feature

@@ -5,11 +5,10 @@
 [![CI](https://github.com/PeterXMR/rustscreen/actions/workflows/ci.yml/badge.svg)](https://github.com/PeterXMR/rustscreen/actions/workflows/ci.yml)
 [![License: not finalized](https://img.shields.io/badge/license-not%20finalized-orange.svg)](#license)
 
-> **Status: pre-functional.** The high-risk pieces are individually proven (virtual
-> display, USB round-trip, capture+encode), but the live end-to-end pipeline is **not
-> wired yet** and on-device decode is not done. See the honest
-> [Status & roadmap](#status--roadmap) snapshot below before expecting a working second
-> screen.
+> **Status: live pipeline works.** The Mac's extended desktop renders on the Pixel 6a
+> over USB, with glass-to-glass latency instrumented and tuned (best ~80 ms p50; target
+> < 50 ms). What's left to make it a daily tool is three steps — see
+> [Status & roadmap](#status--roadmap) below.
 
 ---
 
@@ -155,7 +154,7 @@ cargo build --workspace
 # Run the tests
 cargo test --workspace
 
-# Run the host binary (prints version; the full live pipeline is not wired yet — see status)
+# Run the host binary (the live streaming host; launch from a terminal holding the Screen Recording grant)
 cargo run -p macos-host
 ```
 
@@ -291,32 +290,21 @@ default" to suppress it on reconnect. Details in the
 
 ## Status & roadmap
 
-RustScreen de-risks first, then builds. This project has a strong norm against
-overclaiming — the table below reflects **real** status. **The live end-to-end
-pipeline does not run yet, and on-device decode is not done.** Spikes (🔬) are
-de-risking experiments; their cable-free / Mac-only logic is implemented and merged,
-while the phone-gated parts are deferred.
+The live end-to-end pipeline **works**: the Mac's extended desktop renders on the
+Pixel 6a over a single USB-C cable, with glass-to-glass latency instrumented and tuned
+(best ~80 ms p50 measured on device; target < 50 ms). What remains to make it a
+daily-usable tool is **three steps, in priority order:**
 
-| Phase | Type | Goal | Status |
-|---|---|---|---|
-| **P0** | Build | Workspace + cross-compile + hello-world both platforms + CI | ✅ Complete |
-| **P2** | Spike 🔬 | Create the virtual display from Rust (keystone risk) | ✅ Complete — phantom display via private `CGVirtualDisplay` |
-| **P1** | Spike 🔬 | USB byte round-trip Mac ↔ Pixel | ✅ Complete — byte-exact round-trip over AOA on M1 ↔ Pixel 6a (~103 Mbit/s, no sudo); transport = AOA |
-| **P3** | Spike 🔬 | Capture virtual display + HW-encode to a playable `.h264` | ✅ Complete — capture → VideoToolbox H.264 → playable `out.h264` proven on M1 (encode avg ~10 ms/frame) |
-| **P4** | Spike 🔬 | Decode `.h264` on the Pixel and render to screen | ⚠️ Deferred — needs a Pixel 6a; not done |
-| **P5** | Build | Wire the full live pipeline; measure glass-to-glass latency | 🟡 In progress — protocol frame codec + handshake `negotiate()` merged; **live wiring & the <50 ms measurement are not done** |
-| **P6** | Build | Touch back-channel → CGEvent injection on macOS | 🟡 In progress — both ends' cable-free logic merged (mapping + FSM + injector + Android normalization); **live wiring & the Kotlin capture shim are deferred (phone)** |
-| **P7** | Build | Robustness, UX, menu-bar app, HEVC, signing, Rust-purity upgrades | ⬜ Not started |
-| **P8** | Build | Packaging, distribution, OSS hygiene (this slice) | 🟡 In progress — OSS hygiene (README + LICENSE + CONTRIBUTING + CI badge) **and** packaging scaffolding (macOS `.app`/codesign/notarize/DMG scripts, Android release profile + signing config, release-build CI job) landed; not yet validated against a real signing identity, and final clone-to-second-screen acceptance waits on P4/P5 |
+1. **`rustscreen` terminal app** — install once, then `rustscreen start` runs the host
+   locally and auto-streams the moment the phone app is open; `rustscreen stop` ends it.
+2. **Automatic reconnect** — close and reopen the phone app, restart the host, or unplug
+   and replug the cable, and the connection re-establishes itself (handshake) with no
+   manual restart, as long as the app is running on both sides.
+3. **Native-feel latency** — drive glass-to-glass below 50 ms so moving the mouse or a
+   window on the Mac appears on the phone with no perceptible lag.
 
-**Bottom line:** you can build both halves and run all the pure-Rust tests today, and
-the individually de-risked spikes (display, USB, capture+encode) work on the Mac. You
-**cannot** yet plug in a Pixel 6a and get a live second screen — that needs P4 (decode)
-and P5 (live wiring), both of which require the phone and are not done.
-
-Full detail (decisions, architecture diagram, risks, acceptance criteria per phase) is in
-the [architecture roadmap](docs/superpowers/plans/2026-06-02-rustscreen-architecture-roadmap.md)
-and the execution tracker in [`.planning/ROADMAP.md`](.planning/ROADMAP.md).
+Full detail and per-step sub-tasks are in the execution tracker
+[`.planning/ROADMAP.md`](.planning/ROADMAP.md) (the "Active Priorities" section).
 
 ---
 

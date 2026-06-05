@@ -14,20 +14,26 @@ A user plugs a Pixel 6a into an M1 MacBook with one USB-C cable, launches the ho
 
 <!-- Shipped and confirmed valuable. -->
 
-- ✓ **P0** Workspace scaffold + cross-compilation + thin Kotlin shell + CI — delivered as PR #1 (branch `feat/p0-workspace-scaffold`).
+- ✓ **P0** Workspace scaffold + cross-compile + thin Kotlin shell + CI (PR #1).
+- ✓ **P1** USB byte round-trip Mac↔Pixel over AOA — byte-exact, no sudo, ~103 Mbit/s; **D1 = AOA**.
+- ✓ **P2** Virtual display from Rust via private `CGVirtualDisplay` (keystone risk R1 retired); arrangeable HiDPI external display.
+- ✓ **P3** Capture virtual display + VideoToolbox H.264 encode (RealTime, no B-frames, ~10 ms/frame).
+- ✓ **P4** Decode-to-surface on the Pixel via `AMediaCodec` → `ANativeWindow`.
+- ✓ **P5** Live end-to-end pipeline — the Mac's extended desktop renders on the phone; glass-to-glass instrumented (SNTP clock-sync) + tuned to **~80 ms p50 best** on device.
 
-### Active
+### Active — the three user-set priorities (2026-06-05)
 
-<!-- Current scope. Building toward these. See REQUIREMENTS.md for full detail. -->
+<!-- Current scope, in priority order. `ROADMAP.md` → "Active Priorities" is the single source of truth for sub-tasks. -->
 
-- [ ] **P1** USB byte round-trip Mac↔Pixel (resolves D1)
-- [ ] **P2** Create a virtual display from Rust (keystone risk R1) — NEXT
-- [ ] **P3** Capture virtual display + hardware-encode to playable H.264
-- [ ] **P4** Decode H.264 on the Pixel → on screen (decode-to-surface)
-- [ ] **P5** Wire the full live pipeline; measure glass-to-glass latency
-- [ ] **P6** Touch back-channel → CGEvent injection on macOS
-- [ ] **P7** Robustness, UX, HEVC, code-signing, and Rust-purity adapter swaps
-- [ ] **P8** Packaging, distribution, OSS hygiene
+- [ ] **1. `rustscreen` terminal app** — installable release binary; `rustscreen start` runs the host + auto-streams when the phone app opens; `rustscreen stop` kills it.
+- [ ] **2. Automatic reconnect** — `start` is a supervisor loop that re-handshakes on phone-app close/reopen, host restart, or cable replug.
+- [ ] **3. Native-feel latency** — drive glass-to-glass < 50 ms (next lever: non-blocking USB writes, ~18 ms).
+
+### Deferred (behind the three priorities)
+
+- [ ] **Live touch** — wire the existing CI-tested touch FSM into the live session (today it's a read-only monitor) — completes **P6**.
+- [ ] **P7** Robustness, cursor visibility, orientation, HEVC toggle, code-signing, Rust-purity adapter swaps.
+- [ ] **P8** Packaging, distribution, OSS hygiene.
 
 ### Out of Scope
 
@@ -47,7 +53,7 @@ A user plugs a Pixel 6a into an M1 MacBook with one USB-C cable, launches the ho
 - **Architecture is de-risk-first:** P1–P4 are spikes (de-risking experiments with acceptance criteria, expanded into detailed TDD plans only after each spike succeeds). P0 and P5–P8 are build phases. Pure-Rust pieces (protocol framing, coordinate mapping) use TDD.
 - **Three unavoidable FFI boundaries (honest scope, §0):** (1) Android `NativeActivity` — `android_main()` in Rust + `AndroidManifest.xml` config; (2) macOS virtual display — hand-written bindings to the private `CGVirtualDisplay` ObjC class; (3) Android USB accessory FD — a few `jni` calls to `UsbManager.openAccessory()` returning an `fd` read via `std::fs`.
 - **Rust purity is a living metric:** MVP target (end P6) ~85% Rust source (Kotlin shell + ObjC++ shim + Swift bridge are the deltas); stretch (end P8) ~99% (only `AndroidManifest.xml` + in-OS NativeActivity glue remain).
-- **Latency budget (target, validate in P5):** capture ≤2 ms · encode ≤8 ms · USB ≤3 ms · decode ≤8 ms · present ≤16 ms → glass-to-glass < 50 ms. Unmeasured in research; P5 must prove it.
+- **Latency budget (measured in P5):** glass-to-glass **best ~80 ms p50** on device (Pixel 6a + M1, 2400×1080@60); target **< 50 ms**, practical floor **~43 ms** (one 60 Hz vsync ~16.7 ms + Tensor decode ~12 ms are immovable on this hardware). Phone input-queue bufferbloat solved; host encoder pacing + VideoToolbox low-latency mode shipped. Remaining levers ranked in ROADMAP Priority 3 (non-blocking USB writes first, ~18 ms).
 
 ## Constraints
 
@@ -69,15 +75,15 @@ A user plugs a Pixel 6a into an M1 MacBook with one USB-C cable, launches the ho
 | Decision | Status | Rationale | Outcome |
 |----------|--------|-----------|---------|
 | **D0** — "100% Rust" = simplest-now, shrink-to-Rust-later via ports & adapters: every platform boundary behind a Rust trait/FFI seam; MVP may ship Kotlin shell + ObjC++ shim + Swift bridge; replace with pure-Rust adapters over P7–P8 without touching core logic. | **LOCKED** | True 0% non-Rust is impossible; achievable target is 100% Rust source + 3 documented FFI boundaries. Shrinking at seams keeps the purity work a contained follow-up, not a rewrite. | — Pending |
-| **D1** — USB transport: spike both AOA and network-over-USB (NCM/TCP) in P1, **lead with AOA**; final mechanism picked on measured throughput/reliability. | **LOCKED** (strategy; mechanism decided in P1) | Two spikes guarantee one works; AOA is the lead candidate, NCM the fallback. | — Pending |
-| **D2** — Video codec: **H.264** for MVP; HEVC is a later toggle (P7). | **LOCKED** | Universal HW support on M1 + Pixel 6a for H.264. | — Pending |
-| **D3** — Android render path: **decode-to-surface** (MediaCodec → `ANativeWindow`, no GPU round-trip); `wgpu` sampling only if overlays needed later. | **LOCKED** | Lowest-latency path; avoids a GPU copy. | — Pending |
-| **D4** — Touch scope: single-pointer **mouse emulation** via `CGEvent`; multitouch + pen post-MVP. | Proposed default | Keeps the MVP back-channel simple. | — Pending |
-| **D5** — Mac app shape: **CLI** for spikes, **menu-bar status item** for the shippable app. | Proposed default | CLI is enough to de-risk; menu-bar is the shippable UX. | — Pending |
-| **D6** — Display geometry: **extend** at **2400×1080 @ 60 Hz** (Pixel 6a native, landscape); HiDPI 2× optional. | Proposed default | Matches the Pixel 6a panel; extend (not mirror) is the product. | — Pending |
-| **D7** — Android MVP shell: **thin Kotlin Activity** (glue only, ~50 LOC) → swap to **NativeActivity** in P7. | Proposed default (follows from D0) | Fastest path to a working shell; all logic stays in the Rust `cdylib`. | — Pending |
+| **D1** — USB transport: spike both AOA and network-over-USB (NCM/TCP) in P1, **lead with AOA**; final mechanism picked on measured throughput/reliability. | **LOCKED** | Two spikes guarantee one works; AOA is the lead candidate, NCM the fallback. | ✅ **AOA** (P1, ~103 Mbit/s, no sudo; NCM unused) |
+| **D2** — Video codec: **H.264** for MVP; HEVC is a later toggle (P7). | **LOCKED** | Universal HW support on M1 + Pixel 6a for H.264. | ✅ H.264 live; HEVC deferred (anti-latency on Tensor) |
+| **D3** — Android render path: **decode-to-surface** (MediaCodec → `ANativeWindow`, no GPU round-trip); `wgpu` sampling only if overlays needed later. | **LOCKED** | Lowest-latency path; avoids a GPU copy. | ✅ decode-to-surface live (P4/P5) |
+| **D4** — Touch scope: single-pointer **mouse emulation** via `CGEvent`; multitouch + pen post-MVP. | Proposed default | Keeps the MVP back-channel simple. | Logic done both ends; live wiring deferred |
+| **D5** — Mac app shape: **terminal CLI** (`rustscreen start`/`stop`) is the shippable interface. | **Decided — CLI** (user, 2026-06-05) | User prefers terminal control; the menu-bar app is dropped. | Priority 1 |
+| **D6** — Display geometry: **extend** at **2400×1080 @ 60 Hz** (Pixel 6a native, landscape); HiDPI 2× optional. | Proposed default | Matches the Pixel 6a panel; extend (not mirror) is the product. | ✅ 2400×1080@60 + arrangeable HiDPI (P2) |
+| **D7** — Android MVP shell: **thin Kotlin Activity** (glue only, ~50 LOC) → swap to **NativeActivity** in P7. | Proposed default (follows from D0) | Fastest path to a working shell; all logic stays in the Rust `cdylib`. | Kotlin shell in use; NativeActivity deferred (P7) |
 
 </decisions>
 
 ---
-*Last updated: 2026-06-02 after initial ingest (P0 complete; P2 next per agreed build order)*
+*Last updated: 2026-06-05 — P0–P5 complete (live pipeline works on device). Now executing the three user-set priorities in `ROADMAP.md` → "Active Priorities": CLI → auto-reconnect → finish latency.*
