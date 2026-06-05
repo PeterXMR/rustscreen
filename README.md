@@ -158,6 +158,26 @@ cargo test --workspace
 cargo run -p macos-host
 ```
 
+#### `rustscreen` — install once, drive it from the terminal
+
+The intended way to run the host. Install it once (a **release** build — debug materially worsens
+encode/copy latency), then control it with `start` / `stop`:
+
+```bash
+# Install the CLI onto your PATH (release; needs both live features for capture + USB)
+cargo install --path crates/macos-host --bin rustscreen --features live-capture,live-usb
+
+rustscreen start    # runs the host in the background; streams the moment the phone app opens
+rustscreen status   # is the host running?
+rustscreen stop     # stop the host and remove the virtual display (desktop reflows)
+```
+
+`rustscreen start` runs in the background and returns your prompt immediately. It first checks the
+macOS **Screen & System Audio Recording** permission (see below) and, if it's missing, prints
+exactly how to grant it instead of failing with a silent black screen. It then waits for the phone —
+plug in the Pixel 6a and open the RustScreen app and streaming begins on its own. Worker logs
+(including the per-stage + glass-to-glass latency report) go to `~/.rustscreen/rustscreen.log`.
+
 #### macOS capture spikes — requires the **Screen & System Audio Recording** permission
 
 The display-capture/encode tools are built behind the off-by-default `live-capture` feature:
