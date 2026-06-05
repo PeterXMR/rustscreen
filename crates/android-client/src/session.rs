@@ -21,7 +21,9 @@
 //! - Other `Control` variants → logged / acknowledged; loop continues (the transport-only
 //!   client has no way to honour `RequestKeyframe` itself — the session layer above would
 //!   write one back; here we simply continue).
-//! - `Handshake` / `Touch` → not part of the inbound decode path; silently ignored.
+//! - `Handshake` / `Touch` / `ClockPing` / `ClockPong` / `Stats` → not part of the inbound
+//!   decode path; silently ignored here (the live decode loop answers `ClockPing` and emits
+//!   `Stats` via [`StatsTracker`] / [`pong_for_ping`]).
 //! - Clean EOF (peer closed at a frame boundary) → loop exits; NOT an error.
 //!
 //! ## Returns
@@ -803,6 +805,15 @@ mod tests {
     fn present_without_arrive_yields_none() {
         let mut t = StatsTracker::new(8);
         assert!(t.on_present(2000, 75).is_none());
+    }
+
+    #[test]
+    fn present_with_arrive_but_no_decode_yields_none() {
+        // The other half of the "only emit when complete" rule: arrive seen, decode never
+        // recorded → present must NOT produce a Stats frame (a partial record is dropped).
+        let mut t = StatsTracker::new(8);
+        t.on_arrive(3000, 50);
+        assert!(t.on_present(3000, 75).is_none());
     }
 
     #[test]
