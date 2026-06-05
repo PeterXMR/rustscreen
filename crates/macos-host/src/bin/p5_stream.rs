@@ -42,6 +42,22 @@ use objc2_core_media::CMSampleBuffer;
 #[cfg(all(feature = "live-capture", feature = "live-usb"))]
 use objc2_screen_capture_kit::{SCStream, SCStreamOutput, SCStreamOutputType};
 
+/// Process-global monotonic origin. Initialised on first use so the capture delegate, the
+/// stream loop's host-stage stamps, and clock-sync all share ONE clock origin — otherwise a
+/// `capture_us` stamped against the delegate's clock could not be compared with an
+/// `encode_done_us` stamped against a different `Instant`.
+#[cfg(all(feature = "live-capture", feature = "live-usb"))]
+static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+
+/// Process-monotonic microseconds since [`START`] (initialised on first call).
+#[cfg(all(feature = "live-capture", feature = "live-usb"))]
+fn now_us() -> u64 {
+    START
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_micros() as u64
+}
+
 /// Cached H.264 parameter sets (SPS, PPS) + AVCC NAL-length size, read once from the first
 /// sample's format description and reused to inject params in-band ahead of every keyframe.
 #[cfg(all(feature = "live-capture", feature = "live-usb"))]
@@ -89,6 +105,12 @@ objc2::define_class!(
 
             let tx = self.ivars().tx.clone();
             let params = Arc::clone(&self.ivars().params);
+            // Stamp the REAL capture time (process-monotonic µs) the instant ScreenCaptureKit
+            // delivered this frame, BEFORE it is submitted to VideoToolbox. Carrying this into
+            // the EncodedFrame lets the stream loop measure capture→encode (and glass-to-glass)
+            // against actual wall time — including mpsc-channel queueing — instead of deriving
+            // it tautologically from encode_micros.
+            let capture_us = now_us();
             // Stamp submit time into the handler; when VideoToolbox fires it, the elapsed time
             // is this one frame's encode latency.
             let submit_t = std::time::Instant::now();
@@ -129,6 +151,7 @@ objc2::define_class!(
                     );
                     let frame = EncodedFrame {
                         pts_us,
+                        capture_us,
                         keyframe,
                         encode_micros: submit_t.elapsed().as_micros() as u64,
                         annex_b,
@@ -408,67 +431,127 @@ fn main() {
     // streaming, then split the transport into independent read/write halves — a dedicated reader
     // thread pulls inbound `Frame::Stats` while the main thread streams video on the write half.
     use macos_host::session;
-    use protocol::clock::ClockOffset;
+    use protocol::clock::{self, ClockOffset};
     use protocol::messages::Frame;
-
-    // Monotonic host clock in microseconds, captured once at startup.
-    let start = std::time::Instant::now();
-    let now_us = move || start.elapsed().as_micros() as u64;
+    use std::sync::atomic::AtomicBool;
 
     let offer = session::host_handshake(W as u32, H as u32, 60);
-    if let Err(e) = session::perform_handshake(&mut transport, offer.clone()) {
-        eprintln!("p5_stream: handshake failed: {e}");
-        drop(vdisplay);
-        std::process::exit(8);
-    }
-    println!("p5_stream: handshake OK — running clock-sync…");
-
-    // Clock-sync. On failure, degrade gracefully: stream + host-only stage timings, but no
-    // glass-to-glass (we cannot convert the phone's clock to ours without an offset).
-    let offset: Option<ClockOffset> = match session::perform_clock_sync(&mut transport, now_us) {
-        Ok(off) => {
-            println!(
-                "p5_stream: clock-sync OK — offset={} µs, rtt={} µs (±rtt/2 precision).",
-                off.offset_us, off.rtt_us
-            );
-            Some(off)
-        }
+    // Fix #5: capture the negotiated AgreedConfig and thread it into the stream loop, rather than
+    // discarding it and re-deriving the codec from the offer.
+    let agreed = match session::perform_handshake(&mut transport, offer) {
+        Ok(a) => a,
         Err(e) => {
-            eprintln!(
-                "p5_stream: clock-sync failed ({e}); continuing with host-only stage timings \
-                 (glass-to-glass unavailable)."
-            );
-            None
+            eprintln!("p5_stream: handshake failed: {e}");
+            drop(vdisplay);
+            std::process::exit(8);
         }
     };
+    println!(
+        "p5_stream: handshake OK ({:?} {}×{}@{}) — running clock-sync…",
+        agreed.codec, agreed.width, agreed.height, agreed.refresh_hz
+    );
 
-    // --- 7b. Split the transport; spawn the stats-reader thread ---------------
+    // --- 7b. Split the transport; spawn the single inbound-frame reader -------
+    // Fix #1/#3: split BEFORE clock-sync so ONE reader thread owns the read half and dispatches
+    // every inbound frame — `ClockPong` (stamping t3 on receipt and forwarding it for the bounded
+    // clock-sync wait) and `Frame::Stats` (forwarded to the stream loop). This makes the blocking
+    // bulk-IN read live entirely on the reader thread, so:
+    //   (#1) clock-sync no longer does its own blocking read — it waits on a channel with a
+    //        timeout, so a phone that never answers degrades to offset=None within 2 s instead of
+    //        hanging the host forever (the degrade path is finally reachable), and
+    //   (#3) teardown does not depend on unblocking a pending IN read from the main thread: the
+    //        reader polls a stop flag between whole frames (via nusb's read timeout, which does
+    //        NOT corrupt framing because it only fires while no bytes of a frame are buffered),
+    //        and as a hard backstop we join with a timeout + cancel any pending transfer.
     let (read_half, mut write_half) = transport.split();
+    let stop = Arc::new(AtomicBool::new(false));
+    let (pong_tx, pong_rx) = mpsc::channel::<(Frame, u64)>();
     let (stats_tx, stats_rx) = mpsc::channel::<Frame>();
+    let reader_stop = Arc::clone(&stop);
     let reader = std::thread::spawn(move || {
         let mut read_half = read_half;
-        // Pull inbound frames forever; forward only `Frame::Stats` to the main thread. Any read
-        // error means the peer is gone — exit the loop (dropping stats_tx, closing the channel).
+        // A bounded per-read timeout lets the reader notice the stop flag promptly while idle
+        // between frames (the dominant teardown case) instead of blocking forever on a bulk IN
+        // the phone will never satisfy once capture stops. nusb keeps the pending transfer alive
+        // across a timeout, so re-issuing the read loses no data.
+        read_half.set_read_timeout(Duration::from_millis(250));
         loop {
+            if reader_stop.load(Ordering::Relaxed) {
+                break;
+            }
             match Frame::read_from(&mut read_half) {
+                Ok(frame @ Frame::ClockPong { .. }) => {
+                    // Stamp t3 on receipt (shared monotonic origin) and forward for the
+                    // bounded clock-sync wait. If the main thread already moved on, ignore.
+                    let _ = pong_tx.send((frame, now_us()));
+                }
                 Ok(frame @ Frame::Stats { .. }) => {
                     if stats_tx.send(frame).is_err() {
                         break; // main thread ended
                     }
                 }
-                Ok(_) => {}      // ignore non-Stats inbound frames
-                Err(_) => break, // peer gone / framing error
+                Ok(_) => {} // ignore other inbound frames
+                Err(e) => {
+                    // A timeout just means "no frame this window" — loop and re-check the stop
+                    // flag. Any other error means the peer is gone / framing broke → exit.
+                    if matches!(&e, protocol::messages::MessageError::Io(io)
+                        if io.kind() == std::io::ErrorKind::TimedOut)
+                    {
+                        continue;
+                    }
+                    break;
+                }
             }
         }
     });
 
-    // --- 7c. Instrumented stream until the phone disconnects -------------------
+    // --- 7c. Clock-sync over the split halves (bounded, degrades gracefully) ---
+    // Send the ping on the write half; the reader forwards the pong (with its t3). Wait at most
+    // 2 s: if no pong arrives, degrade to offset=None (host-only stage timings, no glass-to-glass)
+    // instead of hanging.
+    let offset: Option<ClockOffset> = {
+        use std::io::Write as _;
+        let t0 = now_us();
+        let ping = Frame::ClockPing { t0_us: t0 };
+        let ping_sent = ping
+            .write_to(&mut write_half)
+            .and_then(|()| write_half.flush().map_err(Into::into));
+        match ping_sent {
+            Ok(()) => match pong_rx.recv_timeout(Duration::from_secs(2)) {
+                Ok((Frame::ClockPong { t1_us, t2_us, .. }, t3)) => {
+                    let off = clock::estimate(t0, t1_us, t2_us, t3);
+                    println!(
+                        "p5_stream: clock-sync OK — offset={} µs, rtt={} µs (±rtt/2 precision).",
+                        off.offset_us, off.rtt_us
+                    );
+                    Some(off)
+                }
+                Ok(_) => None, // reader only forwards pongs here, but be defensive
+                Err(_) => {
+                    eprintln!(
+                        "p5_stream: clock-sync timed out (no pong in 2 s); continuing with \
+                         host-only stage timings (glass-to-glass unavailable)."
+                    );
+                    None
+                }
+            },
+            Err(e) => {
+                eprintln!(
+                    "p5_stream: clock-sync ping failed ({e}); continuing with host-only stage \
+                     timings (glass-to-glass unavailable)."
+                );
+                None
+            }
+        }
+    };
+
+    // --- 7d. Instrumented stream until the phone disconnects -------------------
     println!("p5_stream: streaming with live latency instrumentation…");
     let mut pipeline = macos_host::latency::PipelineLatency::new(256);
     let result = session::run_stream_session_instrumented(
         rx,
         &mut write_half,
-        offer,
+        agreed,
         offset,
         &stats_rx,
         &mut pipeline,
@@ -486,8 +569,25 @@ fn main() {
     unsafe { stream.stopCaptureWithCompletionHandler(Some(&stop_handler)) };
     let _ = stop_rx.recv_timeout(Duration::from_secs(5));
     drop(vdisplay); // remove the virtual display so the Mac desktop reflows
-    drop(write_half); // closing the write half lets the reader thread unblock + exit
-    let _ = reader.join();
+    drop(write_half); // closing the write half also signals the peer we are done
+                      // Signal the reader to stop; it observes this between frames via its read timeout. We do NOT
+                      // block indefinitely on join: in the pathological case where the reader is parked mid-frame
+                      // inside a transfer, joining could hang teardown — so we give it a bounded grace period and
+                      // otherwise let the detached thread die with the process. (nusb cannot cancel another
+                      // thread's in-flight read from here, so a timeout-bounded join is the robust teardown.)
+    stop.store(true, Ordering::Relaxed);
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while !reader.is_finished() && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    if reader.is_finished() {
+        let _ = reader.join();
+    } else {
+        eprintln!(
+            "p5_stream: reader thread still parked on a bulk-IN read at teardown; detaching it \
+             (it will die with the process) so exit does not hang."
+        );
+    }
 
     // Final latency report on exit.
     print_report(&pipeline.report(), offset);
@@ -560,6 +660,10 @@ fn print_report(
         }
     }
     println!("  anomalies (clock jitter, clamped to 0): {}", r.anomalies);
+    println!(
+        "  unmatched phone stats (no host record / evicted): {}",
+        r.unmatched_stats
+    );
 }
 
 /// Bring up the live AOA transport and read the device's connect-hello.

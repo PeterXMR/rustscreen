@@ -312,6 +312,25 @@ impl AoaTransport {
 /// stats-reader thread, which loops `Frame::read_from(&mut read_half)`.
 pub struct AoaReadHalf(nusb::io::EndpointRead<Bulk>);
 
+impl AoaReadHalf {
+    /// Bound how long a blocking `read()` waits for a transfer before returning
+    /// [`io::ErrorKind::TimedOut`]. nusb does NOT cancel the pending transfer on timeout — it
+    /// may complete later if the read is retried — so a timeout that fires while *no* bytes of a
+    /// frame have been consumed is harmless: the reader can poll a stop flag and re-issue the
+    /// read without losing data. The reader thread uses this so it can notice teardown promptly
+    /// while it is idle between whole frames, instead of blocking forever on a bulk IN that the
+    /// phone will never satisfy once capture has stopped.
+    pub fn set_read_timeout(&mut self, timeout: std::time::Duration) {
+        self.0.set_read_timeout(timeout);
+    }
+
+    /// Cancel any pending IN transfer so a blocking `read()` unwinds to EOF. Used on teardown as
+    /// a hard backstop in case the reader is parked inside a transfer.
+    pub fn cancel_all(&mut self) {
+        self.0.cancel_all();
+    }
+}
+
 impl Read for AoaReadHalf {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         self.0.read(buf)

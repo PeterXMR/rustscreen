@@ -24,6 +24,11 @@ use crate::capture::{CapturedFrame, Capturer};
 pub struct EncodedFrame {
     /// Presentation timestamp in microseconds (carried through from capture).
     pub pts_us: u64,
+    /// Monotonic host time (µs) when the frame was captured/delivered by ScreenCaptureKit,
+    /// before encode. Stamped in the capture delegate so the `capture→encode` stage and the
+    /// glass-to-glass total measure real wall time (including any mpsc-channel queueing),
+    /// rather than being derived from `encode_micros`.
+    pub capture_us: u64,
     /// Whether this access unit is a keyframe (IDR; carries SPS/PPS).
     pub keyframe: bool,
     /// Wall-clock time the encoder took to produce this frame, in microseconds.
@@ -288,6 +293,7 @@ mod tests {
             self.frame_index += 1;
             EncodedFrame {
                 pts_us: frame.pts_us,
+                capture_us: 0,
                 keyframe,
                 encode_micros: 5,
                 annex_b,
@@ -346,6 +352,7 @@ mod tests {
             self.frame_index += 1;
             EncodedFrame {
                 pts_us: frame.pts_us,
+                capture_us: 0,
                 keyframe,
                 encode_micros: 1,
                 annex_b,

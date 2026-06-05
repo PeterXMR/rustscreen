@@ -37,6 +37,12 @@ pub struct LatencyReport {
     pub glass_to_glass: LatencyStats,
     /// Count of samples with a negative computed interval (clock jitter), clamped to 0.
     pub anomalies: u64,
+    /// Count of phone `Frame::Stats` that arrived with NO matching in-flight host record
+    /// (its `pts_us` was never recorded, or was already evicted from the bounded FIFO).
+    /// Surfaced so the report can't silently under-count: a high value means host records
+    /// are being evicted before the phone's stats catch up (capacity too small or the phone
+    /// lagging badly).
+    pub unmatched_stats: u64,
 }
 
 /// Fuses host-side and phone-side per-frame timestamps (correlated by `pts_us`) into a
@@ -91,6 +97,9 @@ impl PipelineLatency {
         offset: ClockOffset,
     ) {
         let Some(idx) = self.inflight.iter().position(|h| h.pts_us == pts_us) else {
+            // No host record for this pts (never recorded, or already evicted). Count it so
+            // the report surfaces silent eviction instead of just dropping the sample.
+            self.report.unmatched_stats += 1;
             return;
         };
         let h = self
@@ -258,6 +267,47 @@ mod tests {
         let mut p = PipelineLatency::new(16);
         p.record_stats(999, 100, 110, 120, offset(0)); // no host record for 999
         assert_eq!(p.report().glass_to_glass.count(), 0);
+    }
+
+    #[test]
+    fn unmatched_stats_counter_increments_on_missing_host_record() {
+        let mut p = PipelineLatency::new(16);
+        // pts 999 was never recorded by record_host → unmatched.
+        p.record_stats(999, 100, 110, 120, offset(0));
+        assert_eq!(
+            p.report().unmatched_stats,
+            1,
+            "missing host record is counted"
+        );
+
+        // A second unmatched stat increments again.
+        p.record_stats(998, 100, 110, 120, offset(0));
+        assert_eq!(p.report().unmatched_stats, 2);
+
+        // A matched stat does NOT bump the unmatched counter.
+        p.record_host(1000, 0, 8, 10);
+        p.record_stats(1000, 110, 120, 130, offset(100));
+        let r = p.report();
+        assert_eq!(
+            r.unmatched_stats, 2,
+            "a matched stat leaves the counter untouched"
+        );
+        assert_eq!(r.glass_to_glass.count(), 1);
+    }
+
+    #[test]
+    fn evicted_host_record_makes_stats_unmatched() {
+        let mut p = PipelineLatency::new(2); // capacity 2 in-flight
+        p.record_host(1, 0, 1, 2);
+        p.record_host(2, 0, 1, 2);
+        p.record_host(3, 0, 1, 2); // evicts pts 1
+        p.record_stats(1, 10, 11, 12, offset(0)); // evicted → unmatched, not fused
+        let r = p.report();
+        assert_eq!(r.glass_to_glass.count(), 0);
+        assert_eq!(
+            r.unmatched_stats, 1,
+            "an evicted host record makes its phone stat observably unmatched"
+        );
     }
 
     #[test]

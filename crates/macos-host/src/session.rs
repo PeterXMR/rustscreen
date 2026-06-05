@@ -212,14 +212,18 @@ pub fn perform_clock_sync(
     let reply = Frame::read_from(transport)?;
     let t3 = now_us();
     let Frame::ClockPong {
-        t0_us,
+        t0_us: _echoed_t0,
         t1_us,
         t2_us,
     } = reply
     else {
         return Err(ClockSyncError::UnexpectedReply);
     };
-    Ok(protocol::clock::estimate(t0_us, t1_us, t2_us, t3))
+    // Use the LOCAL `t0` captured before the ping, not the pong's echoed `t0_us`. A stale
+    // or wrong pong (e.g. an echo from an earlier ping) would otherwise corrupt the offset;
+    // anchoring on our own send timestamp keeps the estimate sound regardless of what the
+    // peer echoes back.
+    Ok(protocol::clock::estimate(t0, t1_us, t2_us, t3))
 }
 
 // ---------------------------------------------------------------------------
@@ -397,10 +401,11 @@ fn run_stream_session_inner(
 ///
 /// For each encoded frame it captures monotonic host timestamps and calls
 /// [`PipelineLatency::record_host`]:
-/// - `encode_done_us` ≈ the instant just before the send,
-/// - `send_done_us` ≈ the instant just after the write+flush returns,
-/// - `capture_us` ≈ `encode_done_us - frame.encode_micros` (the encoder already measured its own
-///   duration).
+/// - `capture_us` = the real capture timestamp the delegate stamped on the frame
+///   ([`EncodedFrame::capture_us`]) — NOT derived from `encode_micros`, so capture→encode and the
+///   glass-to-glass total reflect actual wall time including any mpsc-channel queueing,
+/// - `encode_done_us` = the instant just before the send,
+/// - `send_done_us` = the instant just after the write+flush returns.
 ///
 /// After each send it non-blockingly drains `stats_rx`, fusing any phone `Frame::Stats` (via
 /// `offset`, if clock-sync succeeded) into `pipeline`. The wire contract itself is unchanged:
@@ -417,7 +422,7 @@ fn run_stream_session_inner(
 pub fn run_stream_session_instrumented(
     frames: std::sync::mpsc::Receiver<EncodedFrame>,
     write_half: &mut impl Write,
-    offer: Handshake,
+    agreed: AgreedConfig,
     offset: Option<ClockOffset>,
     stats_rx: &std::sync::mpsc::Receiver<Frame>,
     pipeline: &mut PipelineLatency,
@@ -431,21 +436,9 @@ pub fn run_stream_session_instrumented(
 
     let mut last_report = Instant::now();
 
-    // The handshake + clock-sync already happened on the full-duplex transport before the split;
-    // re-derive the AgreedConfig from the offer so the wire contract (codec) is unchanged. The
-    // offer is the host's own advertisement, so negotiating it against itself yields the host's
-    // codec without another round trip.
-    let agreed = AgreedConfig {
-        width: offer.width,
-        height: offer.height,
-        refresh_hz: offer.refresh_hz,
-        codec: offer
-            .codecs
-            .first()
-            .copied()
-            .unwrap_or(protocol::messages::VideoCodec::H264),
-    };
-
+    // The handshake already negotiated this `agreed` config on the full-duplex transport before
+    // the split; it is threaded in directly so the wire contract (codec) matches exactly what the
+    // peer agreed to, with no re-derivation from the host's own offer.
     let mut counting = CountingWrite::new(write_half);
     let mut summary = SendSessionSummary {
         frames: 0,
@@ -460,8 +453,11 @@ pub fn run_stream_session_instrumented(
             Ok(encoded) => {
                 let pts_us = encoded.pts_us;
                 let encode_micros = encoded.encode_micros;
+                // Real capture time stamped by the delegate (shared monotonic origin), NOT
+                // `encode_done_us - encode_micros`: that would make capture→encode tautologically
+                // equal to encode_micros and hide mpsc-channel queue latency.
+                let capture_us = encoded.capture_us;
                 let encode_done_us = now_us();
-                let capture_us = encode_done_us.saturating_sub(encode_micros);
 
                 send_encoded_frame(
                     encoded,
@@ -666,6 +662,7 @@ mod tests {
             self.frame_index += 1;
             EncodedFrame {
                 pts_us: frame.pts_us,
+                capture_us: 0,
                 keyframe,
                 encode_micros: 5,
                 annex_b,
@@ -865,6 +862,17 @@ mod tests {
         host_handshake(2400, 1080, 60)
     }
 
+    /// The AgreedConfig the default handshake negotiates — threaded directly into
+    /// `run_stream_session_instrumented` (the caller does the handshake before the split).
+    fn default_agreed() -> AgreedConfig {
+        AgreedConfig {
+            width: 2400,
+            height: 1080,
+            refresh_hz: 60,
+            codec: VideoCodec::H264,
+        }
+    }
+
     fn default_client_reply() -> Vec<u8> {
         make_client_reply(protocol_version(), 2400, 1080, 60, vec![VideoCodec::H264])
     }
@@ -883,6 +891,7 @@ mod tests {
         annex_b.extend_from_slice(&[0, 0, 0, 1, 0x65, 0xAA]); // IDR
         EncodedFrame {
             pts_us,
+            capture_us: 0,
             keyframe: true,
             encode_micros: 7,
             annex_b,
@@ -892,6 +901,7 @@ mod tests {
     fn delta_encoded(pts_us: u64) -> EncodedFrame {
         EncodedFrame {
             pts_us,
+            capture_us: 0,
             keyframe: false,
             encode_micros: 3,
             annex_b: vec![0, 0, 0, 1, 0x61, 0xBB],
@@ -1045,7 +1055,7 @@ mod tests {
         let summary = run_stream_session_instrumented(
             rx,
             &mut sink,
-            default_offer(),
+            default_agreed(),
             offset,
             &stats_rx,
             &mut pipeline,
@@ -1126,7 +1136,7 @@ mod tests {
         let summary = run_stream_session_instrumented(
             rx,
             &mut sink,
-            default_offer(),
+            default_agreed(),
             None, // clock-sync failed → degrade to host-only stages
             &stats_rx,
             &mut pipeline,
@@ -1153,6 +1163,134 @@ mod tests {
             summary.latency.count(),
             1,
             "host-only encode latency is still recorded"
+        );
+    }
+
+    /// Fix #5: the negotiated AgreedConfig is threaded in directly (not re-derived from the
+    /// offer), so the codec the loop writes is exactly what was passed — even when it differs
+    /// from the host's own H.264 default.
+    #[test]
+    fn instrumented_stream_uses_threaded_agreed_config() {
+        use crate::latency::PipelineLatency;
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(keyframe_encoded(1000)).unwrap();
+        drop(tx);
+        let (_stats_tx, stats_rx) = std::sync::mpsc::channel::<Frame>();
+
+        // A non-default agreed config (HEVC) proves the loop honours the threaded value rather
+        // than re-deriving H.264 from the offer's codec list.
+        let agreed = AgreedConfig {
+            width: 1920,
+            height: 1080,
+            refresh_hz: 30,
+            codec: VideoCodec::Hevc,
+        };
+
+        let mut t = 0u64;
+        let now = move || {
+            t += 10;
+            t
+        };
+        let mut pipeline = PipelineLatency::new(16);
+        let mut sink: Vec<u8> = Vec::new();
+
+        let summary = run_stream_session_instrumented(
+            rx,
+            &mut sink,
+            agreed.clone(),
+            None,
+            &stats_rx,
+            &mut pipeline,
+            std::time::Duration::from_millis(5),
+            std::time::Duration::from_secs(3600),
+            now,
+            |_r| {},
+        )
+        .unwrap();
+
+        assert_eq!(summary.agreed_config, agreed);
+        // The VideoConfig frame on the wire carries the threaded codec.
+        let mut cur = Cursor::new(sink);
+        let mut codec_seen = None;
+        while let Ok(f) = Frame::read_from(&mut cur) {
+            if let Frame::VideoConfig { codec, .. } = f {
+                codec_seen = Some(codec);
+            }
+        }
+        assert_eq!(
+            codec_seen,
+            Some(VideoCodec::Hevc),
+            "the wire VideoConfig uses the threaded agreed codec, not a re-derived default"
+        );
+    }
+
+    /// Fix #2: capture→encode is measured from the frame's real `capture_us` (stamped by the
+    /// delegate), NOT derived from `encode_micros`. A frame whose capture_us is well before the
+    /// loop's encode_done stamp must produce a capture→encode interval reflecting that real gap.
+    #[test]
+    fn instrumented_stream_uses_real_capture_timestamp() {
+        use crate::latency::PipelineLatency;
+        use protocol::clock::ClockOffset;
+
+        // Build a frame whose capture_us = 5 (stamped "early"), so when the loop stamps
+        // encode_done from the injected clock the capture→encode gap is the real difference,
+        // independent of encode_micros.
+        let mut kf = keyframe_encoded(1000);
+        kf.capture_us = 5;
+        kf.encode_micros = 999; // deliberately unrelated to the capture→encode gap
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(kf).unwrap();
+        drop(tx);
+
+        // Phone stat for pts 1000 so the host record fuses and the capture→encode stage records.
+        let (stats_tx, stats_rx) = std::sync::mpsc::channel::<Frame>();
+        stats_tx
+            .send(Frame::Stats {
+                pts_us: 1000,
+                arrive_us: 1000,
+                decode_us: 1000,
+                present_us: 1000,
+            })
+            .unwrap();
+        drop(stats_tx);
+
+        // Injected clock: first call (encode_done) returns 30, next (send_done) 40, etc.
+        let mut t = 20u64;
+        let now = move || {
+            t += 10;
+            t
+        };
+        let offset = Some(ClockOffset {
+            offset_us: 0,
+            rtt_us: 0,
+        });
+        let mut pipeline = PipelineLatency::new(16);
+        let mut sink: Vec<u8> = Vec::new();
+
+        run_stream_session_instrumented(
+            rx,
+            &mut sink,
+            default_agreed(),
+            offset,
+            &stats_rx,
+            &mut pipeline,
+            std::time::Duration::from_millis(5),
+            std::time::Duration::from_secs(3600),
+            now,
+            |_r| {},
+        )
+        .unwrap();
+
+        let report = pipeline.report();
+        assert_eq!(report.capture_to_encode.count(), 1);
+        // encode_done_us = 30 (first now() call), capture_us = 5 → gap = 25, NOT encode_micros(999)
+        // and NOT 0 (which a `encode_done - encode_micros` derivation would have produced).
+        assert_eq!(
+            report.capture_to_encode.max(),
+            Some(25),
+            "capture→encode uses the real capture_us, not encode_micros"
         );
     }
 
