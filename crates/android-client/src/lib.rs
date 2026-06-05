@@ -2,6 +2,18 @@
 //! All app logic lives here in Rust; the Kotlin shell is glue only and will be replaced by
 //! NativeActivity in a later phase.
 
+use std::sync::OnceLock;
+use std::time::Instant;
+
+static CLOCK_START: OnceLock<Instant> = OnceLock::new();
+
+/// Process-global monotonic phone clock in microseconds. All latency timestamps
+/// (arrive/decode/present + clock-sync t1/t2) MUST use this single epoch so they are
+/// comparable and consistent with the host's clock-sync offset.
+pub fn now_us() -> u64 {
+    CLOCK_START.get_or_init(Instant::now).elapsed().as_micros() as u64
+}
+
 /// Transport core: the platform-agnostic `echo_loop` (host-testable) plus the
 /// android-only `AccessoryFdTransport`. `echo_loop` is NOT cfg-gated so CI exercises it.
 pub mod transport;
@@ -10,6 +22,11 @@ pub mod transport;
 /// normalized `protocol::messages::TouchEvent` — the inverse of the host's coordinate
 /// mapping. NOT cfg-gated, so CI exercises it (the JNI/Kotlin capture shim is glue).
 pub mod touch;
+
+/// Touch move-event coalescing core (pure): batch high-frequency MOVE events down to the
+/// send tick while DOWN/UP pass through immediately and in order. NOT cfg-gated, so CI
+/// exercises it (the JNI/Kotlin/transport wiring is the device-side glue, deferred).
+pub mod coalesce;
 
 /// Decode core (P4 Wave A): the platform-agnostic `VideoDecoder` port + `DecodeSession`
 /// orchestrator that turns protocol `Frame`s into configure/decode calls. NOT cfg-gated,
@@ -22,6 +39,11 @@ pub mod decode;
 /// receive loop that performs the client handshake and routes protocol `Frame`s into the
 /// `DecodeSession` / `VideoDecoder` port. NOT cfg-gated — CI exercises it in full.
 pub mod session;
+
+/// Input-side frame pacing (latency item A): a pure state machine that admits a frame only
+/// while the decoder's in-flight depth is under a small cap, else drops forward to the next
+/// keyframe. Platform-agnostic and CI-tested; the receive loop in `session` drives it.
+pub mod pacing;
 
 /// Surface↔USB rendezvous (P5 live pipeline): the one-way `WindowSlot` handoff that lets the
 /// USB decode-session thread wait for the render surface, which arrives on a separate Android
@@ -160,10 +182,11 @@ mod android {
         };
         let summary = run_session(&mut transport, &caps, &mut session, &mut decoder)?;
         log::info!(
-            "nativeOnUsbFd: {} frames received, {} decoded, {} keyframes",
+            "nativeOnUsbFd: {} frames received, {} decoded, {} keyframes, {} input-dropped",
             summary.frames_received,
             summary.decoded_count,
-            summary.keyframe_count
+            summary.keyframe_count,
+            summary.input_frames_dropped
         );
         Ok(summary.frames_received)
     }

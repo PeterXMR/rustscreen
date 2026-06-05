@@ -2,20 +2,17 @@
 resolver = "2"
 members = ["crates/protocol", "crates/macos-host", "crates/cg-virtual-display", "crates/android-client"]
 
-# Release profile for the shippable binaries (P8 packaging).
+# Release profile — tuned for SPEED (development, benchmarking, latency work).
 #
-# These are conservative, distribution-oriented defaults — they affect ONLY
-# `cargo build --release` (the default debug build is unaffected). Note that CI
-# DOES exercise this profile: the `package-macos` job builds the host with
-# `cargo build --release` via packaging/macos/make_app.sh. Tuned for a small,
-# fast host binary that ships inside the notarized `.app`/DMG (see
-# `packaging/macos/`) and a small Android `.so`.
+# RustScreen is a latency-critical app (glass-to-glass second-monitor mirroring),
+# so the default release build optimizes for raw performance, NOT binary size.
+# Use `--profile dist` (below) to produce the small, stripped artifact that ships.
 #
-#   opt-level = "z"  — optimize for size; the host is latency-bound on the GPU/USB
-#                      path, not on scalar CPU work, so size beats a marginal speedup.
-#   lto = true       — cross-crate inlining; meaningfully smaller binaries.
-#   codegen-units = 1 — best optimization at the cost of slower release builds.
-#   strip = true     — drop symbols from the shipped binary (debuginfo not shipped).
+#   opt-level = 3      — maximum scalar/codegen optimization for lowest latency.
+#   lto = "thin"       — cross-crate inlining with much faster link times than full
+#                        LTO, so the dev/benchmark release loop stays usable.
+#   codegen-units = 1  — best within-crate optimization (slower compile, faster code).
+#   strip = false      — keep symbols so release builds are profilable out of the box.
 #
 # `panic` is intentionally left at the default `unwind`. It is a whole-build
 # profile knob that Cargo cannot override per package, and `android-client`
@@ -24,14 +21,31 @@ members = ["crates/protocol", "crates/macos-host", "crates/cg-virtual-display", 
 # Android process. Forcing `panic = "abort"` here would silently defeat that
 # guard. An `unwind` panic in the macOS host still prints and exits non-zero, so
 # a fatal bug is still surfaced.
-#
-# If you need profiling symbols on a release build, override locally with
-# `cargo build --release --config 'profile.release.strip=false'` rather than
-# editing this file.
 [profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "unwind"
+strip = false
+
+# Distribution profile — tuned for SIZE (the shipped, notarized `.app`/DMG and
+# the Android `.so`). Inherits everything from `release` and overrides only the
+# size knobs. The packaging scripts (packaging/macos/make_app.sh,
+# packaging/android/build_release_apk.sh) and the CI `package-macos` job build
+# the shipped artifact with `cargo build --profile dist`.
+#
+#   opt-level = "z"  — optimize for size; the host is latency-bound on the GPU/USB
+#                      path, not scalar CPU work, so a smaller shipped binary is a
+#                      worthwhile trade for the artifact users download.
+#   lto = true       — full cross-crate LTO; smallest binaries (slower to link, but
+#                      this profile is only built for releases, not the dev loop).
+#   strip = true     — drop symbols from the shipped binary (debuginfo not shipped).
+#
+# `panic` is inherited as `unwind` from `release` (see the BL-03 note above).
+[profile.dist]
+inherits = "release"
 opt-level = "z"
 lto = true
-codegen-units = 1
 strip = true
 
 # Shared package metadata consumed by the packaging scripts (packaging/) so the

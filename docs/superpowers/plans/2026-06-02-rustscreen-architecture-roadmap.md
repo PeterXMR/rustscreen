@@ -88,7 +88,20 @@ Principle: **the Rust core never changes when we swap an adapter.** Each boundar
 └────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-**Data flow latency budget (target, to validate in P5):** capture ≤2 ms · encode ≤8 ms · USB ≤3 ms · decode ≤8 ms · present ≤16 ms (1 vsync) → **target glass-to-glass < 50 ms**. This is unmeasured in research (open question) and P5 must prove it.
+**Data flow latency budget (target):** capture ≤2 ms · encode ≤8 ms · USB ≤3 ms · decode ≤8 ms · present ≤16 ms (1 vsync) → **target glass-to-glass < 50 ms**.
+
+**Measured baseline (2026-06-05, PR #24 instrumentation, M1 + Pixel 6a over AOA, 2400×1080@60, ~866 frames):** SNTP clock-sync offset −111 µs / rtt 222 µs (sub-ms — fused numbers trustworthy to ±111 µs). Per-stage p50 / p95:
+
+| stage | p50 | p95 | vs. target | note |
+|---|---:|---:|---|---|
+| capture→encode | ~155–270 ms | up to 1393 ms | ✗ | host encode-channel queue; **grows over the run** |
+| encode→send | ~25 ms | ~33 ms | ✗ | USB write; > 16.6 ms/frame budget |
+| send→arrive (USB) | 0.5 ms | ~3 ms | ✓ | transit is not the problem |
+| arrive→decode | ~280 ms | up to 1344 ms | ✗ | phone decoder input queue |
+| decode→present | 1.6 ms | ~4 ms | ✓ | AMediaCodec→surface is fast |
+| **GLASS→GLASS** | **~470–585 ms** | up to 2980 ms | ✗ (~10–15×) | |
+
+**Diagnosis:** not a slow-stage problem — **bufferbloat from sub-60 fps throughput.** The pipeline sustains ~25–30 fps (n=45 in the first ~2 s) while capture produces at 60; the surplus is *queued, not dropped* (`unmatched_stats=0`), so the two unbounded-queue stages (host `mpsc` encode channel, phone decoder input) dominate and climb over time. The genuinely fast stages are USB transit (0.5 ms) and render (1.6 ms). **Levers (item 6 step 2):** bound the queues + drop-to-keyframe when behind, and set a VideoToolbox `AverageBitRate` (currently uncapped — p5_stream.rs:357) to shrink frames and pull `encode→send` under the 16.6 ms/frame budget that starts the backlog.
 
 ---
 
@@ -228,7 +241,7 @@ daily-usable app. Through item 11 = shippable to other people.
   - `android/` Gradle project: a ~50-LOC `MainActivity.kt` (SurfaceView + `System.loadLibrary`), built by `cargo-ndk -o android/app/src/main/jniLibs build`. **All logic stays in Rust** — Kotlin is glue only. (Swap this shell for NativeActivity in P7.)
 - [ ] **Step 5: Verify both build**
   - Run: `cargo build -p macos-host` → Expected: builds, prints hello.
-  - Run: `cargo ndk -t arm64-v8a -o android/app/src/main/jniLibs build -p android-client && (cd android && ./gradlew assembleDebug)` → Expected: debug `.apk`.
+  - Run: `cargo ndk -t arm64-v8a -o android/app/src/main/jniLibs build -p android-client --features live-decode && (cd android && ./gradlew assembleDebug)` → Expected: debug `.apk`. (`--features live-decode` is required for a working device build — without it the `.so` is the P1 echo fallback that connects but renders a black screen.)
   - Install on Pixel 6a (dev mode) → Expected: app launches, `adb logcat` shows "hello from Rust".
 - [ ] **Step 6: CI** — GitHub Actions: `cargo build` (macOS runner) + `cargo ndk` + `gradlew assembleDebug`. Commit.
 
@@ -347,8 +360,9 @@ Now connect P1–P4 live. This phase *does* use TDD for the pure-Rust protocol p
 - [ ] Send `VideoConfig` (SPS/PPS) on connect and on each keyframe request.
 
 #### Task P5.4 — Latency harness
-- [ ] Render a millisecond timer/QR on the Mac virtual display, photograph the phone showing it, compute glass-to-glass delta. Log per-stage timings.
-- [ ] **Acceptance:** Live extended desktop visible on the Pixel; **measured glass-to-glass < 50 ms** (revise budget in §2 with real numbers). Commit.
+- [x] **In-band SNTP clock-sync + per-stage `Stats` instrumentation** (PR #24) — supersedes the photograph-the-timer method: the phone stamps arrive/decode/present against a shared clock and ships them back, so glass-to-glass is computed continuously in-pipeline (±111 µs) rather than by camera. Per-stage timings logged via `p5_stream`'s latency report.
+- [x] **Live extended desktop visible on the Pixel** (2026-06-05) — end-to-end render confirmed on device.
+- [ ] **Acceptance — measured glass-to-glass < 50 ms:** ❌ NOT MET. Baseline measured ~470–585 ms p50 (see §2 measured-baseline table) — ~10–15× over, bufferbloat from sub-60 fps throughput. Instrumentation + baseline shipped in PR #24; reaching < 50 ms requires item 6 step 2 (bound queues + drop-to-keyframe + bitrate cap).
 
 **Risk:** First real backpressure/jitter. Add a 1-frame jitter buffer; drop-to-keyframe on overrun. Keep it minimal (YAGNI) until measured.
 

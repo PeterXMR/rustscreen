@@ -23,6 +23,14 @@ use std::io::{self, Read, Write};
 /// comfortably exceeds a 1080p H.264 keyframe.
 pub const MAX_FRAME_LEN: u32 = 16 * 1024 * 1024;
 
+/// Upper bound on the buffer [`read_frame`] fills in a single `read` call when
+/// pulling in a payload. The payload is read incrementally in chunks of at most this
+/// size so a corrupt or hostile length prefix can only force an up-front allocation
+/// bounded by this constant — never the full declared length (up to
+/// [`MAX_FRAME_LEN`] = 16 MiB). The growable buffer still grows to the *actual*
+/// payload length as bytes genuinely arrive.
+pub const READ_CHUNK_LEN: usize = 64 * 1024;
+
 /// Write one framed message: `tag`, then the payload length as a big-endian `u32`,
 /// then `payload`. Returns [`io::ErrorKind::InvalidInput`] if `payload` is longer
 /// than [`MAX_FRAME_LEN`].
@@ -62,8 +70,24 @@ pub fn read_frame(r: &mut dyn Read) -> io::Result<(u8, Vec<u8>)> {
             "frame length exceeds MAX_FRAME_LEN",
         ));
     }
-    let mut payload = vec![0u8; len as usize];
-    r.read_exact(&mut payload)?;
+    // Read the payload INCREMENTALLY in chunks of at most READ_CHUNK_LEN rather than
+    // allocating `len` bytes up front. This bounds the largest single allocation/read
+    // by the chunk size, so a hostile peer declaring (a valid-but-large) `len` cannot
+    // force a multi-MiB allocation before a single byte of payload has been verified to
+    // exist. The buffer still grows to the true payload size as bytes actually arrive.
+    let len = len as usize;
+    let mut payload = Vec::new();
+    let mut remaining = len;
+    while remaining > 0 {
+        let want = remaining.min(READ_CHUNK_LEN);
+        let start = payload.len();
+        payload.resize(start + want, 0);
+        // Fill exactly `want` bytes; a short stream (declared `len` but fewer bytes
+        // actually delivered) surfaces here as UnexpectedEof — same clean error the
+        // previous single `read_exact` produced for a truncated payload.
+        r.read_exact(&mut payload[start..start + want])?;
+        remaining -= want;
+    }
     Ok((tag, payload))
 }
 
@@ -150,6 +174,50 @@ mod tests {
         let err = write_frame(&mut buf, 1, &oversized).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
         assert!(buf.is_empty(), "nothing should be written on rejection");
+    }
+
+    #[test]
+    fn read_reads_payload_in_capped_chunks() {
+        // The key DoS guarantee: a frame declaring a large payload must NOT cause a
+        // single up-front allocation/read of the full declared length. We wrap the
+        // payload bytes in a Read that records the largest single buffer it is asked
+        // to fill, and assert that no individual read request exceeds READ_CHUNK_LEN.
+        //
+        // Declared len is comfortably larger than one chunk so a naive
+        // `read_exact(&mut vec![0; len])` would ask for `len` bytes in one call and
+        // trip the assertion.
+        struct MaxBufRecorder<R> {
+            inner: R,
+            max_buf: usize,
+        }
+        impl<R: Read> Read for MaxBufRecorder<R> {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                self.max_buf = self.max_buf.max(buf.len());
+                // Serve at most one chunk per call so read_exact must loop — this also
+                // exercises the short-read handling.
+                let cap = buf.len().min(READ_CHUNK_LEN);
+                self.inner.read(&mut buf[..cap])
+            }
+        }
+
+        let payload_len = READ_CHUNK_LEN * 3 + 123;
+        let payload: Vec<u8> = (0..payload_len).map(|i| i as u8).collect();
+        let mut wire = Vec::new();
+        write_frame(&mut wire, 0x42, &payload).unwrap();
+
+        let mut recorder = MaxBufRecorder {
+            inner: Cursor::new(wire),
+            max_buf: 0,
+        };
+        let (tag, got) = read_frame(&mut recorder).unwrap();
+        assert_eq!(tag, 0x42);
+        assert_eq!(got, payload, "payload must round-trip intact");
+        assert!(
+            recorder.max_buf <= READ_CHUNK_LEN,
+            "read_frame asked for {} bytes in one call; must never exceed the {}-byte chunk cap",
+            recorder.max_buf,
+            READ_CHUNK_LEN
+        );
     }
 
     #[test]

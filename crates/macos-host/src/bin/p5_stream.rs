@@ -25,7 +25,7 @@ fn main() {
 }
 
 #[cfg(all(feature = "live-capture", feature = "live-usb"))]
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
 #[cfg(all(feature = "live-capture", feature = "live-usb"))]
 use std::sync::mpsc;
 #[cfg(all(feature = "live-capture", feature = "live-usb"))]
@@ -42,6 +42,22 @@ use objc2_core_media::CMSampleBuffer;
 #[cfg(all(feature = "live-capture", feature = "live-usb"))]
 use objc2_screen_capture_kit::{SCStream, SCStreamOutput, SCStreamOutputType};
 
+/// Process-global monotonic origin. Initialised on first use so the capture delegate, the
+/// stream loop's host-stage stamps, and clock-sync all share ONE clock origin — otherwise a
+/// `capture_us` stamped against the delegate's clock could not be compared with an
+/// `encode_done_us` stamped against a different `Instant`.
+#[cfg(all(feature = "live-capture", feature = "live-usb"))]
+static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+
+/// Process-monotonic microseconds since [`START`] (initialised on first call).
+#[cfg(all(feature = "live-capture", feature = "live-usb"))]
+fn now_us() -> u64 {
+    START
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_micros() as u64
+}
+
 /// Cached H.264 parameter sets (SPS, PPS) + AVCC NAL-length size, read once from the first
 /// sample's format description and reused to inject params in-band ahead of every keyframe.
 #[cfg(all(feature = "live-capture", feature = "live-usb"))]
@@ -52,9 +68,22 @@ struct FrameSinkIvars {
     session: objc2::rc::Retained<objc2_video_toolbox::VTCompressionSession>,
     /// Producer half of the push→pull bridge. Each encoded access unit is sent here; the main
     /// thread's `run_stream_session` is the consumer.
-    tx: mpsc::Sender<EncodedFrame>,
+    tx: mpsc::SyncSender<EncodedFrame>,
     params: ParamCache,
     pts_idx: AtomicI64,
+    /// VideoToolbox in-flight encode depth = frames submitted minus frames emitted. The capture
+    /// delegate bounds this (latency TODO #2) so `capture→encode` cannot bufferbloat.
+    in_flight: Arc<AtomicUsize>,
+    /// Count of capture frames shed pre-encode because `in_flight` was at the cap (diagnostic).
+    dropped: Arc<AtomicUsize>,
+    /// Set by the encode handler when a fully-ENCODED frame is dropped post-encode (channel
+    /// `Full`). The capture delegate consumes it to force the NEXT submitted frame to an IDR:
+    /// a dropped P-frame leaves VideoToolbox's reference state pointing at an access unit the
+    /// phone never received, so without a resync every later P-frame references the gap and the
+    /// decoder shows artifacts until the next periodic keyframe (up to ~1 s at MaxKeyFrameInterval
+    /// = 60). Unlike the pre-encode in-flight drop above, which keeps the stream valid with no
+    /// resync because VideoToolbox never sees the shed frame.
+    needs_keyframe: Arc<AtomicBool>,
 }
 
 #[cfg(all(feature = "live-capture", feature = "live-usb"))]
@@ -80,6 +109,20 @@ objc2::define_class!(
             let Some(image) = (unsafe { sample_buffer.image_buffer() }) else {
                 return;
             };
+            // --- in-flight encode pacing (latency TODO #2) --------------------------------
+            // Bound VideoToolbox's submitted-but-not-yet-emitted depth so `capture→encode`
+            // cannot grow unbounded (the measured 55→116 ms p50 / 945 ms max bufferbloat).
+            // When the encoder is already saturated, shed the freshest CAPTURE frame BEFORE
+            // submitting it: the next frame we do submit is encoded as an ordinary P-frame
+            // against the last ENCODED frame, so the H.264 stream stays valid with NO keyframe
+            // resync (unlike the phone's post-encode InputPacer, which must drop-to-keyframe).
+            const MAX_IN_FLIGHT_ENCODES: usize = 2;
+            let in_flight = Arc::clone(&self.ivars().in_flight);
+            if in_flight.load(Ordering::Relaxed) >= MAX_IN_FLIGHT_ENCODES {
+                self.ivars().dropped.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+            in_flight.fetch_add(1, Ordering::Relaxed);
             let idx = self.ivars().pts_idx.fetch_add(1, Ordering::Relaxed);
             // Live presentation timestamps: a monotonic 60 Hz frame counter expressed in
             // microseconds. The decoder uses pts only for ordering; a 1-vsync grid is fine.
@@ -89,13 +132,26 @@ objc2::define_class!(
 
             let tx = self.ivars().tx.clone();
             let params = Arc::clone(&self.ivars().params);
+            // Stamp the REAL capture time (process-monotonic µs) the instant ScreenCaptureKit
+            // delivered this frame, BEFORE it is submitted to VideoToolbox. Carrying this into
+            // the EncodedFrame lets the stream loop measure capture→encode (and glass-to-glass)
+            // against actual wall time — including mpsc-channel queueing — instead of deriving
+            // it tautologically from encode_micros.
+            let capture_us = now_us();
             // Stamp submit time into the handler; when VideoToolbox fires it, the elapsed time
             // is this one frame's encode latency.
             let submit_t = std::time::Instant::now();
+            let in_flight_h = Arc::clone(&in_flight);
+            let dropped_h = Arc::clone(&self.ivars().dropped);
+            let needs_keyframe_h = Arc::clone(&self.ivars().needs_keyframe);
             let handler = block2::RcBlock::new(
                 move |status: i32,
                       _flags: objc2_video_toolbox::VTEncodeInfoFlags,
                       sbuf: *mut CMSampleBuffer| {
+                    // VideoToolbox fires this exactly once per accepted frame. Decrement FIRST,
+                    // on every path (including the early returns below), so the in-flight counter
+                    // can never leak and wedge the pacer permanently shut.
+                    in_flight_h.fetch_sub(1, Ordering::Relaxed);
                     if status != 0 {
                         return;
                     }
@@ -129,29 +185,63 @@ objc2::define_class!(
                     );
                     let frame = EncodedFrame {
                         pts_us,
+                        capture_us,
                         keyframe,
                         encode_micros: submit_t.elapsed().as_micros() as u64,
                         annex_b,
                     };
-                    // A send error means the consumer (run_stream_session) has ended — the phone
-                    // disconnected. Stop submitting; the main thread tears down.
-                    let _ = tx.send(frame);
+                    // Bounded hand-off (latency TODO #5): the consumer does a ~22 ms blocking USB
+                    // write per frame (≈45 fps), but capture runs at 60 fps. With an UNBOUNDED
+                    // channel the 15 fps surplus piled up and `capture→encode` (measured to the
+                    // consumer's dequeue) grew without bound. A bounded `sync_channel` + `try_send`
+                    // drops the frame when the consumer is behind (`Full`) instead of queuing it —
+                    // pacing production to the consumer and keeping latency flat. `Disconnected`
+                    // means the consumer (phone) is gone; the main thread handles teardown.
+                    if let Err(mpsc::TrySendError::Full(_)) = tx.try_send(frame) {
+                        dropped_h.fetch_add(1, Ordering::Relaxed);
+                        // This frame was already ENCODED, so VideoToolbox advanced its reference
+                        // state past an access unit the phone never received. Force the next
+                        // submitted frame to an IDR so the decoder resyncs across the gap instead
+                        // of decoding P-frames against a missing reference. (Re-set if that forced
+                        // frame is itself dropped, so recovery retries on the following frame.)
+                        needs_keyframe_h.store(true, Ordering::Relaxed);
+                    }
                 },
             );
             let mut info = objc2_video_toolbox::VTEncodeInfoFlags::empty();
+            // If a fully-encoded frame was dropped post-encode (channel `Full`), force this frame
+            // to an IDR so the phone's decoder resyncs across the reference-chain gap. `swap`
+            // clears the flag atomically; if this forced frame is later dropped too, the handler
+            // re-sets it. Built only on the rare forced frame, never on the steady-state path.
+            let frame_props = self
+                .ivars()
+                .needs_keyframe
+                .swap(false, Ordering::Relaxed)
+                .then(|| {
+                    objc2_core_foundation::CFDictionary::from_slices(
+                        &[objc2_video_toolbox::kVTEncodeFrameOptionKey_ForceKeyFrame],
+                        &[objc2_core_foundation::CFBoolean::new(true)],
+                    )
+                });
             // SAFETY: VideoToolbox `Block_copy`s the handler during this call (see p3_encode);
-            // the heap `RcBlock` stays alive until VT releases it after firing.
+            // the heap `RcBlock` stays alive until VT releases it after firing. `frame_props` (if
+            // present) is read synchronously by VideoToolbox during this call and outlives it;
+            // `cast_unchecked` only erases the dictionary's phantom key/value types (identical
+            // layout), which VideoToolbox reads dynamically by CFString key.
             let status = unsafe {
                 self.ivars().session.encode_frame_with_output_handler(
                     &image,
                     pts,
                     dur,
-                    None,
+                    frame_props.as_deref().map(|d| d.cast_unchecked()),
                     &mut info,
                     &*handler as *const _ as *mut _,
                 )
             };
             if status != 0 {
+                // Sync submit failure → the output handler will NOT fire, so compensate the
+                // pre-submit increment to keep the in-flight count accurate.
+                in_flight.fetch_sub(1, Ordering::Relaxed);
                 eprintln!("p5_stream: EncodeFrame returned status {status}");
             }
         }
@@ -162,7 +252,7 @@ objc2::define_class!(
 impl FrameSink {
     fn new(
         session: objc2::rc::Retained<objc2_video_toolbox::VTCompressionSession>,
-        tx: mpsc::Sender<EncodedFrame>,
+        tx: mpsc::SyncSender<EncodedFrame>,
         params: ParamCache,
     ) -> objc2::rc::Retained<Self> {
         use objc2::AllocAnyThread;
@@ -171,6 +261,9 @@ impl FrameSink {
             tx,
             params,
             pts_idx: AtomicI64::new(0),
+            in_flight: Arc::new(AtomicUsize::new(0)),
+            dropped: Arc::new(AtomicUsize::new(0)),
+            needs_keyframe: Arc::new(AtomicBool::new(false)),
         });
         unsafe { objc2::msg_send![super(this), init] }
     }
@@ -308,9 +401,29 @@ fn main() {
         config.setHeight(H);
         config.setShowsCursor(true); // the Mac cursor composites into the stream (item 3)
         config.setPixelFormat(u32::from_be_bytes(*b"420v"));
+        // Cap delivery at 60 fps (item 6 step 2). Without a minimum frame interval, ScreenCaptureKit
+        // can deliver change-driven bursts above 60 fps, oversupplying the phone's 60 Hz present
+        // path so frames pile up in the decoder (the measured arrive→decode growth). One frame per
+        // 1/60 s bounds the source rate to what the phone can present.
+        config.setMinimumFrameInterval(objc2_core_media::CMTime::new(1, 60));
     }
 
-    // --- 4. VideoToolbox H.264 session (RealTime, no B-frames) -----------------
+    // --- 4. VideoToolbox H.264 session (RealTime low-latency, no B-frames) ------
+    // Low-latency encoder spec (latency TODO #1): EnableLowLatencyRateControl selects
+    // VideoToolbox's dedicated low-delay hardware pipeline (one-in/one-out, no frame
+    // reordering), so a submitted frame is emitted within ~one frame instead of being held.
+    // This fixes the residual capture→encode HOLD TIME the in-flight cap alone could not remove
+    // (measured on-device: cap bounded the max 945→382 ms but VT still held ~2 frames 40–62 ms
+    // each under load). Must be passed at session creation — it picks the encoder.
+    let encoder_spec = unsafe {
+        objc2_core_foundation::CFDictionary::<CFType, CFType>::from_slices(
+            &[
+                objc2_video_toolbox::kVTVideoEncoderSpecification_EnableLowLatencyRateControl
+                    .as_ref(),
+            ],
+            &[objc2_core_foundation::CFBoolean::new(true).as_ref()],
+        )
+    };
     let mut session_ptr: *mut VTCompressionSession = std::ptr::null_mut();
     let status = unsafe {
         VTCompressionSession::create(
@@ -318,7 +431,7 @@ fn main() {
             W as i32,
             H as i32,
             objc2_core_media::kCMVideoCodecType_H264,
-            None,
+            Some(encoder_spec.as_opaque()),
             None,
             None,
             None,
@@ -346,6 +459,45 @@ fn main() {
         );
     }
 
+    // --- 4b. Rate control: cap bitrate + force periodic keyframes (item 6 step 2) ----------
+    // Measure-before-tune found glass-to-glass ~500 ms dominated by *queue buildup*, not slow
+    // stages: the encoder ran uncapped (default bitrate 0 = "encoder decides"), emitting large,
+    // bursty access units that overflow the ~103 Mbit/s AOA link, so frames pile up in the host
+    // encode channel and the phone's decoder input. Capping the average bitrate keeps frames
+    // small enough that USB sustains 60 fps (the root throughput fix), and a 1-second keyframe
+    // interval gives drop-to-keyframe (in run_stream_session_instrumented) frequent resync points
+    // so any residual backlog is shed as a fresh IDR instead of growing unbounded latency.
+    let fps_num = objc2_core_foundation::CFNumber::new_i32(60);
+    let bitrate_num = objc2_core_foundation::CFNumber::new_i32(20_000_000); // ~20 Mbit/s
+    let keyint_num = objc2_core_foundation::CFNumber::new_i32(60); // 60 frames @ 60 Hz = 1 s
+    unsafe {
+        let fps: &CFType = (*fps_num).as_ref();
+        let br: &CFType = (*bitrate_num).as_ref();
+        let ki: &CFType = (*keyint_num).as_ref();
+        let s_fps = objc2_video_toolbox::VTSessionSetProperty(
+            &session,
+            objc2_video_toolbox::kVTCompressionPropertyKey_ExpectedFrameRate,
+            Some(fps),
+        );
+        let s_br = objc2_video_toolbox::VTSessionSetProperty(
+            &session,
+            objc2_video_toolbox::kVTCompressionPropertyKey_AverageBitRate,
+            Some(br),
+        );
+        let s_ki = objc2_video_toolbox::VTSessionSetProperty(
+            &session,
+            objc2_video_toolbox::kVTCompressionPropertyKey_MaxKeyFrameInterval,
+            Some(ki),
+        );
+        if s_fps != 0 || s_br != 0 || s_ki != 0 {
+            eprintln!(
+                "p5_stream: warn — rate-control property status: \
+                 ExpectedFrameRate={s_fps} AverageBitRate={s_br} MaxKeyFrameInterval={s_ki}"
+            );
+        }
+    }
+    println!("p5_stream: rate control set — 20 Mbit/s avg, keyframe every 1 s (60 fps).");
+
     // --- 5. Bring up the live AOA transport (P1 sequence) ---------------------
     // Done BEFORE starting capture so we don't buffer frames with no consumer. The connect
     // hello (read below) also guarantees the phone's reader is live before we write.
@@ -358,7 +510,10 @@ fn main() {
     };
 
     // --- 6. Wire the push→pull bridge and start capture -----------------------
-    let (tx, rx) = mpsc::channel::<EncodedFrame>();
+    // Bounded hand-off so the producer (60 fps capture+encode) cannot outrun the consumer
+    // (~45 fps, gated by the per-frame USB write). Depth 2 = one being-sent + one ready;
+    // `try_send` in the encode handler drops the surplus instead of growing latency. (TODO #5)
+    let (tx, rx) = mpsc::sync_channel::<EncodedFrame>(2);
     let params: ParamCache = Arc::new(Mutex::new(None));
     let sink = FrameSink::new(session.clone(), tx, Arc::clone(&params));
     let sink_proto: &ProtocolObject<dyn SCStreamOutput> = ProtocolObject::from_ref(&*sink);
@@ -402,11 +557,148 @@ fn main() {
         }
     }
 
-    // --- 7. Stream until the phone disconnects --------------------------------
-    // run_stream_session does the handshake then drains the channel, sending VideoConfig
-    // before every keyframe + Video per access unit, until the transport errors (disconnect).
-    let offer = macos_host::session::host_handshake(W as u32, H as u32, 60);
-    let result = macos_host::session::run_stream_session(rx, &mut transport, offer);
+    // --- 7. Handshake + clock-sync on the full-duplex transport ---------------
+    // Latency instrumentation (Task 6): do the handshake explicitly (rather than letting
+    // run_stream_session do it internally) so we can run an SNTP-style clock-sync BEFORE
+    // streaming, then split the transport into independent read/write halves — a dedicated reader
+    // thread pulls inbound `Frame::Stats` while the main thread streams video on the write half.
+    use macos_host::session;
+    use protocol::clock::{self, ClockOffset};
+    use protocol::messages::Frame;
+    use std::sync::atomic::AtomicBool;
+
+    let offer = session::host_handshake(W as u32, H as u32, 60);
+    // Fix #5: capture the negotiated AgreedConfig and thread it into the stream loop, rather than
+    // discarding it and re-deriving the codec from the offer.
+    let agreed = match session::perform_handshake(&mut transport, offer) {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("p5_stream: handshake failed: {e}");
+            drop(vdisplay);
+            std::process::exit(8);
+        }
+    };
+    println!(
+        "p5_stream: handshake OK ({:?} {}×{}@{}) — running clock-sync…",
+        agreed.codec, agreed.width, agreed.height, agreed.refresh_hz
+    );
+
+    // --- 7b. Split the transport; spawn the single inbound-frame reader -------
+    // Fix #1/#3: split BEFORE clock-sync so ONE reader thread owns the read half and dispatches
+    // every inbound frame — `ClockPong` (stamping t3 on receipt and forwarding it for the bounded
+    // clock-sync wait) and `Frame::Stats` (forwarded to the stream loop). This makes the blocking
+    // bulk-IN read live entirely on the reader thread, so:
+    //   (#1) clock-sync no longer does its own blocking read — it waits on a channel with a
+    //        timeout, so a phone that never answers degrades to offset=None within 2 s instead of
+    //        hanging the host forever (the degrade path is finally reachable), and
+    //   (#3) teardown does not depend on unblocking a pending IN read from the main thread: the
+    //        reader polls a stop flag between whole frames (via nusb's read timeout, which does
+    //        NOT corrupt framing because it only fires while no bytes of a frame are buffered),
+    //        and as a hard backstop we join with a timeout + cancel any pending transfer.
+    let (read_half, mut write_half) = transport.split();
+    let stop = Arc::new(AtomicBool::new(false));
+    let (pong_tx, pong_rx) = mpsc::channel::<(Frame, u64)>();
+    let (stats_tx, stats_rx) = mpsc::channel::<Frame>();
+    let reader_stop = Arc::clone(&stop);
+    let reader = std::thread::spawn(move || {
+        let mut read_half = read_half;
+        // A bounded per-read timeout lets the reader notice the stop flag promptly while idle
+        // between frames (the dominant teardown case) instead of blocking forever on a bulk IN
+        // the phone will never satisfy once capture stops. nusb keeps the pending transfer alive
+        // across a timeout, so re-issuing the read loses no data.
+        read_half.set_read_timeout(Duration::from_millis(250));
+        loop {
+            if reader_stop.load(Ordering::Relaxed) {
+                break;
+            }
+            match Frame::read_from(&mut read_half) {
+                Ok(frame @ Frame::ClockPong { .. }) => {
+                    // Stamp t3 on receipt (shared monotonic origin) and forward for the
+                    // bounded clock-sync wait. If the main thread already moved on, ignore.
+                    let _ = pong_tx.send((frame, now_us()));
+                }
+                Ok(frame @ Frame::Stats { .. }) => {
+                    if stats_tx.send(frame).is_err() {
+                        break; // main thread ended
+                    }
+                }
+                Ok(_) => {} // ignore other inbound frames
+                Err(e) => {
+                    // A timeout just means "no frame this window" — loop and re-check the stop
+                    // flag. Any other error means the peer is gone / framing broke → exit.
+                    if matches!(&e, protocol::messages::MessageError::Io(io)
+                        if io.kind() == std::io::ErrorKind::TimedOut)
+                    {
+                        continue;
+                    }
+                    break;
+                }
+            }
+        }
+    });
+
+    // --- 7c. Clock-sync over the split halves (bounded, degrades gracefully) ---
+    // Send the ping on the write half; the reader forwards the pong (with its t3). Wait at most
+    // 2 s: if no pong arrives, degrade to offset=None (host-only stage timings, no glass-to-glass)
+    // instead of hanging.
+    let offset: Option<ClockOffset> = {
+        use std::io::Write as _;
+        let t0 = now_us();
+        let ping = Frame::ClockPing { t0_us: t0 };
+        let ping_sent = ping
+            .write_to(&mut write_half)
+            .and_then(|()| write_half.flush().map_err(Into::into));
+        match ping_sent {
+            Ok(()) => match pong_rx.recv_timeout(Duration::from_secs(2)) {
+                Ok((Frame::ClockPong { t1_us, t2_us, .. }, t3)) => {
+                    let off = clock::estimate(t0, t1_us, t2_us, t3);
+                    println!(
+                        "p5_stream: clock-sync OK — offset={} µs, rtt={} µs (±rtt/2 precision).",
+                        off.offset_us, off.rtt_us
+                    );
+                    Some(off)
+                }
+                Ok(_) => None, // reader only forwards pongs here, but be defensive
+                Err(_) => {
+                    eprintln!(
+                        "p5_stream: clock-sync timed out (no pong in 2 s); continuing with \
+                         host-only stage timings (glass-to-glass unavailable)."
+                    );
+                    None
+                }
+            },
+            Err(e) => {
+                eprintln!(
+                    "p5_stream: clock-sync ping failed ({e}); continuing with host-only stage \
+                     timings (glass-to-glass unavailable)."
+                );
+                None
+            }
+        }
+    };
+
+    // --- 7d. Instrumented stream until the phone disconnects -------------------
+    println!("p5_stream: streaming with live latency instrumentation…");
+    let mut pipeline = macos_host::latency::PipelineLatency::new(256);
+    let result = session::run_stream_session_instrumented(
+        rx,
+        &mut write_half,
+        agreed,
+        offset,
+        &stats_rx,
+        &mut pipeline,
+        Duration::from_secs(1), // heartbeat / idle-disconnect probe
+        Duration::from_secs(2), // print a latency report every ~2 s
+        now_us,
+        |report| print_report(report, offset),
+    );
+
+    println!(
+        "p5_stream: encoder pacing — shed {} frames total (in-flight cap + channel backpressure); \
+         final in-flight depth {}.",
+        sink.ivars().dropped.load(Ordering::Relaxed),
+        sink.ivars().in_flight.load(Ordering::Relaxed),
+    );
 
     // --- 8. Teardown ----------------------------------------------------------
     let (stop_tx, stop_rx) = mpsc::channel::<()>();
@@ -416,6 +708,28 @@ fn main() {
     unsafe { stream.stopCaptureWithCompletionHandler(Some(&stop_handler)) };
     let _ = stop_rx.recv_timeout(Duration::from_secs(5));
     drop(vdisplay); // remove the virtual display so the Mac desktop reflows
+    drop(write_half); // closing the write half also signals the peer we are done
+                      // Signal the reader to stop; it observes this between frames via its read timeout. We do NOT
+                      // block indefinitely on join: in the pathological case where the reader is parked mid-frame
+                      // inside a transfer, joining could hang teardown — so we give it a bounded grace period and
+                      // otherwise let the detached thread die with the process. (nusb cannot cancel another
+                      // thread's in-flight read from here, so a timeout-bounded join is the robust teardown.)
+    stop.store(true, Ordering::Relaxed);
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while !reader.is_finished() && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    if reader.is_finished() {
+        let _ = reader.join();
+    } else {
+        eprintln!(
+            "p5_stream: reader thread still parked on a bulk-IN read at teardown; detaching it \
+             (it will die with the process) so exit does not hang."
+        );
+    }
+
+    // Final latency report on exit.
+    print_report(&pipeline.report(), offset);
 
     match result {
         Ok(summary) => println!(
@@ -426,6 +740,73 @@ fn main() {
         ),
         Err(e) => eprintln!("p5_stream: session ended with error (likely disconnect): {e}"),
     }
+}
+
+/// Print a glass-to-glass latency report: each stage's avg/p50/p95/max in milliseconds, the
+/// fused glass-to-glass line, the rtt/offset precision caveat, and the anomaly count.
+///
+/// When `offset` is `None` (clock-sync failed) only the host-side stages are meaningful — and
+/// even those are populated only once a phone `Frame::Stats` fuses, which never happens without
+/// an offset — so the host stages print "—" and we note glass-to-glass is unavailable.
+#[cfg(all(feature = "live-capture", feature = "live-usb"))]
+fn print_report(
+    r: &macos_host::latency::LatencyReport,
+    offset: Option<protocol::clock::ClockOffset>,
+) {
+    use macos_host::encode::LatencyStats;
+
+    // Format one stage as "avg/p50/p95/max ms" (µs → ms), or "—" when it has no samples.
+    fn line(name: &str, s: &LatencyStats) {
+        if s.count() == 0 {
+            println!("  {name:<16} —");
+            return;
+        }
+        let ms = |us: f64| us / 1000.0;
+        let avg = s.mean().unwrap_or(0.0);
+        let p50 = s.p50().unwrap_or(0) as f64;
+        let p95 = s.p95().unwrap_or(0) as f64;
+        let max = s.max().unwrap_or(0) as f64;
+        println!(
+            "  {name:<16} avg {:>6.2}  p50 {:>6.2}  p95 {:>6.2}  max {:>6.2}  ms  (n={})",
+            ms(avg),
+            ms(p50),
+            ms(p95),
+            ms(max),
+            s.count(),
+        );
+    }
+
+    println!("p5_stream: ─── latency report ───");
+    match offset {
+        Some(off) => {
+            line("capture→encode", &r.capture_to_encode);
+            line("encode→send", &r.encode_to_send);
+            line("send→arrive", &r.send_to_arrive);
+            line("arrive→decode", &r.arrive_to_decode);
+            line("decode→present", &r.decode_to_present);
+            line("GLASS→GLASS", &r.glass_to_glass);
+            println!(
+                "  offset={} µs  rtt={} µs  (±rtt/2 = ±{} µs precision on every fused number)",
+                off.offset_us,
+                off.rtt_us,
+                off.rtt_us / 2,
+            );
+        }
+        None => {
+            line("capture→encode", &r.capture_to_encode);
+            line("encode→send", &r.encode_to_send);
+            println!("  glass-to-glass unavailable (clock-sync failed — no host↔phone offset).");
+        }
+    }
+    println!("  anomalies (clock jitter, clamped to 0): {}", r.anomalies);
+    println!(
+        "  unmatched phone stats (no host record / evicted): {}",
+        r.unmatched_stats
+    );
+    println!(
+        "  dropped frames (drop-to-keyframe shed load): {}",
+        r.dropped_frames
+    );
 }
 
 /// Bring up the live AOA transport and read the device's connect-hello.

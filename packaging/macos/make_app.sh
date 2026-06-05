@@ -65,14 +65,17 @@ VERSION="$(
 )"
 VERSION="${VERSION:-0.0.0}"
 
-echo "==> Building $BIN_NAME (release${FEATURES:+, features: $FEATURES})"
+# Build with the `dist` profile (size-optimized, stripped) — that is the shipped
+# artifact. The default `release` profile is tuned for speed (dev/benchmark); see the
+# `[profile.dist]` rationale in the workspace Cargo.toml.
+echo "==> Building $BIN_NAME (dist${FEATURES:+, features: $FEATURES})"
 if [[ -n "$FEATURES" ]]; then
-    cargo build --release -p "$BIN_NAME" --features "$FEATURES"
+    cargo build --profile dist -p "$BIN_NAME" --features "$FEATURES"
 else
-    cargo build --release -p "$BIN_NAME"
+    cargo build --profile dist -p "$BIN_NAME"
 fi
 
-BIN_PATH="$REPO_ROOT/target/release/$BIN_NAME"
+BIN_PATH="$REPO_ROOT/target/dist/$BIN_NAME"
 if [[ ! -x "$BIN_PATH" ]]; then
     echo "make_app.sh: expected binary not found at $BIN_PATH" >&2
     exit 1

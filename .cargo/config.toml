@@ -1,3 +1,10 @@
+# macOS host: target the Apple M1 microarchitecture. The host only ever runs on the
+# user's M1 MacBook, so we can let the compiler use the full M1 ISA (e.g. wider SIMD,
+# cheaper atomics) rather than the conservative baseline aarch64 — a free win on the
+# latency-critical capture/encode path. (Only affects native macOS arm64 builds.)
+[target.aarch64-apple-darwin]
+rustflags = ["-C", "target-cpu=apple-m1"]
+
 # Align Android native libraries to 16 KB ELF LOAD segments.
 #
 # Android 15+ (and Google Play from Nov 2025) runs on 16 KB memory pages; native .so
@@ -5,8 +12,16 @@
 # them ("ELF alignment check failed"). NDK r28+ defaults to this; we're on r25c, which
 # defaults to 4 KB — so we pass the linker flag explicitly. (No effect on the macOS host
 # or other targets.)
+#
+# Also tune codegen for the Pixel 6a's Tensor SoC: cortex-a76 is the big-core
+# microarchitecture, and +neon/+fp16/+dotprod enable SIMD features used on the decode
+# path. The .so only ever runs on this class of device.
 [target.aarch64-linux-android]
-rustflags = ["-C", "link-arg=-Wl,-z,max-page-size=16384"]
+rustflags = [
+    "-C", "link-arg=-Wl,-z,max-page-size=16384",
+    "-C", "target-cpu=cortex-a76",
+    "-C", "target-feature=+neon,+fp16,+dotprod",
+]
 
 [target.armv7-linux-androideabi]
 rustflags = ["-C", "link-arg=-Wl,-z,max-page-size=16384"]

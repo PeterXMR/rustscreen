@@ -436,6 +436,53 @@ mod tests {
     }
 
     #[test]
+    fn map_hostile_input_stays_in_bounds_or_rejected() {
+        // CHARACTERIZATION / regression guard (R5): this PINS the security-relevant
+        // sanitation contract that is the only guard before a real CGEvent is posted —
+        // hostile normalized coordinates must NEVER produce an out-of-bounds (or NaN)
+        // global point. This locks EXISTING behavior, so it passes immediately (not a
+        // red-green cycle): NaN/±inf are rejected with MapError::NotFinite, and finite
+        // out-of-range values are clamped into the display rect. Touches every channel
+        // the task calls out: nx = NaN, nx = 2.0 (over), ny = -1.0 (under).
+        let rect = DisplayRect {
+            x: 100.0,
+            y: 50.0,
+            w: 2400.0,
+            h: 1080.0,
+        };
+        let x_lo = rect.x;
+        let x_hi = rect.x + rect.w;
+        let y_lo = rect.y;
+        let y_hi = rect.y + rect.h;
+
+        // 1) nx = NaN => rejected before any arithmetic (no event will be posted).
+        assert_eq!(
+            map_normalized_to_global(f32::NAN, 0.5, rect),
+            Err(MapError::NotFinite),
+            "NaN nx must be rejected, never mapped"
+        );
+
+        // 2) nx = 2.0 (over range), ny = -1.0 (under range): both finite => CLAMPED.
+        let p = map_normalized_to_global(2.0, -1.0, rect).expect("finite input must map");
+        assert!(
+            p.x.is_finite() && p.y.is_finite(),
+            "mapped point must be finite, got {p:?}"
+        );
+        assert!(
+            p.x >= x_lo && p.x <= x_hi,
+            "x must be clamped into [{x_lo}, {x_hi}], got {}",
+            p.x
+        );
+        assert!(
+            p.y >= y_lo && p.y <= y_hi,
+            "y must be clamped into [{y_lo}, {y_hi}], got {}",
+            p.y
+        );
+        // Exact clamp targets: nx 2.0 -> right edge, ny -1.0 -> top edge.
+        assert_eq!(p, CgPoint { x: x_hi, y: y_lo });
+    }
+
+    #[test]
     fn host_map_round_trips_topleft_pixels_no_flip() {
         // Guards the HOST mapping against a Y-flip / offset regression: a pixel normalized the
         // way the Android client does it must map back to the same pixel — same top-left/y-down
