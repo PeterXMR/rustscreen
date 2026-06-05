@@ -167,6 +167,60 @@ pub fn perform_handshake(
 }
 
 // ---------------------------------------------------------------------------
+// Clock sync
+// ---------------------------------------------------------------------------
+
+/// Why a clock-sync exchange failed.
+#[derive(Debug)]
+pub enum ClockSyncError {
+    /// The reply frame was not a `ClockPong`.
+    UnexpectedReply,
+    /// A framing/codec error reading or writing the exchange.
+    Message(protocol::messages::MessageError),
+}
+
+impl std::fmt::Display for ClockSyncError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ClockSyncError::UnexpectedReply => write!(f, "clock-sync reply was not a ClockPong"),
+            ClockSyncError::Message(e) => write!(f, "clock-sync I/O: {e}"),
+        }
+    }
+}
+impl std::error::Error for ClockSyncError {}
+impl From<protocol::messages::MessageError> for ClockSyncError {
+    fn from(e: protocol::messages::MessageError) -> Self {
+        ClockSyncError::Message(e)
+    }
+}
+
+/// Run one SNTP-style clock-sync exchange over `transport`, returning the estimated
+/// [`protocol::clock::ClockOffset`]. `now_us` supplies host-clock microseconds (injected
+/// for testability): called once for `t0` (before the ping) and once for `t3` (after the
+/// pong).
+pub fn perform_clock_sync(
+    transport: &mut (impl Read + Write),
+    mut now_us: impl FnMut() -> u64,
+) -> Result<protocol::clock::ClockOffset, ClockSyncError> {
+    let t0 = now_us();
+    Frame::ClockPing { t0_us: t0 }.write_to(transport)?;
+    transport
+        .flush()
+        .map_err(|e| ClockSyncError::Message(e.into()))?;
+    let reply = Frame::read_from(transport)?;
+    let t3 = now_us();
+    let Frame::ClockPong {
+        t0_us,
+        t1_us,
+        t2_us,
+    } = reply
+    else {
+        return Err(ClockSyncError::UnexpectedReply);
+    };
+    Ok(protocol::clock::estimate(t0_us, t1_us, t2_us, t3))
+}
+
+// ---------------------------------------------------------------------------
 // Counting Write adapter (for bytes_sent tracking)
 // ---------------------------------------------------------------------------
 
@@ -1161,6 +1215,88 @@ mod tests {
         // Sanity: at least one VideoConfig and two Video frames were sent.
         let stream_frame_count = all_frames_before_sink.len() - 1; // subtract the handshake
         assert!(stream_frame_count >= 3, "VideoConfig + 2 Video frames");
+    }
+
+    // -----------------------------------------------------------------------
+    // Clock sync tests
+    // -----------------------------------------------------------------------
+
+    use protocol::clock::ClockOffset;
+
+    #[test]
+    fn clock_sync_round_trips_and_estimates_offset() {
+        // The "phone" pre-writes the ClockPong it will reply with; the host reads it.
+        let mut pong = Vec::new();
+        Frame::ClockPong {
+            t0_us: 0,
+            t1_us: 150,
+            t2_us: 150,
+        }
+        .write_to(&mut pong)
+        .unwrap();
+
+        let mut transport = DuplexFake::new(pong);
+
+        // Host clock returns t0=0 on the ping, t3=200 on receipt.
+        let mut times = [0u64, 200].into_iter();
+        let offset = perform_clock_sync(&mut transport, || times.next().unwrap()).unwrap();
+
+        assert_eq!(
+            offset,
+            ClockOffset {
+                offset_us: 50,
+                rtt_us: 200
+            }
+        );
+        // The host must have written exactly one ClockPing carrying t0=0.
+        let mut cur = std::io::Cursor::new(transport.written());
+        assert_eq!(
+            Frame::read_from(&mut cur).unwrap(),
+            Frame::ClockPing { t0_us: 0 }
+        );
+    }
+
+    #[test]
+    fn clock_sync_rejects_unexpected_reply() {
+        let mut not_a_pong = Vec::new();
+        Frame::Control(Control::Heartbeat)
+            .write_to(&mut not_a_pong)
+            .unwrap();
+        let mut transport = DuplexFake::new(not_a_pong);
+        let mut times = [0u64, 1].into_iter();
+        let err = perform_clock_sync(&mut transport, || times.next().unwrap());
+        assert!(matches!(err, Err(ClockSyncError::UnexpectedReply)));
+    }
+
+    /// A `Read + Write` that serves canned bytes on read and captures writes.
+    struct DuplexFake {
+        to_read: std::io::Cursor<Vec<u8>>,
+        written: Vec<u8>,
+    }
+    impl DuplexFake {
+        fn new(to_read: Vec<u8>) -> Self {
+            Self {
+                to_read: std::io::Cursor::new(to_read),
+                written: Vec::new(),
+            }
+        }
+        fn written(&self) -> &[u8] {
+            &self.written
+        }
+    }
+    impl std::io::Read for DuplexFake {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.to_read.read(buf)
+        }
+    }
+    impl std::io::Write for DuplexFake {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.written.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
     }
 
     // -----------------------------------------------------------------------
