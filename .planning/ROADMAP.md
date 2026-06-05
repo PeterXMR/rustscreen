@@ -213,7 +213,7 @@ Plans:
 | P1. USB Byte Round-Trip 🔬 | 1/1 (PR #6, #7 merged + connect-hello PR) | ✅ **Complete** — live byte-exact round-trip on M1↔Pixel 6a over AOA, **no sudo** (A2 retired): 4× 1 MiB @ **103.0 Mbit/s**. **D1 = AOA**; XPORT-01 met (throughput is a synchronous-echo floor, see Phase P1 note) | 2026-06-04 (HW) |
 | P3. Capture + Encode 🔬 | 1/1 (PR #4, #11 merged; encoder PR open) | ✅ **Complete** — full capture→VideoToolbox H.264→playable `out.h264` PROVEN on M1 (ffplay: `h264 High yuv420p 2400×1080`; SPS 12 B/PPS 4 B; encode avg 10.29 ms). All 3 criteria met; ENC-01 met; FB17797423 retired | 2026-06-04 |
 | P4. Decode + Present 🔬 | Wave A done (branch `feat/p4-decode-support`) | 🟡 Cable-free Wave A done — `VideoDecoder` port + `DecodeSession` + `nal::to_annex_b_access_unit` (TDD, toward DEC-01 #2); Wave B (AMediaCodec decode-to-surface, JNI, Kotlin) deferred — needs Pixel 6a | 2026-06-04 (Wave A) |
-| P5. Live Pipeline + Latency | 0/1 cable-free slice (PR #5 merged) | 🟡 Cable-free protocol slice done (`Frame` codec + `negotiate()`, merged — satisfies criterion #3 logic); live wiring + latency blocked on P1/P4 | 2026-06-03 (slice) |
+| P5. Live Pipeline + Latency | 1 merged (PR #5) + item 6 in progress | 🟡 Criterion #3 logic merged. Live video shipped (item 1, PR #21/#22). **Latency instrumentation (PR #24, item 6):** cable-free core DONE on `feat/p5-latency-instrumentation` (SNTP clock-sync + `Clock`/`Stats` frames + `PipelineLatency` fusing, 228 tests green); live wiring (host+Android) + on-device glass-to-glass measurement (criterion #2) now in progress on connected hardware | 2026-06-05 (core) |
 | P6. Touch Injection | 0/1 (PR #8 merged + Android slice) | 🟡 Both ends' cable-free logic done — Mac side (`macos_host::touch`: mapping + FSM + `CgEventSink`/`AXIsProcessTrusted` behind `live-inject` + `p6_inject` bin, PR #8 merged) and Android side (`android_client::touch`: `MotionEvent`→normalized `TouchEvent`); Kotlin capture shim + live wiring deferred | 2026-06-04 (logic) |
 | P7. Robustness + Purity | 0/TBD | Not started | - |
 | P8. Packaging + Distribution | 0/TBD | Not started | - |
@@ -221,6 +221,8 @@ Plans:
 **Legend:** ✅ phase complete · 🟡 substantial slice landed (cable-free / de-risked), remainder hardware-blocked · ⚠ deferred (needs phone) · blank = not started.
 
 **Cable-free progress:** **every Mac-only / pure-logic slice through P6 is now implemented and merged** (P0–P6 logic on `main`). The autonomous cable-free well is essentially dry — what remains needs a hands-on-Mac session or the phone, per the blockers below.
+
+**🔌 Hardware now permanently connected (2026-06-05):** the M1 MacBook and Pixel 6a are connected for the whole dev cycle. **The "cable-free slice first, hardware-deferred" pattern is no longer a constraint** — device / hands-on-Mac work can be implemented and verified inline, and new PRs need **not** be split into cable-free vs. deferred halves. The previously "deferred (needs phone)" / "hands-on-Mac" items (P4 Wave B, P5 live wiring + latency, P6 live touch, item-2/item-3 eyeball checks) are now **directly executable**. **One standing caveat:** running the macOS capture (`p5_stream`) requires the **Screen & System Audio Recording** grant on the *launching* app — launch it from a terminal that holds the grant (a process launched from Claude.app cannot capture without that grant; this is the U3 usability item).
 
 ## Blockers & What's Needed Next
 
