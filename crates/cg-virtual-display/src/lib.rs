@@ -16,6 +16,9 @@
 
 #![cfg(target_os = "macos")]
 
+mod config;
+pub use config::*;
+
 use std::fmt;
 use std::ptr::NonNull;
 
@@ -71,20 +74,27 @@ pub struct VirtualDisplay {
 }
 
 impl VirtualDisplay {
-    /// Create a virtual display of `width`x`height` pixels at `refresh` Hz.
+    /// Create a virtual display of `width`x`height` pixels at `refresh` Hz, with the legacy
+    /// defaults (stable identity, HiDPI off, no programmatic arrangement). Thin wrapper over
+    /// [`with_config`](Self::with_config) so existing callers are unaffected.
     pub fn new(width: u32, height: u32, refresh: f64) -> Result<Self, VirtualDisplayError> {
+        Self::with_config(&DisplayConfig::new(width, height, refresh))
+    }
+
+    /// Create a virtual display from a full [`DisplayConfig`] (item 2: name, identity, HiDPI
+    /// scaled modes, and optional default-side arrangement).
+    pub fn with_config(cfg: &DisplayConfig) -> Result<Self, VirtualDisplayError> {
+        if cfg.width == 0 || cfg.height == 0 {
+            return Err(VirtualDisplayError::CreationFailed);
+        }
         // SAFETY: every msg-send below targets a private CoreGraphics class resolved by name;
         // the selectors and argument types match the reverse-engineered interfaces (the same
         // shapes the former ObjC++ shim re-declared). A missing class or a rejected
         // `applySettings:` is handled as `CreationFailed`, and we never touch a null object.
-        unsafe { Self::new_inner(width, height, refresh) }
+        unsafe { Self::new_inner(cfg) }
     }
 
-    unsafe fn new_inner(
-        width: u32,
-        height: u32,
-        refresh: f64,
-    ) -> Result<Self, VirtualDisplayError> {
+    unsafe fn new_inner(cfg: &DisplayConfig) -> Result<Self, VirtualDisplayError> {
         let desc_cls = private_class("CGVirtualDisplayDescriptor");
         let mode_cls = private_class("CGVirtualDisplayMode");
         let set_cls = private_class("CGVirtualDisplaySettings");
@@ -103,17 +113,17 @@ impl VirtualDisplay {
             Retained::from_raw(obj).ok_or(VirtualDisplayError::CreationFailed)?
         };
 
-        let name = NSString::from_str("RustScreen");
+        let name = NSString::from_str(&cfg.name);
         let _: () = msg_send![&*desc, setName: &*name];
-        let _: () = msg_send![&*desc, setMaxPixelsWide: width];
-        let _: () = msg_send![&*desc, setMaxPixelsHigh: height];
+        let _: () = msg_send![&*desc, setMaxPixelsWide: cfg.width];
+        let _: () = msg_send![&*desc, setMaxPixelsHigh: cfg.height];
         // Physical size at ~110 ppi (1 px ≈ 0.231 mm). Only affects reported DPI, not creation.
-        let size = CGSize::new(width as f64 * 0.231, height as f64 * 0.231);
+        let size = CGSize::new(cfg.width as f64 * 0.231, cfg.height as f64 * 0.231);
         let _: () = msg_send![&*desc, setSizeInMillimeters: size];
-        let _: () = msg_send![&*desc, setProductID: 0x0001u32];
-        // 'rm' — arbitrary, identifies RustScreen displays.
-        let _: () = msg_send![&*desc, setVendorID: 0x726Du32];
-        let _: () = msg_send![&*desc, setSerialNum: 0x0001u32];
+        // Stable identity (vendor/product/serial) → macOS remembers the arrangement position.
+        let _: () = msg_send![&*desc, setProductID: cfg.product_id];
+        let _: () = msg_send![&*desc, setVendorID: cfg.vendor_id];
+        let _: () = msg_send![&*desc, setSerialNum: cfg.serial];
 
         // The descriptor needs a serial dispatch queue (the private API fires its termination
         // handler on it). `dispatch2::DispatchQueue` is an objc-compatible dispatch object, so
@@ -135,25 +145,30 @@ impl VirtualDisplay {
         };
 
         // --- Mode + Settings ------------------------------------------------------------
-        let mode: Retained<AnyObject> = {
+        // Register the native pixel mode plus, when HiDPI is on, a scaled mode (D6) so macOS
+        // exposes a "Larger Text … More Space" scaling slider. `hidpi_modes` builds the
+        // ordered, de-duplicated spec list (pure-logic, unit-tested).
+        let specs = hidpi_modes(cfg.width, cfg.height, cfg.refresh, cfg.hidpi);
+        let mut mode_objs: Vec<Retained<AnyObject>> = Vec::with_capacity(specs.len());
+        for spec in &specs {
             let allocated: *mut AnyObject = msg_send![mode_cls, alloc];
             let obj: *mut AnyObject = msg_send![
                 allocated,
-                initWithWidth: width,
-                height: height,
-                refreshRate: refresh,
+                initWithWidth: spec.width,
+                height: spec.height,
+                refreshRate: spec.refresh,
             ];
-            Retained::from_raw(obj).ok_or(VirtualDisplayError::CreationFailed)?
-        };
+            mode_objs.push(Retained::from_raw(obj).ok_or(VirtualDisplayError::CreationFailed)?);
+        }
 
         let settings: Retained<AnyObject> = {
             let allocated: *mut AnyObject = msg_send![set_cls, alloc];
             let obj: *mut AnyObject = msg_send![allocated, init];
             Retained::from_raw(obj).ok_or(VirtualDisplayError::CreationFailed)?
         };
-        let modes = NSArray::from_retained_slice(std::slice::from_ref(&mode));
+        let modes = NSArray::from_retained_slice(&mode_objs);
         let _: () = msg_send![&*settings, setModes: &*modes];
-        let _: () = msg_send![&*settings, setHiDPI: 0u32];
+        let _: () = msg_send![&*settings, setHiDPI: cfg.hidpi as u32];
 
         // --- Apply ----------------------------------------------------------------------
         let applied: bool = msg_send![&*disp, applySettings: &*settings];
@@ -164,20 +179,118 @@ impl VirtualDisplay {
         let display_id: u32 = msg_send![&*disp, displayID];
 
         // The dispatch queue is retained by the descriptor/display internally, so we may drop
-        // our local handle; `desc`, `mode`, `settings` are likewise retained as needed. Only the
-        // display itself must outlive this function to keep the on-screen display alive.
+        // our local handle; `desc`, the mode objects, and `settings` are likewise retained as
+        // needed. Only the display itself must outlive this function to keep it alive.
         drop(queue);
 
-        Ok(Self {
+        let display = Self {
             _display: disp,
             display_id,
-        })
+        };
+        // Place on the requested side (non-fatal on CG error — see `arrange`).
+        if let Arrangement::Side(side) = cfg.arrangement {
+            display.arrange(side);
+        }
+        Ok(display)
     }
 
     /// The `CGDirectDisplayID` of the created display (non-zero on success), usable by
     /// downstream capture (P3).
     pub fn display_id(&self) -> u32 {
         self.display_id
+    }
+
+    /// Place this display on `side` of the main display via `CGConfigureDisplayOrigin`.
+    /// Non-fatal: on any CoreGraphics error the display simply stays at its default macOS
+    /// position (stable identity still lets macOS remember a later manual rearrange).
+    pub fn arrange(&self, side: Side) {
+        // SAFETY: a pure CG display-configuration transaction; `display_id` is this display's
+        // own id and every begin is balanced by exactly one complete or cancel on every path.
+        unsafe {
+            let main_id = cg::CGMainDisplayID();
+            let mb = cg::CGDisplayBounds(main_id);
+            let main = DisplayBounds {
+                x: mb.origin.x as i32,
+                y: mb.origin.y as i32,
+                width: mb.size.width as i32,
+                height: mb.size.height as i32,
+            };
+            // The virtual display's own bounds give its (point) size for placement.
+            let vb = cg::CGDisplayBounds(self.display_id);
+            let vsize = (vb.size.width as i32, vb.size.height as i32);
+            let (ox, oy) = arrangement_origin(main, vsize, side);
+
+            let mut token: cg::CGDisplayConfigRef = core::ptr::null_mut();
+            if cg::CGBeginDisplayConfiguration(&mut token) != 0 {
+                eprintln!(
+                    "cg-virtual-display: arrange: begin-config failed; leaving default position"
+                );
+                return;
+            }
+            if cg::CGConfigureDisplayOrigin(token, self.display_id, ox, oy) != 0 {
+                eprintln!(
+                    "cg-virtual-display: arrange: set-origin failed; leaving default position"
+                );
+                // Discard the open transaction so the rejected origin is not applied.
+                // `CGCancelDisplayConfiguration` rolls back; `CGComplete*` would commit it.
+                let _ = cg::CGCancelDisplayConfiguration(token);
+                return;
+            }
+            // 0 = kCGConfigureForAppOnly: the change lives for as long as we hold the display.
+            if cg::CGCompleteDisplayConfiguration(token, 0) != 0 {
+                eprintln!("cg-virtual-display: arrange: complete-config failed");
+            }
+        }
+    }
+}
+
+impl Drop for VirtualDisplay {
+    fn drop(&mut self) {
+        // The retained `CGVirtualDisplay` is released right after this, tearing the display
+        // down so the desktop reflows. Log it so disconnect teardown is observable.
+        eprintln!(
+            "cg-virtual-display: removing virtual display {} (desktop will reflow)",
+            self.display_id
+        );
+    }
+}
+
+/// Minimal CoreGraphics display-configuration FFI (same inline-`extern "C"` style as
+/// [`active_display_count`]). Used by [`VirtualDisplay::arrange`] to place the display.
+mod cg {
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub struct CGPoint {
+        pub x: f64,
+        pub y: f64,
+    }
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub struct CGSize {
+        pub width: f64,
+        pub height: f64,
+    }
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub struct CGRect {
+        pub origin: CGPoint,
+        pub size: CGSize,
+    }
+    pub type CGDirectDisplayID = u32;
+    pub type CGDisplayConfigRef = *mut core::ffi::c_void;
+
+    extern "C" {
+        pub fn CGMainDisplayID() -> CGDirectDisplayID;
+        pub fn CGDisplayBounds(display: CGDirectDisplayID) -> CGRect;
+        pub fn CGBeginDisplayConfiguration(config: *mut CGDisplayConfigRef) -> i32;
+        pub fn CGConfigureDisplayOrigin(
+            config: CGDisplayConfigRef,
+            display: CGDirectDisplayID,
+            x: i32,
+            y: i32,
+        ) -> i32;
+        pub fn CGCompleteDisplayConfiguration(config: CGDisplayConfigRef, option: u32) -> i32;
+        pub fn CGCancelDisplayConfiguration(config: CGDisplayConfigRef) -> i32;
     }
 }
 

@@ -32,6 +32,16 @@ class MainActivity : Activity() {
     // handoff race in HARDWARE-FINDINGS.md) and then never retry.
     private val sessionActive = AtomicBoolean(false)
 
+    // The current render surface, tracked across its create/destroy lifecycle. The native
+    // SURFACE_SLOT handoff is consume-once (take_blocking removes it), and surfaceCreated only
+    // fires once per surface lifetime — so a re-attach (a new decode session while the surface
+    // already exists, same process) would find an empty slot and time out ("no render surface
+    // within 10s"). Keeping the surface here lets openAndRun re-deposit it for each session.
+    // Touched only on the UI thread today (surface callbacks + openAndRun); @Volatile is a
+    // cheap guard in case a future caller ever reads it off-thread.
+    @Volatile
+    private var currentSurface: Surface? = null
+
     // Receives the result of UsbManager.requestPermission() (the "Allow?" dialog).
     private val permissionReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
@@ -53,6 +63,7 @@ class MainActivity : Activity() {
         surfaceView.holder.addCallback(object : SurfaceHolder.Callback {
             override fun surfaceCreated(holder: SurfaceHolder) {
                 Log.i(TAG, "surface created — handing to native decode-to-surface")
+                currentSurface = holder.surface
                 nativeOnSurface(holder.surface)
             }
 
@@ -66,6 +77,7 @@ class MainActivity : Activity() {
                 // dead window. The Rust side releases its ANativeWindow reference and ends the
                 // decode loop.
                 Log.i(TAG, "surface destroyed — notifying native")
+                currentSurface = null
                 nativeOnSurfaceDestroyed()
             }
         })
@@ -150,6 +162,14 @@ class MainActivity : Activity() {
             return
         }
         Log.i(TAG, "accessory opened — handing fd $fd to native decode session (background thread)")
+        // Re-deposit the surface for THIS session. The native handoff is consume-once, so without
+        // this a re-attach (surface already created, slot drained by a previous session) would
+        // time out waiting for a surface that surfaceCreated will never re-announce. If the surface
+        // isn't up yet (cold launch-by-plug), this is null and surfaceCreated deposits it later.
+        currentSurface?.let { surface ->
+            Log.i(TAG, "re-depositing existing surface for new decode session")
+            nativeOnSurface(surface)
+        }
         // BL-02: once detachFd() returns, the raw fd is owned by nobody until nativeOnUsbFd
         // wraps it. If starting the thread throws, reclaim and close the fd (and release the
         // latch) so it isn't leaked.
