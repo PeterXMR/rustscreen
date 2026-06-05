@@ -12,6 +12,7 @@
 
 pub mod capture;
 pub mod capture_select;
+pub mod daemon;
 pub mod encode;
 pub mod encode_vt;
 pub mod latency;
