@@ -236,7 +236,7 @@ unsafe fn block_buffer_bytes(sbuf: &CMSampleBuffer) -> Option<Vec<u8>> {
 
 #[cfg(all(feature = "live-capture", feature = "live-usb"))]
 fn main() {
-    use cg_virtual_display::VirtualDisplay;
+    use cg_virtual_display::{DisplayConfig, Side, VirtualDisplay};
     use objc2::rc::Retained;
     use objc2::runtime::ProtocolObject;
     use objc2::AnyThread;
@@ -252,8 +252,14 @@ fn main() {
     const H: usize = 1080;
 
     // --- 1. Virtual display (held alive for the whole session) ----------------
-    println!("p5_stream: creating virtual display {W}×{H}@60…");
-    let vdisplay = match VirtualDisplay::new(W as u32, H as u32, 60.0) {
+    // Item 2: present as a named, HiDPI external display placed to the right of the main
+    // display. Stable identity (DisplayConfig defaults) lets macOS remember any manual
+    // rearrange; dropping `vdisplay` on disconnect tears it down so the desktop reflows.
+    println!("p5_stream: creating virtual display {W}×{H}@60 (HiDPI, right of main)…");
+    let cfg = DisplayConfig::new(W as u32, H as u32, 60.0)
+        .with_hidpi(true)
+        .arranged(Side::Right);
+    let vdisplay = match VirtualDisplay::with_config(&cfg) {
         Ok(d) => d,
         Err(e) => {
             eprintln!("p5_stream: failed to create virtual display: {e}");

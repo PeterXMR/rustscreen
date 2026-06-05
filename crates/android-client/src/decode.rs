@@ -109,9 +109,13 @@ impl From<AccessUnitError> for DecodeError {
 #[derive(Debug)]
 pub struct DecodeSession {
     /// The established codec config, used to inject SPS/PPS ahead of a bare keyframe and
-    /// to gate the first `Video`. A `VideoConfig` frame updates this unconditionally
-    /// (mid-stream reconfig is driven by the protocol); an in-band keyframe only
-    /// establishes it when none is set yet — it does not override a prior config.
+    /// to gate the first `Video`. A `VideoConfig` frame reconfigures the decoder only when
+    /// its SPS/PPS differ from the current config — the host re-sends an identical config
+    /// before every keyframe, and re-applying it would force an unsupported mid-stream
+    /// reconfigure. (Codec type is not compared; a codec-only change can't occur for the
+    /// H.264-only MVP, where SPS/PPS bytes already encode the codec.)
+    /// An in-band keyframe only establishes it when none is set yet — it does not override
+    /// a prior config.
     config: Option<CodecConfig>,
     /// The negotiated codec (from `VideoConfig`); defaults to H.264 when config is first
     /// learned from an in-band keyframe (D2: H.264 is the only MVP codec).
@@ -170,10 +174,19 @@ impl DecodeSession {
         match frame {
             Frame::VideoConfig { codec, sps_pps } => {
                 if let Some(config) = nal::extract_codec_config(sps_pps) {
-                    self.codec = *codec;
-                    decoder.configure(*codec, &config)?;
-                    self.config = Some(config);
-                    self.configured = true;
+                    // The host re-sends VideoConfig before EVERY keyframe so a late-joining
+                    // client can start decoding. Only (re)configure when the config actually
+                    // changes: re-applying an identical config would trigger a mid-stream
+                    // reconfigure that the Wave-B AMediaCodec adapter rejects, killing the
+                    // session (the live black-screen-after-~0.5s bug). A genuinely different
+                    // config (e.g. a resolution change) still reaches configure() — and is
+                    // still rejected by the MVP adapter, unchanged from before.
+                    if self.config.as_ref() != Some(&config) {
+                        self.codec = *codec;
+                        decoder.configure(*codec, &config)?;
+                        self.config = Some(config);
+                        self.configured = true;
+                    }
                 }
                 // A VideoConfig whose bytes carry no usable SPS+PPS is ignored: the next
                 // in-band keyframe can still establish the config. (Defensive — the host
@@ -523,6 +536,24 @@ mod tests {
             .filter(|c| matches!(c, Call::Configure(..)))
             .count();
         assert_eq!(configures, 2);
+    }
+
+    #[test]
+    fn identical_second_config_does_not_reconfigure() {
+        // The live host re-sends the SAME VideoConfig before every keyframe. The session must
+        // configure exactly once — re-applying an identical config would force an unsupported
+        // mid-stream reconfigure in the Wave-B adapter and kill the session.
+        let mut dec = RecordingDecoder::default();
+        let mut session = DecodeSession::new();
+        session.feed(&video_config_frame(), &mut dec).unwrap();
+        session.feed(&video_config_frame(), &mut dec).unwrap();
+
+        let configures = dec
+            .calls
+            .iter()
+            .filter(|c| matches!(c, Call::Configure(..)))
+            .count();
+        assert_eq!(configures, 1);
     }
 
     #[test]

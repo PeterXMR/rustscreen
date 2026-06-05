@@ -1,5 +1,6 @@
-//! One-shot handoff of the render surface from the SurfaceView callback to the USB
-//! decode-session thread.
+//! One-way handoff of the render surface from the SurfaceView callback to the USB
+//! decode-session thread, re-deposited once per decode session (the slot is consume-once,
+//! so each new session re-`put`s the current surface — see `WindowSlot::put`).
 //!
 //! The two things a live decode session needs — the render **surface** and the USB
 //! **transport fd** — arrive on independent Android callbacks in an order that is not fixed:
