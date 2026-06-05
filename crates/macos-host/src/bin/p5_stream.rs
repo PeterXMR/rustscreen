@@ -402,11 +402,81 @@ fn main() {
         }
     }
 
-    // --- 7. Stream until the phone disconnects --------------------------------
-    // run_stream_session does the handshake then drains the channel, sending VideoConfig
-    // before every keyframe + Video per access unit, until the transport errors (disconnect).
-    let offer = macos_host::session::host_handshake(W as u32, H as u32, 60);
-    let result = macos_host::session::run_stream_session(rx, &mut transport, offer);
+    // --- 7. Handshake + clock-sync on the full-duplex transport ---------------
+    // Latency instrumentation (Task 6): do the handshake explicitly (rather than letting
+    // run_stream_session do it internally) so we can run an SNTP-style clock-sync BEFORE
+    // streaming, then split the transport into independent read/write halves — a dedicated reader
+    // thread pulls inbound `Frame::Stats` while the main thread streams video on the write half.
+    use macos_host::session;
+    use protocol::clock::ClockOffset;
+    use protocol::messages::Frame;
+
+    // Monotonic host clock in microseconds, captured once at startup.
+    let start = std::time::Instant::now();
+    let now_us = move || start.elapsed().as_micros() as u64;
+
+    let offer = session::host_handshake(W as u32, H as u32, 60);
+    if let Err(e) = session::perform_handshake(&mut transport, offer.clone()) {
+        eprintln!("p5_stream: handshake failed: {e}");
+        drop(vdisplay);
+        std::process::exit(8);
+    }
+    println!("p5_stream: handshake OK — running clock-sync…");
+
+    // Clock-sync. On failure, degrade gracefully: stream + host-only stage timings, but no
+    // glass-to-glass (we cannot convert the phone's clock to ours without an offset).
+    let offset: Option<ClockOffset> = match session::perform_clock_sync(&mut transport, now_us) {
+        Ok(off) => {
+            println!(
+                "p5_stream: clock-sync OK — offset={} µs, rtt={} µs (±rtt/2 precision).",
+                off.offset_us, off.rtt_us
+            );
+            Some(off)
+        }
+        Err(e) => {
+            eprintln!(
+                "p5_stream: clock-sync failed ({e}); continuing with host-only stage timings \
+                 (glass-to-glass unavailable)."
+            );
+            None
+        }
+    };
+
+    // --- 7b. Split the transport; spawn the stats-reader thread ---------------
+    let (read_half, mut write_half) = transport.split();
+    let (stats_tx, stats_rx) = mpsc::channel::<Frame>();
+    let reader = std::thread::spawn(move || {
+        let mut read_half = read_half;
+        // Pull inbound frames forever; forward only `Frame::Stats` to the main thread. Any read
+        // error means the peer is gone — exit the loop (dropping stats_tx, closing the channel).
+        loop {
+            match Frame::read_from(&mut read_half) {
+                Ok(frame @ Frame::Stats { .. }) => {
+                    if stats_tx.send(frame).is_err() {
+                        break; // main thread ended
+                    }
+                }
+                Ok(_) => {}      // ignore non-Stats inbound frames
+                Err(_) => break, // peer gone / framing error
+            }
+        }
+    });
+
+    // --- 7c. Instrumented stream until the phone disconnects -------------------
+    println!("p5_stream: streaming with live latency instrumentation…");
+    let mut pipeline = macos_host::latency::PipelineLatency::new(256);
+    let result = session::run_stream_session_instrumented(
+        rx,
+        &mut write_half,
+        offer,
+        offset,
+        &stats_rx,
+        &mut pipeline,
+        Duration::from_secs(1), // heartbeat / idle-disconnect probe
+        Duration::from_secs(2), // print a latency report every ~2 s
+        now_us,
+        |report| print_report(report, offset),
+    );
 
     // --- 8. Teardown ----------------------------------------------------------
     let (stop_tx, stop_rx) = mpsc::channel::<()>();
@@ -416,6 +486,11 @@ fn main() {
     unsafe { stream.stopCaptureWithCompletionHandler(Some(&stop_handler)) };
     let _ = stop_rx.recv_timeout(Duration::from_secs(5));
     drop(vdisplay); // remove the virtual display so the Mac desktop reflows
+    drop(write_half); // closing the write half lets the reader thread unblock + exit
+    let _ = reader.join();
+
+    // Final latency report on exit.
+    print_report(&pipeline.report(), offset);
 
     match result {
         Ok(summary) => println!(
@@ -426,6 +501,65 @@ fn main() {
         ),
         Err(e) => eprintln!("p5_stream: session ended with error (likely disconnect): {e}"),
     }
+}
+
+/// Print a glass-to-glass latency report: each stage's avg/p50/p95/max in milliseconds, the
+/// fused glass-to-glass line, the rtt/offset precision caveat, and the anomaly count.
+///
+/// When `offset` is `None` (clock-sync failed) only the host-side stages are meaningful — and
+/// even those are populated only once a phone `Frame::Stats` fuses, which never happens without
+/// an offset — so the host stages print "—" and we note glass-to-glass is unavailable.
+#[cfg(all(feature = "live-capture", feature = "live-usb"))]
+fn print_report(
+    r: &macos_host::latency::LatencyReport,
+    offset: Option<protocol::clock::ClockOffset>,
+) {
+    use macos_host::encode::LatencyStats;
+
+    // Format one stage as "avg/p50/p95/max ms" (µs → ms), or "—" when it has no samples.
+    fn line(name: &str, s: &LatencyStats) {
+        if s.count() == 0 {
+            println!("  {name:<16} —");
+            return;
+        }
+        let ms = |us: f64| us / 1000.0;
+        let avg = s.mean().unwrap_or(0.0);
+        let p50 = s.p50().unwrap_or(0) as f64;
+        let p95 = s.p95().unwrap_or(0) as f64;
+        let max = s.max().unwrap_or(0) as f64;
+        println!(
+            "  {name:<16} avg {:>6.2}  p50 {:>6.2}  p95 {:>6.2}  max {:>6.2}  ms  (n={})",
+            ms(avg),
+            ms(p50),
+            ms(p95),
+            ms(max),
+            s.count(),
+        );
+    }
+
+    println!("p5_stream: ─── latency report ───");
+    match offset {
+        Some(off) => {
+            line("capture→encode", &r.capture_to_encode);
+            line("encode→send", &r.encode_to_send);
+            line("send→arrive", &r.send_to_arrive);
+            line("arrive→decode", &r.arrive_to_decode);
+            line("decode→present", &r.decode_to_present);
+            line("GLASS→GLASS", &r.glass_to_glass);
+            println!(
+                "  offset={} µs  rtt={} µs  (±rtt/2 = ±{} µs precision on every fused number)",
+                off.offset_us,
+                off.rtt_us,
+                off.rtt_us / 2,
+            );
+        }
+        None => {
+            line("capture→encode", &r.capture_to_encode);
+            line("encode→send", &r.encode_to_send);
+            println!("  glass-to-glass unavailable (clock-sync failed — no host↔phone offset).");
+        }
+    }
+    println!("  anomalies (clock jitter, clamped to 0): {}", r.anomalies);
 }
 
 /// Bring up the live AOA transport and read the device's connect-hello.

@@ -295,6 +295,42 @@ impl Write for AoaTransport {
     }
 }
 
+impl AoaTransport {
+    /// Split into independent read and write halves so the host can read inbound `Frame::Stats`
+    /// on a dedicated thread while the main thread streams video on the write half. Each half
+    /// owns one nusb endpoint.
+    ///
+    /// The claimed `Interface` is dropped here: each `EndpointWrite`/`EndpointRead` keeps its own
+    /// endpoint (and thereby the interface claim) alive independently, so the duplex link survives
+    /// the split.
+    pub fn split(self) -> (AoaReadHalf, AoaWriteHalf) {
+        (AoaReadHalf(self.reader), AoaWriteHalf(self.writer))
+    }
+}
+
+/// The read half of a split [`AoaTransport`] — owns the bulk IN endpoint. Lives on the
+/// stats-reader thread, which loops `Frame::read_from(&mut read_half)`.
+pub struct AoaReadHalf(nusb::io::EndpointRead<Bulk>);
+
+impl Read for AoaReadHalf {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.0.read(buf)
+    }
+}
+
+/// The write half of a split [`AoaTransport`] — owns the bulk OUT endpoint. Lives on the main
+/// thread, which streams `VideoConfig`/`Video` frames over it.
+pub struct AoaWriteHalf(nusb::io::EndpointWrite<Bulk>);
+
+impl Write for AoaWriteHalf {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.0.write(buf)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.0.flush()
+    }
+}
+
 /// NCM/TCP fallback transport (RESEARCH Pattern 5). A `TcpStream` is already
 /// `Read + Write + Send`; this newtype exists only to name the D1 fallback path. The same
 /// `echo_roundtrip` drives it unchanged.

@@ -33,7 +33,9 @@ use protocol::{
 use crate::{
     capture::Capturer,
     encode::{EncodedFrame, Encoder, LatencyStats},
+    latency::PipelineLatency,
 };
+use protocol::clock::ClockOffset;
 
 // ---------------------------------------------------------------------------
 // Error type
@@ -383,6 +385,145 @@ fn run_stream_session_inner(
 
     summary.bytes_sent = counting.total;
     Ok(summary)
+}
+
+/// Drive an **instrumented** post-handshake stream loop over a write-only half, fusing live
+/// glass-to-glass latency.
+///
+/// Unlike [`run_stream_session`], this function does **not** perform the handshake — the caller
+/// (`p5_stream`) does the handshake and clock-sync on the full-duplex transport first, then
+/// [`crate::aoa::AoaTransport::split`]s it so a dedicated reader thread can pull inbound
+/// `Frame::Stats` (forwarded here via `stats_rx`) while this loop owns the write half.
+///
+/// For each encoded frame it captures monotonic host timestamps and calls
+/// [`PipelineLatency::record_host`]:
+/// - `encode_done_us` ≈ the instant just before the send,
+/// - `send_done_us` ≈ the instant just after the write+flush returns,
+/// - `capture_us` ≈ `encode_done_us - frame.encode_micros` (the encoder already measured its own
+///   duration).
+///
+/// After each send it non-blockingly drains `stats_rx`, fusing any phone `Frame::Stats` (via
+/// `offset`, if clock-sync succeeded) into `pipeline`. The wire contract itself is unchanged:
+/// it reuses [`send_encoded_frame`] and the same idle-heartbeat liveness probe as
+/// [`run_stream_session_inner`].
+///
+/// `now_us` supplies monotonic host-clock microseconds (injected for testability). Every
+/// `report_each` of wall time the loop invokes `on_report` with a snapshot of the accumulated
+/// [`crate::latency::LatencyReport`] so the caller can print a periodic latency report without
+/// this (platform-agnostic) module taking on any I/O; the caller is expected to print one final
+/// report after this function returns. The loop ends when the frame channel closes (capture
+/// stopped) or the transport errors (peer disconnect).
+#[allow(clippy::too_many_arguments)]
+pub fn run_stream_session_instrumented(
+    frames: std::sync::mpsc::Receiver<EncodedFrame>,
+    write_half: &mut impl Write,
+    offer: Handshake,
+    offset: Option<ClockOffset>,
+    stats_rx: &std::sync::mpsc::Receiver<Frame>,
+    pipeline: &mut PipelineLatency,
+    heartbeat: std::time::Duration,
+    report_each: std::time::Duration,
+    mut now_us: impl FnMut() -> u64,
+    mut on_report: impl FnMut(&crate::latency::LatencyReport),
+) -> Result<SendSessionSummary, SessionError> {
+    use std::sync::mpsc::RecvTimeoutError;
+    use std::time::Instant;
+
+    let mut last_report = Instant::now();
+
+    // The handshake + clock-sync already happened on the full-duplex transport before the split;
+    // re-derive the AgreedConfig from the offer so the wire contract (codec) is unchanged. The
+    // offer is the host's own advertisement, so negotiating it against itself yields the host's
+    // codec without another round trip.
+    let agreed = AgreedConfig {
+        width: offer.width,
+        height: offer.height,
+        refresh_hz: offer.refresh_hz,
+        codec: offer
+            .codecs
+            .first()
+            .copied()
+            .unwrap_or(protocol::messages::VideoCodec::H264),
+    };
+
+    let mut counting = CountingWrite::new(write_half);
+    let mut summary = SendSessionSummary {
+        frames: 0,
+        bytes_sent: 0,
+        codec_config: None,
+        latency: LatencyStats::new(),
+        agreed_config: agreed.clone(),
+    };
+
+    loop {
+        match frames.recv_timeout(heartbeat) {
+            Ok(encoded) => {
+                let pts_us = encoded.pts_us;
+                let encode_micros = encoded.encode_micros;
+                let encode_done_us = now_us();
+                let capture_us = encode_done_us.saturating_sub(encode_micros);
+
+                send_encoded_frame(
+                    encoded,
+                    &mut counting,
+                    &mut summary.codec_config,
+                    agreed.codec,
+                )?;
+
+                let send_done_us = now_us();
+                pipeline.record_host(pts_us, capture_us, encode_done_us, send_done_us);
+                summary.latency.record(encode_micros);
+                summary.frames += 1;
+
+                // Non-blockingly drain whatever phone Stats the reader thread has forwarded.
+                drain_stats(stats_rx, offset, pipeline);
+            }
+            // No frame within the heartbeat window — probe the transport so a disconnect is
+            // detected promptly instead of blocking forever. Also drain any pending stats.
+            Err(RecvTimeoutError::Timeout) => {
+                Frame::Control(Control::Heartbeat).write_to(&mut counting)?;
+                counting.flush()?;
+                drain_stats(stats_rx, offset, pipeline);
+            }
+            // Every sender dropped → capture stopped: end the stream cleanly.
+            Err(RecvTimeoutError::Disconnected) => break,
+        }
+
+        // Periodic report so a long-running live session surfaces latency continuously.
+        if last_report.elapsed() >= report_each {
+            on_report(&pipeline.report());
+            last_report = Instant::now();
+        }
+    }
+
+    // Final drain: fuse any phone Stats that arrived after the last frame was sent (the phone's
+    // report for the tail frames lags the host's send by the network + decode + present latency).
+    drain_stats(stats_rx, offset, pipeline);
+
+    summary.bytes_sent = counting.total;
+    Ok(summary)
+}
+
+/// Non-blockingly drain forwarded phone `Frame::Stats` and fuse them into `pipeline` (only when
+/// clock-sync produced an `offset`). Other frame kinds and a closed/empty channel are ignored.
+fn drain_stats(
+    stats_rx: &std::sync::mpsc::Receiver<Frame>,
+    offset: Option<ClockOffset>,
+    pipeline: &mut PipelineLatency,
+) {
+    while let Ok(frame) = stats_rx.try_recv() {
+        if let Frame::Stats {
+            pts_us,
+            arrive_us,
+            decode_us,
+            present_us,
+        } = frame
+        {
+            if let Some(off) = offset {
+                pipeline.record_stats(pts_us, arrive_us, decode_us, present_us, off);
+            }
+        }
+    }
 }
 
 /// Send one encoded access unit on the wire, applying the shared keyframe/config contract:
@@ -834,6 +975,184 @@ mod tests {
         assert!(
             result.is_err(),
             "an idle session over a dead transport must detect the disconnect via heartbeat, not hang"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // run_stream_session_instrumented — post-handshake loop with live stats fusion.
+    // The caller does the handshake + clock-sync + split first, then a reader thread
+    // forwards phone Frame::Stats into stats_rx while this loop streams on the write
+    // half and records host stage timestamps. Cable-free, host-tested.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn instrumented_stream_fuses_host_and_phone_stats() {
+        use crate::latency::PipelineLatency;
+        use protocol::clock::ClockOffset;
+
+        // Inject one keyframe and a delta. The phone's report for a given pts only arrives after
+        // the host has sent (and recorded) that frame, so we model that lag with a background
+        // thread that forwards each Stats frame for a pts *after* a host record for it can exist.
+        // To keep the test deterministic, we gate the loop on the frame timing: each frame is sent
+        // with a small delay, and the stats thread forwards each report keyed to a frame that the
+        // loop will already have recorded by the time the per-frame/heartbeat drain runs.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (stats_tx, stats_rx) = std::sync::mpsc::channel::<Frame>();
+
+        // Frame producer: send kf(1000), then after the stat for 1000 is delivered, send
+        // delta(2000), then the stat for 2000, then close. The ordering guarantees each Stats is
+        // drained only once its host record exists, so both fuse.
+        let producer = std::thread::spawn(move || {
+            tx.send(keyframe_encoded(1000)).unwrap();
+            // Give the loop time to record host stamps for pts 1000.
+            std::thread::sleep(std::time::Duration::from_millis(15));
+            stats_tx
+                .send(Frame::Stats {
+                    pts_us: 1000,
+                    arrive_us: 100,
+                    decode_us: 110,
+                    present_us: 120,
+                })
+                .unwrap();
+            tx.send(delta_encoded(2000)).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(15));
+            stats_tx
+                .send(Frame::Stats {
+                    pts_us: 2000,
+                    arrive_us: 200,
+                    decode_us: 210,
+                    present_us: 220,
+                })
+                .unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(15));
+            // dropping tx + stats_tx closes both channels → loop ends, final drain fuses the tail.
+        });
+
+        // Monotonic host clock: deterministic increasing stamps (10 µs apart).
+        let mut t = 0u64;
+        let now = move || {
+            t += 10;
+            t
+        };
+
+        let offset = Some(ClockOffset {
+            offset_us: 0,
+            rtt_us: 4,
+        });
+        let mut pipeline = PipelineLatency::new(16);
+        let mut sink: Vec<u8> = Vec::new();
+
+        let summary = run_stream_session_instrumented(
+            rx,
+            &mut sink,
+            default_offer(),
+            offset,
+            &stats_rx,
+            &mut pipeline,
+            std::time::Duration::from_millis(5),
+            std::time::Duration::from_secs(3600), // no periodic report during the test
+            now,
+            |_r| {},
+        )
+        .unwrap();
+        producer.join().unwrap();
+
+        assert_eq!(summary.frames, 2);
+        assert_eq!(summary.agreed_config.codec, VideoCodec::H264);
+
+        // Both phone Stats matched an in-flight host record → two fused glass-to-glass samples.
+        let report = pipeline.report();
+        assert_eq!(
+            report.glass_to_glass.count(),
+            2,
+            "both frames' phone stats should fuse with their host records"
+        );
+        // Host stages were recorded for both frames too.
+        assert_eq!(report.capture_to_encode.count(), 2);
+        assert_eq!(report.encode_to_send.count(), 2);
+
+        // The write half carries the same wire contract: VideoConfig+Video(kf), Video(delta).
+        // (Plus any idle Heartbeats interleaved while waiting on the producer's delays.)
+        let mut cur = Cursor::new(sink);
+        let mut sent = Vec::new();
+        while let Ok(f) = Frame::read_from(&mut cur) {
+            sent.push(f);
+        }
+        let videos: Vec<_> = sent
+            .iter()
+            .filter(|f| matches!(f, Frame::Video { .. }))
+            .collect();
+        assert_eq!(
+            videos.len(),
+            2,
+            "two Video frames, regardless of heartbeats"
+        );
+        assert!(
+            sent.iter().any(|f| matches!(f, Frame::VideoConfig { .. })),
+            "VideoConfig precedes the keyframe"
+        );
+        // No Handshake frame here (handshake happened on the duplex transport before the split).
+        assert!(!sent.iter().any(|f| matches!(f, Frame::Handshake(_))));
+    }
+
+    #[test]
+    fn instrumented_stream_without_offset_records_host_only() {
+        use crate::latency::PipelineLatency;
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(keyframe_encoded(1000)).unwrap();
+        drop(tx);
+
+        // A phone Stats arrives, but with no clock offset it must NOT be fused (no glass-to-glass).
+        let (stats_tx, stats_rx) = std::sync::mpsc::channel::<Frame>();
+        stats_tx
+            .send(Frame::Stats {
+                pts_us: 1000,
+                arrive_us: 100,
+                decode_us: 110,
+                present_us: 120,
+            })
+            .unwrap();
+        drop(stats_tx);
+
+        let mut t = 0u64;
+        let now = move || {
+            t += 10;
+            t
+        };
+        let mut pipeline = PipelineLatency::new(16);
+        let mut sink: Vec<u8> = Vec::new();
+
+        let summary = run_stream_session_instrumented(
+            rx,
+            &mut sink,
+            default_offer(),
+            None, // clock-sync failed → degrade to host-only stages
+            &stats_rx,
+            &mut pipeline,
+            std::time::Duration::from_millis(5),
+            std::time::Duration::from_secs(3600),
+            now,
+            |_r| {},
+        )
+        .unwrap();
+
+        assert_eq!(summary.frames, 1);
+        let report = pipeline.report();
+        // Without a clock offset the host never fuses phone Stats, so no stage in the report has
+        // any samples — glass-to-glass (and every cross-clock stage) is unavailable. The host
+        // stamps are still captured into the in-flight FIFO; they simply never get fused. The
+        // summary's encode-latency stat is the host-only signal that remains usable.
+        assert_eq!(
+            report.glass_to_glass.count(),
+            0,
+            "no offset → phone stats are not fused; glass-to-glass unavailable"
+        );
+        assert_eq!(report.capture_to_encode.count(), 0);
+        assert_eq!(
+            summary.latency.count(),
+            1,
+            "host-only encode latency is still recorded"
         );
     }
 
