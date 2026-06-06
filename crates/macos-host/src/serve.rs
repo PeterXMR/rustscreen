@@ -506,7 +506,6 @@ pub fn run_host(opts: &HostOpts, stop: &AtomicBool) -> std::io::Result<()> {
     // hello (read inside bring_up_aoa) also guarantees the phone's reader is live before we write.
     // Wait-for-phone: retry until the accessory appears or `stop` is requested, so the daemon can
     // be started before the phone is plugged in.
-    ensure_android_app_running();
     println!("rustscreen: waiting for the phone (open the app to start streaming)…");
     let mut transport = loop {
         if stop.load(Ordering::Relaxed) {
@@ -818,42 +817,6 @@ fn print_report(r: &crate::latency::LatencyReport, offset: Option<protocol::cloc
         "  dropped frames (drop-to-keyframe shed load): {}",
         r.dropped_frames
     );
-}
-
-/// Best-effort: make sure the Android client app is running on the connected phone before the
-/// AOA handshake, so the user never has to open it by hand. Runs while the phone is still in
-/// normal USB mode (adb works); non-fatal — if adb is missing or the phone isn't reachable, we
-/// log and fall back to the Android manifest's USB-accessory auto-launch + manual open.
-fn ensure_android_app_running() {
-    const PKG: &str = "com.rustscreen.client";
-    const ACTIVITY: &str = "com.rustscreen.client/.MainActivity";
-    // Already running? `pidof` exits 0 with a pid on stdout when it is.
-    let running = std::process::Command::new("adb")
-        .args(["shell", "pidof", PKG])
-        .output()
-        .map(|o| o.status.success() && !o.stdout.trim_ascii().is_empty())
-        .unwrap_or(false);
-    if running {
-        println!("rustscreen: phone app already running.");
-        return;
-    }
-    match std::process::Command::new("adb")
-        .args(["shell", "am", "start", "-n", ACTIVITY])
-        .output()
-    {
-        Ok(o) if o.status.success() => {
-            println!("rustscreen: launched the phone app via adb.");
-            // Give it a moment to come to the foreground before the AOA switch.
-            std::thread::sleep(std::time::Duration::from_millis(800));
-        }
-        Ok(o) => eprintln!(
-            "rustscreen: `adb am start` failed ({}); open the RustScreen app on the phone manually.",
-            String::from_utf8_lossy(&o.stderr).trim()
-        ),
-        Err(e) => eprintln!(
-            "rustscreen: adb not available ({e}); open the RustScreen app on the phone manually."
-        ),
-    }
 }
 
 /// Bring up the live AOA transport and read the device's connect-hello.
