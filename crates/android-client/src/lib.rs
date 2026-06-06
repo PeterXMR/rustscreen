@@ -164,7 +164,9 @@ mod android {
             .ok_or("no render surface within 10s (SurfaceView never created?)")?;
         log::info!("nativeOnUsbFd: surface acquired; decoding to surface");
 
-        let mut decoder = MediaCodecDecoder::new(window);
+        // Pass the same slot the window came from so the decode loop can pick up a surface
+        // recreated mid-session (phone lock/unlock) and re-attach it to the running codec.
+        let mut decoder = MediaCodecDecoder::new(window, &SURFACE_SLOT);
         let mut session = DecodeSession::new();
         // Advertise the device's H.264 decode ceiling rather than a single hardcoded mode.
         // negotiate() only requires the client max to be >= the host's offered resolution, and
@@ -242,21 +244,22 @@ mod android {
         SURFACE_SLOT.put(window);
     }
 
-    /// Called from `SurfaceHolder.Callback.surfaceDestroyed`. Retracts any window still sitting
-    /// in [`SURFACE_SLOT`] so a session that has not yet claimed it cannot configure the decoder
-    /// onto a now-dead surface (the destroy-before-take race on the launch-by-plug path), and so
-    /// a surface deposited but never consumed does not leak its `ANativeWindow` reference.
+    /// Called from `SurfaceHolder.Callback.surfaceDestroyed`. Marks the slot `gone`: it retracts
+    /// any window still sitting in [`SURFACE_SLOT`] (so a session that has not yet claimed it
+    /// cannot configure the decoder onto a now-dead surface — the destroy-before-take race on the
+    /// launch-by-plug path — and an unconsumed surface does not leak its `ANativeWindow` ref), and
+    /// signals the running decode loop to skip rendering until a new surface arrives.
     ///
-    /// For the MVP single-connect pipeline a surface lost *after* a session already claimed it
-    /// still ends only when the host disconnects (USB EOF) — robust mid-session surface-recreate
-    /// is deferred to the hotplug ladder item.
+    /// A surface lost *after* a session already claimed it (phone lock) no longer wedges the
+    /// session black: the decode loop render-skips during the gap and re-attaches the recreated
+    /// surface on unlock via `AMediaCodec_setOutputSurface` (see [`crate::mediacodec`]).
     #[cfg(feature = "live-decode")]
     #[no_mangle]
     pub extern "system" fn Java_com_rustscreen_client_MainActivity_nativeOnSurfaceDestroyed(
         _env: JNIEnv,
         _class: JClass,
     ) {
-        log::info!("nativeOnSurfaceDestroyed: surface gone — retracting any unclaimed window");
-        SURFACE_SLOT.clear();
+        log::info!("nativeOnSurfaceDestroyed: surface gone — marking slot (render-skip until re-create)");
+        SURFACE_SLOT.mark_gone();
     }
 }

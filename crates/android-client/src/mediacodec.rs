@@ -41,6 +41,7 @@ use protocol::messages::VideoCodec;
 use protocol::nal::CodecConfig;
 
 use crate::decode::{DecodeError, DecoderInput, PresentedFrame, VideoDecoder};
+use crate::rendezvous::WindowSlot;
 
 // Link the NDK media library. `ndk-sys` only declares the FFI signatures and links
 // `libandroid` (for `ANativeWindow_*`), NOT `libmediandk` — so the `AMediaCodec_*` /
@@ -126,6 +127,13 @@ pub struct MediaCodecDecoder {
     window: Option<NativeWindow>,
     /// The running decoder, created lazily on the first `configure`.
     codec: Option<Codec>,
+    /// The surface rendezvous channel, polled each frame so a surface recreated mid-session
+    /// (phone lock/unlock) is swapped into the live codec via `AMediaCodec_setOutputSurface`.
+    surface_channel: &'static WindowSlot<NativeWindow>,
+    /// True while the surface is destroyed (locked gap): the drain step then releases output
+    /// buffers WITHOUT rendering, so we never composite into a dead window. `Cell` because the
+    /// drain helper borrows `&self`.
+    surface_gone: Cell<bool>,
     /// Access units handed to `queueInputBuffer` so far (latency item A depth accounting).
     queued: Cell<u64>,
     /// Output buffers pulled from `dequeueOutputBuffer` so far (rendered or dropped).
@@ -134,13 +142,46 @@ pub struct MediaCodecDecoder {
 
 impl MediaCodecDecoder {
     /// Build an adapter that will decode onto `window`. The codec itself is created on the
-    /// first [`VideoDecoder::configure`] call, when SPS/PPS are known.
-    pub fn new(window: NativeWindow) -> Self {
+    /// first [`VideoDecoder::configure`] call, when SPS/PPS are known. `surface_channel` is the
+    /// same slot `window` was taken from; the decode loop polls it each frame so a surface
+    /// recreated after a lock/unlock is re-attached to the running codec.
+    pub fn new(window: NativeWindow, surface_channel: &'static WindowSlot<NativeWindow>) -> Self {
         MediaCodecDecoder {
             window: Some(window),
             codec: None,
+            surface_channel,
+            surface_gone: Cell::new(false),
             queued: Cell::new(0),
             dequeued: Cell::new(0),
+        }
+    }
+
+    /// Pick up a surface change signalled by the JNI callbacks. Called at the top of every
+    /// `decode`/`pump`. If a surface was recreated (post-unlock), swap it into the running codec
+    /// with `AMediaCodec_setOutputSurface` — the decoder keeps its reference frames, so the next
+    /// frame paints correctly. If the surface is currently destroyed (locked), mark it so the
+    /// drain step skips rendering into the dead window.
+    fn poll_surface(&mut self) {
+        if let Some(new) = self.surface_channel.take_pending() {
+            match self.codec.as_mut() {
+                Some(codec) => match codec.set_output_surface(new) {
+                    Ok(()) => {
+                        self.surface_gone.set(false);
+                        log::info!("MediaCodecDecoder: re-attached decoder to recreated surface");
+                    }
+                    Err(e) => {
+                        log::error!("MediaCodecDecoder: setOutputSurface failed, keeping previous window: {e}");
+                    }
+                },
+                // Not configured yet (still before the first keyframe): stash as the initial
+                // window so `configure` binds the freshest surface.
+                None => {
+                    self.window = Some(new);
+                    self.surface_gone.set(false);
+                }
+            }
+        } else if self.surface_channel.is_gone() {
+            self.surface_gone.set(true);
         }
     }
 }
@@ -148,8 +189,26 @@ impl MediaCodecDecoder {
 /// RAII wrapper over a started `AMediaCodec` (stopped + deleted on `Drop`).
 struct Codec {
     ptr: NonNull<sys::AMediaCodec>,
-    /// Kept alive for the codec's lifetime: the codec renders into this window.
-    _window: NativeWindow,
+    /// Kept alive for the codec's lifetime: the codec renders into this window. Swapped (old one
+    /// dropped) by [`set_output_surface`](Codec::set_output_surface) on a mid-session re-attach.
+    window: NativeWindow,
+}
+
+impl Codec {
+    /// Swap the decoder's output surface to `new` without reconfiguring or flushing —
+    /// `AMediaCodec_setOutputSurface` preserves the decoder's state and reference frames, so the
+    /// next decoded frame (even a P-frame) paints correctly onto the new surface. Used to
+    /// re-attach after a phone lock/unlock recreates the `SurfaceView`'s surface. On success the
+    /// previous window is dropped (its `ANativeWindow` reference released); on error the previous
+    /// window stays bound and `new` is dropped by going out of scope.
+    fn set_output_surface(&mut self, new: NativeWindow) -> Result<(), DecodeError> {
+        // SAFETY: `ptr` is a valid started codec; `new` owns a live `ANativeWindow` reference.
+        let status =
+            unsafe { sys::AMediaCodec_setOutputSurface(self.ptr.as_ptr(), new.as_ptr()) };
+        check(status, "setOutputSurface")?;
+        self.window = new; // drop the previous window (release its ref); keep `new` alive
+        Ok(())
+    }
 }
 
 impl Drop for Codec {
@@ -290,7 +349,7 @@ impl VideoDecoder for MediaCodecDecoder {
 
                 Ok(Codec {
                     ptr: codec_ptr,
-                    _window: window,
+                    window,
                 })
             })();
 
@@ -303,6 +362,8 @@ impl VideoDecoder for MediaCodecDecoder {
     }
 
     fn decode(&mut self, input: &DecoderInput) -> Result<Vec<PresentedFrame>, DecodeError> {
+        // Apply any surface lock/unlock signalled since the last frame before decoding this one.
+        self.poll_surface();
         let codec = self
             .codec
             .as_ref()
@@ -387,6 +448,7 @@ impl VideoDecoder for MediaCodecDecoder {
     fn pump(&mut self) -> Result<Vec<PresentedFrame>, DecodeError> {
         // Drain ready output without submitting input — used when the session's pacer drops an
         // incoming frame but the codec should keep draining so the surface stays current.
+        self.poll_surface();
         let codec = self
             .codec
             .as_ref()
@@ -488,15 +550,31 @@ impl MediaCodecDecoder {
         // Present the newest decoded buffer WITH render so it composites onto the ANativeWindow
         // (D3 — no CPU copy back to us); stamp present right after. The global clock keeps these
         // timestamps in the same epoch as arrive_us / ClockPong t1,t2.
+        //
+        // While the surface is gone (phone locked), render=false: compositing into a destroyed
+        // ANativeWindow can error and would end the session. We still dequeue+release every buffer
+        // so the codec keeps draining (the host keeps flowing); the next surface swap (unlock)
+        // resumes painting on the warm decoder. No PresentedFrame is recorded for an un-rendered
+        // buffer, so latency stats reflect only frames actually shown.
+        let render = !self.surface_gone.get();
         // SAFETY: `newest_idx` is a valid output buffer index just dequeued and not yet released.
-        let status = unsafe { sys::AMediaCodec_releaseOutputBuffer(codec, newest_idx, true) };
-        check(status, "releaseOutputBuffer(render=true)")?;
-        let present_us = crate::now_us();
-        presented.push(PresentedFrame {
-            pts_us: newest_pts,
-            decode_us: newest_decode_us,
-            present_us,
-        });
+        let status = unsafe { sys::AMediaCodec_releaseOutputBuffer(codec, newest_idx, render) };
+        check(
+            status,
+            if render {
+                "releaseOutputBuffer(render=true)"
+            } else {
+                "releaseOutputBuffer(render=false, surface gone)"
+            },
+        )?;
+        if render {
+            let present_us = crate::now_us();
+            presented.push(PresentedFrame {
+                pts_us: newest_pts,
+                decode_us: newest_decode_us,
+                present_us,
+            });
+        }
         Ok(())
     }
 }
