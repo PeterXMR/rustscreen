@@ -308,6 +308,7 @@ dependencies = [
  "cg-virtual-display",
  "core-graphics",
  "dispatch2",
+ "libc",
  "log",
  "nusb",
  "objc2",
