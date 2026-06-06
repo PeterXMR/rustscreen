@@ -113,7 +113,10 @@ mod tests {
 
     #[test]
     fn paths_live_under_dot_rustscreen_in_home() {
-        assert_eq!(runtime_dir("/Users/me"), PathBuf::from("/Users/me/.rustscreen"));
+        assert_eq!(
+            runtime_dir("/Users/me"),
+            PathBuf::from("/Users/me/.rustscreen")
+        );
         assert_eq!(
             pid_path("/Users/me"),
             PathBuf::from("/Users/me/.rustscreen/rustscreen.pid")

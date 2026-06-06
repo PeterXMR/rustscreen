@@ -341,6 +341,24 @@ impl Read for AoaReadHalf {
 /// thread, which streams `VideoConfig`/`Video` frames over it.
 pub struct AoaWriteHalf(nusb::io::EndpointWrite<Bulk>);
 
+impl AoaWriteHalf {
+    /// Bound how long a blocking `write()`/`flush()` waits for its bulk-OUT transfers to complete
+    /// before returning an error instead of blocking forever. nusb's `EndpointWrite` defaults this
+    /// to `Duration::MAX` (infinite): if the phone stops draining the endpoint, `flush()` wedges
+    /// the stream loop permanently. Setting a finite timeout converts that hang into a clean
+    /// session-end (teardown drops the virtual display) once a transfer stalls past the deadline.
+    pub fn set_write_timeout(&mut self, timeout: std::time::Duration) {
+        self.0.set_write_timeout(timeout);
+    }
+
+    /// Set the number of bulk-OUT transfers nusb keeps in flight at once. More in-flight transfers
+    /// pipeline the host→phone path (the writer can submit the next chunk before the previous one
+    /// has completed), lowering per-frame send latency.
+    pub fn set_num_transfers(&mut self, num_transfers: usize) {
+        self.0.set_num_transfers(num_transfers);
+    }
+}
+
 impl Write for AoaWriteHalf {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         self.0.write(buf)

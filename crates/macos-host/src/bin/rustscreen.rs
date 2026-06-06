@@ -134,12 +134,29 @@ fn cmd_stop() {
         Some(pid) if process_alive(pid) => {
             // SAFETY: sending SIGTERM to our own daemon pid for graceful teardown.
             unsafe { libc::kill(pid, libc::SIGTERM) };
-            // Brief wait for graceful teardown (display drop + USB close).
-            for _ in 0..50 {
+            // Grace period (~3s) for clean teardown (display drop + USB close).
+            // On macOS `libc::signal` uses BSD/SA_RESTART semantics, so SIGTERM does
+            // NOT interrupt a blocking USB write/flush — the worker may not observe the
+            // stop flag until that syscall returns. If it never exits, escalate below.
+            for _ in 0..30 {
                 if !process_alive(pid) {
                     break;
                 }
                 std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            if process_alive(pid) {
+                // SIGKILL cannot be caught/restarted, so it always wins. RAII teardown is
+                // skipped, but the CGVirtualDisplay is owned by the process and is removed
+                // on exit, so the desktop still reflows — safe.
+                println!("rustscreen: worker {pid} didn't exit on SIGTERM; sending SIGKILL.");
+                // SAFETY: sending SIGKILL to our own daemon pid to force exit.
+                unsafe { libc::kill(pid, libc::SIGKILL) };
+                for _ in 0..10 {
+                    if !process_alive(pid) {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
             }
             let _ = std::fs::remove_file(&pid_path);
             println!("rustscreen: stopped (pid {pid}).");

@@ -596,6 +596,18 @@ pub fn run_host(opts: &HostOpts, stop: &AtomicBool) -> std::io::Result<()> {
     // thread: the reader polls a stop flag between whole frames (via nusb's read timeout, which
     // does NOT corrupt framing because it only fires while no bytes of a frame are buffered).
     let (read_half, mut write_half) = transport.split();
+    // Pipeline up to 4 in-flight bulk-OUT transfers so the writer can submit the next chunk
+    // before the previous one completes (lower host→phone send latency; ROADMAP latency lever #1).
+    write_half.set_num_transfers(4);
+    // Bound how long a flush waits before erroring instead of hanging forever. nusb's
+    // EndpointWrite defaults its write timeout to Duration::MAX, so if the phone stops draining
+    // the bulk-OUT endpoint the stream loop wedges permanently inside flush() (observed: 1 frame
+    // sent, then 4+ minutes of silence — even the ~2s latency report never fired). A finite
+    // timeout turns that wedge into a clean session-end: the flush returns an error and the loop
+    // unwinds into teardown (which drops the virtual display) instead of blocking forever. 5s is
+    // generous — active streaming completes each transfer in milliseconds, so this only fires on
+    // a real persistent stall, never on the healthy streaming path.
+    write_half.set_write_timeout(Duration::from_secs(5));
     let reader_local_stop = Arc::new(AtomicBool::new(false));
     let (pong_tx, pong_rx) = mpsc::channel::<(Frame, u64)>();
     let (stats_tx, stats_rx) = mpsc::channel::<Frame>();
