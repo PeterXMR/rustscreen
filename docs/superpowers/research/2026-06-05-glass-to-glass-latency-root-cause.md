@@ -244,6 +244,106 @@ if in-flight exceeds a small cap (1–2), **drop the SCK frame instead of submit
 USB write + framing; revisit after capture→encode). See category **E** for the IDR-bubble
 angle (a 1 s GOP full IDR is a large frame that can spike both encode and transfer).
 
+## 7. Result after non-blocking USB writes (PR 1 / GH #27) — measured 2026-06-07
+
+PR 1 removed the per-frame **blocking** `flush()` from the host streaming send path: `AoaWriteHalf`
+ended each frame with nusb's non-waiting `submit()` instead, relying on the depth-4 transfer ring
+for backpressure. **Measured on device (M1 + Pixel 6a, 2400×1080@60, offset −12.36 s / rtt 430 µs):**
+
+| stage | baseline | PR 1 light-load (n=5) | PR 1 steady-state (n=594) | verdict |
+|---|---|---|---|---|
+| capture→encode | ~11 ms p50 (spiky) | 10.2 p50 / 57.9 p95 | 10.9 p50 / **84 p95 / 150 max** | jitter tail (separate) |
+| **encode→send** | **~22 ms p50** | 0.15 p50 | **0.23 p50** | collapsed as predicted ✅ |
+| **send→arrive** | ~0.8 ms | 1.0 | **41.8 p50 / 101 p95** | **GREW — bufferbloat** ⬆ |
+| arrive→decode | ~10 ms p50 | 9.1 | 12.0 p50 (425 max startup) | fine |
+| decode→present | ~12 ms | 12.1 | 12.7 p50 | one vsync (floor) |
+| **GLASS→GLASS** | **~80 ms p50** | **39 p50** | **100 p50 / 192 p95 / 454 max** | **REGRESSED** ⬆ |
+
+**Conclusion: the plan's premise was wrong, and the measurement disproves it.** The per-frame
+`flush()` was **not ~18 ms of waste — it was load-bearing flow control.** A bulk-OUT transfer
+*completes only when the phone pulls the bytes* off its bulk-IN endpoint (USB-level flow control),
+so the old flush time **was the phone-pull latency**, and blocking on it held the wire queue at
+**depth ≈ 1** (drained to zero between frames). Removing it (1) **relocated** the ~22 ms from
+`encode→send` to `send→arrive` (we now stamp `send_done` before the transfer completes), and (2)
+**added** a persistent **~3-frame standing queue (~45 ms)** in the nusb ring + kernel USB buffers —
+invisible to *both* sides' drop-to-keyframe logic (`dropped frames` stayed **0** the whole run).
+Textbook standing-queue **bufferbloat**, and a direct violation of the prime directive ("never add
+unbounded/invisible buffering on the hot path").
+
+**Tells in the data:** `send→arrive` climbed `1 → 31 → 47 ms` and **plateaued** at ~45 ms (a full,
+standing buffer — not unbounded), with `dropped = 0` throughout. The pretty 39 ms in the first
+report was the **empty-buffer transient** before the queue filled. There is **no host-side free
+lunch**: `num_transfers = 1` just recreates the blocking-flush depth-1 behavior. The ~22 ms is
+fundamentally the **phone-pull rate**.
+
+### What the floor analysis says is achievable
+
+The light-load transient (39 ms, before any queue stood) ≈ the **sum of the per-stage floors**:
+capture ~11 + wire ~3 + arrive→decode ~12 + decode→present ~13 ≈ **~39 ms**. So **~40 ms steady
+state is reachable** — *if every queue is kept shallow*. The job is queue discipline, not shaving
+any single stage.
+
+### Revised strategy (supersedes the original PR ordering)
+
+1. **Revert PR 1.** `flush()` is the correct shallow-queue gate; it restores the ~80 ms baseline.
+   Host-side pipelining is a **dead end on its own**.
+2. **PR 5 (phone RX thread) → promoted to #1.** The dominant steady-state cost is the **phone
+   pull** (~22 ms, whether shown as `encode→send` or `send→arrive`). The *only* lever that shrinks
+   it instead of relocating it is making the phone **drain USB continuously on a dedicated thread**,
+   decoupled from decode/present, into a bounded **drop-to-keyframe** ring. That both (a) completes
+   host transfers in ~wire time (~3 ms) so the 22 ms collapses *for real*, and (b) moves any
+   standing queue to the phone's *app-level* ring where the existing `InputPacer` sheds it — not
+   invisible kernel buffers. Keystone of getting under 50 ms.
+3. **PR 1 revisited only after PR 5**, redesigned with **app-level in-flight accounting** (bounded
+   outstanding-frame count / lightweight per-frame ack) so excess frames coalesce in the *visible*
+   host channel, never kernel buffers. Safe only once the phone drains fast enough.
+4. **PR 6 (IDR-bubble) rises in priority.** The periodic ~58 ms `capture→encode` spike (even at
+   light load) is the **1 s full-IDR** — large, slow to encode *and* slow to transfer, so it also
+   spikes `send→arrive`. Lengthen the GOP + on-demand keyframe back-channel (F) and/or intra-refresh
+   (E). Fixes a tail visible in *two* stages.
+5. **PR 2 (real-time scheduling)** for the remaining broad `capture→encode` p95/max tail.
+6. **PR 3 / PR 4** (decoder hints, vsync) — polish; `arrive→decode` (~12 ms) and `decode→present`
+   (~13 ms, one vsync) are already near their hardware floor.
+
+**New ranked order: revert PR 1 → PR 5 → PR 6 → PR 2 → (PR 1 redux) → PR 3/4.**
+
+## 8. Result after the drain-loop fix (GH #27) — measured 2026-06-07 — **TARGET MET**
+
+After reverting PR 1, investigating why `decode→present` was stuck at ~12.7 ms regardless of the
+present call uncovered the real bug: `drain_output` polled `dequeueOutputBuffer` with the full 10 ms
+`DEQUEUE_TIMEOUT_US` on **every** iteration, so the trailing "any more buffers?" poll **blocked
+~10 ms every frame** on the single decode thread. Fix: block only for the *first* buffer, poll the
+rest with timeout 0. Measured on device (M1 + Pixel 6a, 2400×1080@60, offset −10.18 s / rtt 330 µs):
+
+| stage | §7 (reverted baseline) | **after drain fix (n=593)** | verdict |
+|---|---|---|---|
+| capture→encode | ~12 ms p50 (p95 ~86) | 10.2 p50 / 12.5 p95 | fine (IDR max 60) |
+| encode→send | ~0.5 ms p50 | 0.48 p50 | fine |
+| **send→arrive** | **~30–42 ms p50** | **0.47 p50 / 1.2 p95** | **COLLAPSED** ✅ |
+| arrive→decode | ~12 ms p50 | 20.1 p50 / 47 p95 | Tensor decode floor (now dominant) |
+| **decode→present** | **~12.7 ms p50** | **1.79 p50** | **COLLAPSED** ✅ |
+| **GLASS→GLASS** | **~110 ms p50** | **33.7 p50 / 60 p95** | **< 50 ms target MET** 🎯 |
+
+**Root cause, finally:** the ~10 ms/frame trailing-dequeue block **compounded** — the single
+read+decode thread fell ~10 ms behind every frame, so a ~30–42 ms standing queue built up in the
+phone's USB receive buffer and surfaced as `send→arrive`. It was *also* mis-measured as
+`decode→present` (the 10 ms sat between the decode-complete and present stamps). Removing it
+collapsed **both** stages at once, with `dropped = 0` throughout (the phone genuinely keeps up).
+
+**Honesty caveat:** PR 4 stamps `present_us` at the present *handoff*, not the actual scanout, so
+the measured 33.7 ms under-counts the final photons by ~one vsync. **Real glass-to-glass ≈ 42–50 ms
+— at the ~43 ms hardware floor.** Still a real ~2.5× improvement and at the floor.
+
+**What's left (polish, not median):** `arrive→decode` (~20 ms p50) is now the largest stage — the
+Tensor decode floor, near-irreducible. The p95 (~60 ms) and a one-time startup spike (first ~11
+frames: `arrive→decode` ~135 ms while the decoder primes) are the remaining tails → PR 6 (IDR
+bubble) / PR 7 (cold start). Per the plan's own rule, with p50 < 50 ms the remaining PRs are
+jitter/robustness polish, not median wins.
+
+**Meta-lesson:** a stage pinned at *exactly* a timeout value (12 ms ≈ the 10 ms `DEQUEUE_TIMEOUT_US`)
+is almost always a blocking-poll artifact, not real latency. Two earlier rounds mis-attributed it to
+the present (vsync coupling). Check the timeout constant before believing a stage.
+
 ## Sources
 Moonlight `MediaCodecHelper.java` / `MediaCodecDecoderRenderer.java`; AOSP low-latency-media;
 Android MediaCodec async ref; Apollo #1308 (Tensor decode latency); scrcpy develop.md /
