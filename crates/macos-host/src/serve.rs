@@ -388,12 +388,12 @@ pub fn run_host(opts: &HostOpts, stop: &AtomicBool) -> std::io::Result<()> {
     let fps = opts.fps;
 
     // --- 1. Virtual display (held alive for the whole session) ----------------
-    // Item 2: present as a named, HiDPI external display placed to the right of the main
-    // display. Stable identity (DisplayConfig defaults) lets macOS remember any manual
-    // rearrange. `vdisplay` is held alive across the whole reconnect loop and dropped exactly
-    // once in the final teardown (on `stop`) — a disconnect keeps it warm, so the desktop never
-    // reflows on replug.
-    println!("rustscreen: creating virtual display {W}×{H}@{fps} (HiDPI, right of main)…");
+    // Item 2: present as a named, HiDPI external display placed at the bottom-right of the main
+    // display (Side::Right is bottom-aligned — see arrangement_origin). Stable identity
+    // (DisplayConfig defaults) lets macOS remember any manual rearrange. `vdisplay` is held alive
+    // across the whole reconnect loop and dropped exactly once in the final teardown (on `stop`)
+    // — a disconnect keeps it warm, so the desktop never reflows on replug.
+    println!("rustscreen: creating virtual display {W}×{H}@{fps} (HiDPI, bottom-right of main)…");
     let cfg = DisplayConfig::new(W as u32, H as u32, fps as f64)
         .with_hidpi(true)
         .arranged(Side::Right);
