@@ -64,16 +64,34 @@ mod android {
     use jni::objects::JClass;
     use jni::JNIEnv;
 
+    /// Run a JNI entry-point body under `catch_unwind` so a Rust `panic!` can never unwind across
+    /// the `extern "system"` FFI boundary (BL-03) — that is undefined behavior and aborts the host
+    /// Android process. A caught panic is logged and swallowed; the JNI call returns normally.
+    /// `AssertUnwindSafe` is sound here: on a caught panic we do not observe the closure's captured
+    /// state again. (`nativeOnUsbFd` inlines its own variant because it threads a return value.)
+    fn jni_guard(name: &str, body: impl FnOnce()) {
+        if let Err(panic) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(body)) {
+            let msg = panic
+                .downcast_ref::<&str>()
+                .map(|s| s.to_string())
+                .or_else(|| panic.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "unknown panic payload".to_string());
+            log::error!("{name}: caught panic, not unwinding across FFI: {msg}");
+        }
+    }
+
     /// Called once from Kotlin `MainActivity` at startup. P0: just proves the JNI bridge works.
     #[no_mangle]
     pub extern "system" fn Java_com_rustscreen_client_MainActivity_nativeInit(
         _env: JNIEnv,
         _class: JClass,
     ) {
-        android_logger::init_once(
-            android_logger::Config::default().with_max_level(log::LevelFilter::Info),
-        );
-        log::info!("hello from Rust");
+        jni_guard("nativeInit", || {
+            android_logger::init_once(
+                android_logger::Config::default().with_max_level(log::LevelFilter::Info),
+            );
+            log::info!("hello from Rust");
+        });
     }
 
     /// Called from Kotlin after `UsbManager.openAccessory()` → `ParcelFileDescriptor` →
@@ -229,17 +247,19 @@ mod android {
     ) {
         use crate::mediacodec::NativeWindow;
 
-        // SAFETY: `env` is the live JNI env for this thread; `surface` is the non-null Surface
-        // JNI passed us (Kotlin only calls this with a valid created surface).
-        let window = match unsafe { NativeWindow::from_surface(env.get_raw(), surface) } {
-            Some(w) => w,
-            None => {
-                log::error!("nativeOnSurface: ANativeWindow_fromSurface returned null");
-                return;
-            }
-        };
-        log::info!("nativeOnSurface: surface ready — depositing for the USB decode session");
-        SURFACE_SLOT.put(window);
+        jni_guard("nativeOnSurface", || {
+            // SAFETY: `env` is the live JNI env for this thread; `surface` is the non-null Surface
+            // JNI passed us (Kotlin only calls this with a valid created surface).
+            let window = match unsafe { NativeWindow::from_surface(env.get_raw(), surface) } {
+                Some(w) => w,
+                None => {
+                    log::error!("nativeOnSurface: ANativeWindow_fromSurface returned null");
+                    return;
+                }
+            };
+            log::info!("nativeOnSurface: surface ready — depositing for the USB decode session");
+            SURFACE_SLOT.put(window);
+        });
     }
 
     /// Called from `SurfaceHolder.Callback.surfaceDestroyed`. Retracts any window still sitting
@@ -256,7 +276,9 @@ mod android {
         _env: JNIEnv,
         _class: JClass,
     ) {
-        log::info!("nativeOnSurfaceDestroyed: surface gone — retracting any unclaimed window");
-        SURFACE_SLOT.clear();
+        jni_guard("nativeOnSurfaceDestroyed", || {
+            log::info!("nativeOnSurfaceDestroyed: surface gone — retracting any unclaimed window");
+            SURFACE_SLOT.clear();
+        });
     }
 }
