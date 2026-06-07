@@ -8,11 +8,15 @@
 //! the identical, on-device-verified code path. Compiled ONLY under `live-capture,live-usb`;
 //! the whole module is gated so the per-item attributes the spike carried are unnecessary here.
 //!
-//! Two behaviors beyond the spike, both driven by the `stop` flag the caller owns:
+//! Three behaviors beyond the spike, all driven by the `stop` flag the caller owns:
 //! - **wait-for-phone**: bring-up retries until the accessory appears or `stop` is set, so
 //!   `rustscreen start` can be run before the phone is plugged in;
-//! - **clean teardown**: an external `stop` (─→ `rustscreen stop` → SIGTERM) breaks the stream
-//!   into the normal teardown path, dropping the virtual display so the Mac desktop reflows.
+//! - **auto-reconnect**: a plain disconnect (replug, sleep/wake, write error) loops `run_host`
+//!   back to wait-for-phone, keeping the virtual display + capture/encoder **warm** (no desktop
+//!   reflow, no encoder cold-start) so a replug recovers in ~1–2 s rather than ending the session;
+//! - **clean teardown**: an external `stop` (─→ `rustscreen stop` → SIGTERM) breaks the loop
+//!   into the single final teardown — the ONLY time the virtual display is dropped and the Mac
+//!   desktop reflows.
 #![cfg(all(feature = "live-capture", feature = "live-usb"))]
 
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
@@ -76,13 +80,16 @@ struct FrameSinkIvars {
     in_flight: Arc<AtomicUsize>,
     /// Count of capture frames shed pre-encode because `in_flight` was at the cap (diagnostic).
     dropped: Arc<AtomicUsize>,
-    /// Set by the encode handler when a fully-ENCODED frame is dropped post-encode (channel
-    /// `Full`). The capture delegate consumes it to force the NEXT submitted frame to an IDR:
-    /// a dropped P-frame leaves VideoToolbox's reference state pointing at an access unit the
-    /// phone never received, so without a resync every later P-frame references the gap and the
-    /// decoder shows artifacts until the next periodic keyframe (up to ~1 s at MaxKeyFrameInterval
-    /// = 60). Unlike the pre-encode in-flight drop above, which keeps the stream valid with no
-    /// resync because VideoToolbox never sees the shed frame.
+    /// Forces the NEXT submitted frame to an IDR. The capture delegate consumes the flag at
+    /// VT-submit time. Set from two places:
+    /// - the encode handler, when a fully-ENCODED frame is dropped post-encode (channel `Full`):
+    ///   a dropped P-frame leaves VideoToolbox's reference state pointing at an access unit the
+    ///   phone never received, so without a resync every later P-frame references the gap and the
+    ///   decoder shows artifacts until the next periodic keyframe (up to ~1 s at MaxKeyFrameInterval
+    ///   = 60). Unlike the pre-encode in-flight drop above, which keeps the stream valid with no
+    ///   resync because VideoToolbox never sees the shed frame.
+    /// - the reconnect loop, on each (re)connect: a freshly reconnected MediaCodec can only start
+    ///   from a keyframe, so the loop forces an IDR before streaming to the new phone decoder.
     needs_keyframe: Arc<AtomicBool>,
 }
 
@@ -323,8 +330,44 @@ unsafe fn block_buffer_bytes(sbuf: &CMSampleBuffer) -> Option<Vec<u8>> {
     Some(buf)
 }
 
-/// Run the host until the phone disconnects or `stop` is set. On every return path the virtual
-/// display has been dropped so the Mac desktop reflows.
+/// Why a single connection ended — drives the reconnect loop.
+#[derive(Debug, PartialEq, Eq)]
+enum ConnEnd {
+    /// `rustscreen stop` / SIGTERM was requested → break the loop into final teardown.
+    Stopped,
+    /// The phone went away (replug, sleep, write error) → loop and wait for it again.
+    Disconnected,
+}
+
+/// Classify a finished connection. `stop` is the only thing that means "shut down":
+/// whether the stream returned `Ok` or `Err`, an unset `stop` means the phone is gone
+/// and we should reconnect.
+fn classify_connection_end(stop_requested: bool) -> ConnEnd {
+    if stop_requested {
+        ConnEnd::Stopped
+    } else {
+        ConnEnd::Disconnected
+    }
+}
+
+/// Drain every buffered item from `rx` without blocking; returns how many were discarded.
+/// Best-effort hygiene on (re)connect: sheds the stale frames the warm channel buffered while
+/// no phone was consuming, so we don't ship a backlog of pre-disconnect access units. It does
+/// NOT by itself guarantee a keyframe leads the connection — a P-frame already in flight can
+/// still race ahead of the forced IDR after the drain. The actual "first delivered frame is a
+/// keyframe" guarantee is the consumer-side `seen_keyframe` guard in
+/// [`session::run_stream_session_instrumented`], which drops leading non-keyframes per connection.
+fn drain_frames<T>(rx: &std::sync::mpsc::Receiver<T>) -> usize {
+    let mut n = 0;
+    while rx.try_recv().is_ok() {
+        n += 1;
+    }
+    n
+}
+
+/// Run the host, auto-reconnecting across phone disconnects until `stop` is set. The virtual
+/// display and capture/encoder stay warm across reconnects (no desktop reflow, no cold start);
+/// the display is dropped exactly once, in the final teardown when `stop` is requested.
 pub fn run_host(opts: &HostOpts, stop: &AtomicBool) -> std::io::Result<()> {
     use cg_virtual_display::{DisplayConfig, Side, VirtualDisplay};
     use objc2::rc::Retained;
@@ -347,7 +390,9 @@ pub fn run_host(opts: &HostOpts, stop: &AtomicBool) -> std::io::Result<()> {
     // --- 1. Virtual display (held alive for the whole session) ----------------
     // Item 2: present as a named, HiDPI external display placed to the right of the main
     // display. Stable identity (DisplayConfig defaults) lets macOS remember any manual
-    // rearrange; dropping `vdisplay` on disconnect tears it down so the desktop reflows.
+    // rearrange. `vdisplay` is held alive across the whole reconnect loop and dropped exactly
+    // once in the final teardown (on `stop`) — a disconnect keeps it warm, so the desktop never
+    // reflows on replug.
     println!("rustscreen: creating virtual display {W}×{H}@{fps} (HiDPI, right of main)…");
     let cfg = DisplayConfig::new(W as u32, H as u32, fps as f64)
         .with_hidpi(true)
@@ -501,27 +546,14 @@ pub fn run_host(opts: &HostOpts, stop: &AtomicBool) -> std::io::Result<()> {
     }
     println!("rustscreen: rate control set — 20 Mbit/s avg, keyframe every 1 s ({fps} fps).");
 
-    // --- 5. Bring up the live AOA transport (P1 sequence), waiting for the phone ----
-    // Done BEFORE starting capture so we don't buffer frames with no consumer. The connect
-    // hello (read inside bring_up_aoa) also guarantees the phone's reader is live before we write.
-    // Wait-for-phone: retry until the accessory appears or `stop` is requested, so the daemon can
-    // be started before the phone is plugged in.
-    println!("rustscreen: waiting for the phone (open the app to start streaming)…");
-    let mut transport = loop {
-        if stop.load(Ordering::Relaxed) {
-            drop(vdisplay); // early-out before any stream: tear the display down explicitly
-            return Ok(());
-        }
-        match bring_up_aoa() {
-            Ok(t) => break t,
-            Err(_) => std::thread::sleep(Duration::from_millis(200)),
-        }
-    };
-
-    // --- 6. Wire the push→pull bridge and start capture -----------------------
+    // --- 5. Wire the push→pull bridge and start capture (ONCE, kept warm) -----
     // Bounded hand-off so the producer (60 fps capture+encode) cannot outrun the consumer
     // (~45 fps, gated by the per-frame USB write). Depth 2 = one being-sent + one ready;
     // `try_send` in the encode handler drops the surplus instead of growing latency. (TODO #5)
+    // Capture is started BEFORE the reconnect loop and kept running across reconnects so a replug
+    // pays no cold-start cost. While no phone is connected the depth-2 channel harmlessly drops the
+    // surplus (no consumer reads); on (re)connect we force an IDR and drain the stale frames so the
+    // fresh decoder shows a clean image (step (A) below).
     let (tx, rx) = mpsc::sync_channel::<EncodedFrame>(2);
     let params: ParamCache = Arc::new(Mutex::new(None));
     let sink = FrameSink::new(session.clone(), tx, Arc::clone(&params));
@@ -563,196 +595,258 @@ pub fn run_host(opts: &HostOpts, stop: &AtomicBool) -> std::io::Result<()> {
         }
     }
 
-    // --- 7. Handshake + clock-sync on the full-duplex transport ---------------
-    // Latency instrumentation: do the handshake explicitly (rather than letting
-    // run_stream_session do it internally) so we can run an SNTP-style clock-sync BEFORE
-    // streaming, then split the transport into independent read/write halves — a dedicated reader
-    // thread pulls inbound `Frame::Stats` while the main thread streams video on the write half.
+    // Per-connection items used inside the reconnect loop below.
     use crate::session;
     use protocol::clock::{self, ClockOffset};
     use protocol::messages::Frame;
 
-    let offer = session::host_handshake(W as u32, H as u32, fps);
-    // Capture the negotiated AgreedConfig and thread it into the stream loop, rather than
-    // discarding it and re-deriving the codec from the offer.
-    let agreed = match session::perform_handshake(&mut transport, offer) {
-        Ok(a) => a,
-        Err(e) => {
-            drop(vdisplay);
-            return Err(std::io::Error::other(format!("handshake failed: {e}")));
+    // --- 6. Reconnect loop: (re)bring-up → handshake → clock-sync → stream -----
+    // Everything above (virtual display, capture, encoder, channel) is warm and shared; each
+    // iteration rebuilds only the per-connection half (AOA transport, reader thread, clock-sync,
+    // stream). `stop` breaks the loop into the single teardown below; a plain disconnect loops back.
+    println!("rustscreen: waiting for the phone (open the app to start streaming)…");
+    'reconnect: loop {
+        if stop.load(Ordering::Relaxed) {
+            break 'reconnect;
         }
-    };
-    println!(
-        "rustscreen: handshake OK ({:?} {}×{}@{}) — running clock-sync…",
-        agreed.codec, agreed.width, agreed.height, agreed.refresh_hz
-    );
 
-    // --- 7b. Split the transport; spawn the single inbound-frame reader -------
-    // Split BEFORE clock-sync so ONE reader thread owns the read half and dispatches every
-    // inbound frame — `ClockPong` (stamping t3 on receipt and forwarding it for the bounded
-    // clock-sync wait) and `Frame::Stats` (forwarded to the stream loop). This makes the blocking
-    // bulk-IN read live entirely on the reader thread, so clock-sync no longer does its own
-    // blocking read, and teardown does not depend on unblocking a pending IN read from the main
-    // thread: the reader polls a stop flag between whole frames (via nusb's read timeout, which
-    // does NOT corrupt framing because it only fires while no bytes of a frame are buffered).
-    let (read_half, mut write_half) = transport.split();
-    // Pipeline up to 4 in-flight bulk-OUT transfers so the writer can submit the next chunk
-    // before the previous one completes (lower host→phone send latency; ROADMAP latency lever #1).
-    write_half.set_num_transfers(4);
-    // Bound how long a flush waits before erroring instead of hanging forever. nusb's
-    // EndpointWrite defaults its write timeout to Duration::MAX, so if the phone stops draining
-    // the bulk-OUT endpoint the stream loop wedges permanently inside flush() (observed: 1 frame
-    // sent, then 4+ minutes of silence — even the ~2s latency report never fired). A finite
-    // timeout turns that wedge into a clean session-end: the flush returns an error and the loop
-    // unwinds into teardown (which drops the virtual display) instead of blocking forever. 5s is
-    // generous — active streaming completes each transfer in milliseconds, so this only fires on
-    // a real persistent stall, never on the healthy streaming path.
-    write_half.set_write_timeout(Duration::from_secs(5));
-    let reader_local_stop = Arc::new(AtomicBool::new(false));
-    let (pong_tx, pong_rx) = mpsc::channel::<(Frame, u64)>();
-    let (stats_tx, stats_rx) = mpsc::channel::<Frame>();
-    let reader_stop = Arc::clone(&reader_local_stop);
-    let reader = std::thread::spawn(move || {
-        let mut read_half = read_half;
-        // A bounded per-read timeout lets the reader notice the stop flag promptly while idle
-        // between frames (the dominant teardown case) instead of blocking forever on a bulk IN
-        // the phone will never satisfy once capture stops. nusb keeps the pending transfer alive
-        // across a timeout, so re-issuing the read loses no data.
-        read_half.set_read_timeout(Duration::from_millis(250));
-        loop {
-            if reader_stop.load(Ordering::Relaxed) {
-                break;
+        // --- 6a. Bring up the live AOA transport (P1 sequence), waiting for the phone ----
+        // The connect hello (read inside bring_up_aoa) guarantees the phone's reader is live before
+        // we write. Wait-for-phone: retry until the accessory appears or `stop` is requested. No
+        // drop(vdisplay) here anymore — teardown is centralized after the loop.
+        let mut transport = loop {
+            if stop.load(Ordering::Relaxed) {
+                break 'reconnect;
             }
-            match Frame::read_from(&mut read_half) {
-                Ok(frame @ Frame::ClockPong { .. }) => {
-                    // Stamp t3 on receipt (shared monotonic origin) and forward for the
-                    // bounded clock-sync wait. If the main thread already moved on, ignore.
-                    let _ = pong_tx.send((frame, now_us()));
-                }
-                Ok(frame @ Frame::Stats { .. }) => {
-                    if stats_tx.send(frame).is_err() {
-                        break; // main thread ended
-                    }
-                }
-                Ok(_) => {} // ignore other inbound frames
-                Err(e) => {
-                    // A timeout just means "no frame this window" — loop and re-check the stop
-                    // flag. Any other error means the peer is gone / framing broke → exit.
-                    if matches!(&e, protocol::messages::MessageError::Io(io)
-                        if io.kind() == std::io::ErrorKind::TimedOut)
-                    {
-                        continue;
-                    }
+            match bring_up_aoa() {
+                Ok(t) => break t,
+                Err(_) => std::thread::sleep(Duration::from_millis(200)),
+            }
+        };
+
+        // --- 6b. Reconnect hygiene: clean IDR + drop stale pre-disconnect frames ---
+        // Force the next submitted frame to an IDR so the fresh phone decoder has a keyframe to sync
+        // on, and drain the frames the encoder pushed into the warm channel while no phone was
+        // connected so we don't ship a stale backlog. These two are best-effort producer-side
+        // hygiene; the hard guarantee that the connection's first *delivered* frame is a keyframe is
+        // the consumer-side `seen_keyframe` guard in the stream loop, which drops any leading
+        // non-keyframe (closing the race where an in-flight P-frame beats the forced IDR).
+        sink.ivars().needs_keyframe.store(true, Ordering::Relaxed);
+        let drained = drain_frames(&rx);
+        if drained > 0 {
+            println!("rustscreen: reconnect — dropped {drained} stale frame(s) before keyframe.");
+        }
+
+        // --- 6c. Handshake + clock-sync on the full-duplex transport ---------------
+        // Latency instrumentation: do the handshake explicitly (rather than letting
+        // run_stream_session do it internally) so we can run an SNTP-style clock-sync BEFORE
+        // streaming, then split the transport into independent read/write halves — a dedicated reader
+        // thread pulls inbound `Frame::Stats` while the main thread streams video on the write half.
+        let offer = session::host_handshake(W as u32, H as u32, fps);
+        // Capture the negotiated AgreedConfig and thread it into the stream loop, rather than
+        // discarding it and re-deriving the codec from the offer.
+        let agreed = match session::perform_handshake(&mut transport, offer) {
+            Ok(a) => a,
+            Err(e) => {
+                // Self-healing: a failed handshake is treated like a disconnect. Warn and reconnect
+                // (transport drops at iteration end). Do NOT drop(vdisplay) or return — the display
+                // and capture stay warm for the retry.
+                eprintln!("rustscreen: handshake failed ({e}); waiting for the phone again…");
+                continue 'reconnect;
+            }
+        };
+        println!(
+            "rustscreen: handshake OK ({:?} {}×{}@{}) — running clock-sync…",
+            agreed.codec, agreed.width, agreed.height, agreed.refresh_hz
+        );
+
+        // --- 6d. Split the transport; spawn the single inbound-frame reader -------
+        // Split BEFORE clock-sync so ONE reader thread owns the read half and dispatches every
+        // inbound frame — `ClockPong` (stamping t3 on receipt and forwarding it for the bounded
+        // clock-sync wait) and `Frame::Stats` (forwarded to the stream loop). This makes the blocking
+        // bulk-IN read live entirely on the reader thread, so clock-sync no longer does its own
+        // blocking read, and teardown does not depend on unblocking a pending IN read from the main
+        // thread: the reader polls a stop flag between whole frames (via nusb's read timeout, which
+        // does NOT corrupt framing because it only fires while no bytes of a frame are buffered).
+        let (read_half, mut write_half) = transport.split();
+        // Pipeline up to 4 in-flight bulk-OUT transfers so the writer can submit the next chunk
+        // before the previous one completes (lower host→phone send latency; ROADMAP latency lever #1).
+        write_half.set_num_transfers(4);
+        // Bound how long a flush waits before erroring instead of hanging forever. nusb's
+        // EndpointWrite defaults its write timeout to Duration::MAX, so if the phone stops draining
+        // the bulk-OUT endpoint the stream loop wedges permanently inside flush() (observed: 1 frame
+        // sent, then 4+ minutes of silence — even the ~2s latency report never fired). A finite
+        // timeout turns that wedge into a clean session-end: the flush returns an error and the loop
+        // unwinds into teardown (which loops back to wait for the phone) instead of blocking forever.
+        // 5s is generous — active streaming completes each transfer in milliseconds, so this only
+        // fires on a real persistent stall, never on the healthy streaming path.
+        write_half.set_write_timeout(Duration::from_secs(5));
+        let reader_local_stop = Arc::new(AtomicBool::new(false));
+        let (pong_tx, pong_rx) = mpsc::channel::<(Frame, u64)>();
+        let (stats_tx, stats_rx) = mpsc::channel::<Frame>();
+        let reader_stop = Arc::clone(&reader_local_stop);
+        let reader = std::thread::spawn(move || {
+            let mut read_half = read_half;
+            // A bounded per-read timeout lets the reader notice the stop flag promptly while idle
+            // between frames (the dominant teardown case) instead of blocking forever on a bulk IN
+            // the phone will never satisfy once capture stops. nusb keeps the pending transfer alive
+            // across a timeout, so re-issuing the read loses no data.
+            read_half.set_read_timeout(Duration::from_millis(250));
+            loop {
+                if reader_stop.load(Ordering::Relaxed) {
                     break;
                 }
-            }
-        }
-    });
-
-    // --- 7c. Clock-sync over the split halves (bounded, degrades gracefully) ---
-    // Send the ping on the write half; the reader forwards the pong (with its t3). Wait at most
-    // 2 s: if no pong arrives, degrade to offset=None (host-only stage timings, no glass-to-glass)
-    // instead of hanging.
-    let offset: Option<ClockOffset> = {
-        use std::io::Write as _;
-        let t0 = now_us();
-        let ping = Frame::ClockPing { t0_us: t0 };
-        let ping_sent = ping
-            .write_to(&mut write_half)
-            .and_then(|()| write_half.flush().map_err(Into::into));
-        match ping_sent {
-            Ok(()) => match pong_rx.recv_timeout(Duration::from_secs(2)) {
-                Ok((Frame::ClockPong { t1_us, t2_us, .. }, t3)) => {
-                    let off = clock::estimate(t0, t1_us, t2_us, t3);
-                    println!(
-                        "rustscreen: clock-sync OK — offset={} µs, rtt={} µs (±rtt/2 precision).",
-                        off.offset_us, off.rtt_us
-                    );
-                    Some(off)
+                match Frame::read_from(&mut read_half) {
+                    Ok(frame @ Frame::ClockPong { .. }) => {
+                        // Stamp t3 on receipt (shared monotonic origin) and forward for the
+                        // bounded clock-sync wait. If the main thread already moved on, ignore.
+                        let _ = pong_tx.send((frame, now_us()));
+                    }
+                    Ok(frame @ Frame::Stats { .. }) => {
+                        if stats_tx.send(frame).is_err() {
+                            break; // main thread ended
+                        }
+                    }
+                    Ok(_) => {} // ignore other inbound frames
+                    Err(e) => {
+                        // A timeout just means "no frame this window" — loop and re-check the stop
+                        // flag. Any other error means the peer is gone / framing broke → exit.
+                        if matches!(&e, protocol::messages::MessageError::Io(io)
+                            if io.kind() == std::io::ErrorKind::TimedOut)
+                        {
+                            continue;
+                        }
+                        break;
+                    }
                 }
-                Ok(_) => None, // reader only forwards pongs here, but be defensive
-                Err(_) => {
+            }
+        });
+
+        // --- 6e. Clock-sync over the split halves (bounded, degrades gracefully) ---
+        // Send the ping on the write half; the reader forwards the pong (with its t3). Wait at most
+        // 2 s: if no pong arrives, degrade to offset=None (host-only stage timings, no glass-to-glass)
+        // instead of hanging.
+        let offset: Option<ClockOffset> = {
+            use std::io::Write as _;
+            let t0 = now_us();
+            let ping = Frame::ClockPing { t0_us: t0 };
+            let ping_sent = ping
+                .write_to(&mut write_half)
+                .and_then(|()| write_half.flush().map_err(Into::into));
+            match ping_sent {
+                Ok(()) => match pong_rx.recv_timeout(Duration::from_secs(2)) {
+                    Ok((Frame::ClockPong { t1_us, t2_us, .. }, t3)) => {
+                        let off = clock::estimate(t0, t1_us, t2_us, t3);
+                        println!(
+                            "rustscreen: clock-sync OK — offset={} µs, rtt={} µs (±rtt/2 precision).",
+                            off.offset_us, off.rtt_us
+                        );
+                        Some(off)
+                    }
+                    Ok(_) => None, // reader only forwards pongs here, but be defensive
+                    Err(_) => {
+                        eprintln!(
+                            "rustscreen: clock-sync timed out (no pong in 2 s); continuing with \
+                             host-only stage timings (glass-to-glass unavailable)."
+                        );
+                        None
+                    }
+                },
+                Err(e) => {
                     eprintln!(
-                        "rustscreen: clock-sync timed out (no pong in 2 s); continuing with \
-                         host-only stage timings (glass-to-glass unavailable)."
+                        "rustscreen: clock-sync ping failed ({e}); continuing with host-only stage \
+                         timings (glass-to-glass unavailable)."
                     );
                     None
                 }
-            },
-            Err(e) => {
-                eprintln!(
-                    "rustscreen: clock-sync ping failed ({e}); continuing with host-only stage \
-                     timings (glass-to-glass unavailable)."
+            }
+        };
+
+        // --- 6f. Instrumented stream until the phone disconnects or `stop` is set --
+        println!("rustscreen: streaming with live latency instrumentation…");
+        let mut pipeline = crate::latency::PipelineLatency::new(256);
+        let result = session::run_stream_session_instrumented(
+            &rx,
+            &mut write_half,
+            agreed,
+            offset,
+            &stats_rx,
+            &mut pipeline,
+            Duration::from_secs(1), // heartbeat / idle-disconnect probe
+            Duration::from_secs(2), // print a latency report every ~2 s
+            now_us,
+            |report| print_report(report, offset),
+            stop, // external stop (rustscreen stop → SIGTERM) breaks the stream into teardown
+        );
+
+        // `dropped`/`in_flight` live in the warm FrameSink and are NOT reset per reconnect, so
+        // these are cumulative across every connection since the host started — labelled as such
+        // so a climbing "shed" count across replugs doesn't read as a per-connection anomaly.
+        println!(
+            "rustscreen: encoder pacing — shed {} frames cumulative since host start (in-flight cap \
+             + channel backpressure); current in-flight depth {}.",
+            sink.ivars().dropped.load(Ordering::Relaxed),
+            sink.ivars().in_flight.load(Ordering::Relaxed),
+        );
+
+        // This connection's final latency report.
+        print_report(&pipeline.report(), offset);
+        match &result {
+            Ok(summary) => println!(
+                "rustscreen: connection ended cleanly — {} frames, {} bytes sent; encode mean {:.2} ms.",
+                summary.frames,
+                summary.bytes_sent,
+                summary.latency.mean().map_or(0.0, |m| m / 1000.0),
+            ),
+            Err(e) => eprintln!("rustscreen: connection ended (likely disconnect): {e}"),
+        }
+
+        // --- 6g. Per-connection teardown: drop write half + stop/join the reader ----
+        // Capture and the virtual display stay warm — only the per-connection USB half is torn down.
+        drop(write_half); // closing the write half also signals the peer we are done
+                          // Signal the reader to stop; it observes this between frames via its read timeout. We do
+                          // NOT block indefinitely on join: in the pathological case where the reader is parked
+                          // mid-frame inside a transfer, joining could hang teardown — so we give it a bounded grace
+                          // period and otherwise let the detached thread die with the process. (nusb cannot cancel
+                          // another thread's in-flight read from here, so a timeout-bounded join is the robust path.)
+        reader_local_stop.store(true, Ordering::Relaxed);
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while !reader.is_finished() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        if reader.is_finished() {
+            let _ = reader.join();
+        } else {
+            eprintln!(
+                "rustscreen: reader thread still parked on a bulk-IN read at teardown; detaching it \
+                 (it will die with the process) so exit does not hang."
+            );
+        }
+
+        // --- 6h. stop → break to the single teardown; disconnect → reconnect -------
+        // The virtual display + capture stay warm across a disconnect, so a replug pays no cold start.
+        match classify_connection_end(stop.load(Ordering::Relaxed)) {
+            ConnEnd::Stopped => break 'reconnect,
+            ConnEnd::Disconnected => {
+                println!(
+                    "rustscreen: phone disconnected — waiting for replug (display kept alive)…"
                 );
-                None
+                continue 'reconnect;
             }
         }
-    };
+    }
 
-    // --- 7d. Instrumented stream until the phone disconnects or `stop` is set --
-    println!("rustscreen: streaming with live latency instrumentation…");
-    let mut pipeline = crate::latency::PipelineLatency::new(256);
-    let result = session::run_stream_session_instrumented(
-        rx,
-        &mut write_half,
-        agreed,
-        offset,
-        &stats_rx,
-        &mut pipeline,
-        Duration::from_secs(1), // heartbeat / idle-disconnect probe
-        Duration::from_secs(2), // print a latency report every ~2 s
-        now_us,
-        |report| print_report(report, offset),
-        stop, // external stop (rustscreen stop → SIGTERM) breaks the stream into teardown
-    );
-
-    println!(
-        "rustscreen: encoder pacing — shed {} frames total (in-flight cap + channel backpressure); \
-         final in-flight depth {}.",
-        sink.ivars().dropped.load(Ordering::Relaxed),
-        sink.ivars().in_flight.load(Ordering::Relaxed),
-    );
-
-    // --- 8. Teardown ----------------------------------------------------------
+    // --- 7. Single final teardown (runs once, on stop) ------------------------
+    // Stop capture and drop the virtual display exactly once here — the ONLY desktop reflow, on
+    // shutdown. Disconnects never reach this; they loop back with the display kept alive.
     let (stop_tx, stop_rx) = mpsc::channel::<()>();
     let stop_handler = block2::RcBlock::new(move |_e: *mut NSError| {
         let _ = stop_tx.send(());
     });
     unsafe { stream.stopCaptureWithCompletionHandler(Some(&stop_handler)) };
     let _ = stop_rx.recv_timeout(Duration::from_secs(5));
-    drop(vdisplay); // remove the virtual display so the Mac desktop reflows
-    drop(write_half); // closing the write half also signals the peer we are done
-                      // Signal the reader to stop; it observes this between frames via its read timeout. We do NOT
-                      // block indefinitely on join: in the pathological case where the reader is parked mid-frame
-                      // inside a transfer, joining could hang teardown — so we give it a bounded grace period and
-                      // otherwise let the detached thread die with the process. (nusb cannot cancel another
-                      // thread's in-flight read from here, so a timeout-bounded join is the robust teardown.)
-    reader_local_stop.store(true, Ordering::Relaxed);
-    let deadline = std::time::Instant::now() + Duration::from_secs(2);
-    while !reader.is_finished() && std::time::Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    if reader.is_finished() {
-        let _ = reader.join();
-    } else {
-        eprintln!(
-            "rustscreen: reader thread still parked on a bulk-IN read at teardown; detaching it \
-             (it will die with the process) so exit does not hang."
-        );
-    }
-
-    // Final latency report on exit.
-    print_report(&pipeline.report(), offset);
-
-    match result {
-        Ok(summary) => println!(
-            "rustscreen: session ended cleanly — {} frames, {} bytes sent; encode mean {:.2} ms.",
-            summary.frames,
-            summary.bytes_sent,
-            summary.latency.mean().map_or(0.0, |m| m / 1000.0),
-        ),
-        Err(e) => eprintln!("rustscreen: session ended with error (likely disconnect): {e}"),
-    }
+    drop(vdisplay); // remove the virtual display — the ONLY desktop reflow, on shutdown
+    println!("rustscreen: host stopped — virtual display removed.");
     Ok(())
 }
 
@@ -817,6 +911,32 @@ fn print_report(r: &crate::latency::LatencyReport, offset: Option<protocol::cloc
         "  dropped frames (drop-to-keyframe shed load): {}",
         r.dropped_frames
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stop_requested_means_stopped_else_disconnected() {
+        assert_eq!(classify_connection_end(true), ConnEnd::Stopped);
+        assert_eq!(classify_connection_end(false), ConnEnd::Disconnected);
+    }
+
+    #[test]
+    fn drain_frames_discards_all_buffered_and_counts_them() {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<u8>(4);
+        tx.send(1).unwrap();
+        tx.send(2).unwrap();
+        assert_eq!(drain_frames(&rx), 2, "drains both buffered items");
+        assert_eq!(drain_frames(&rx), 0, "nothing left to drain");
+        drop(tx);
+        assert_eq!(
+            drain_frames(&rx),
+            0,
+            "disconnected sender drains to zero too"
+        );
+    }
 }
 
 /// Bring up the live AOA transport and read the device's connect-hello.
