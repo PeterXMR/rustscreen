@@ -268,8 +268,15 @@ pub fn sps_dimensions(sps: &[u8]) -> Option<(u32, u32)> {
     }
     let _direct_8x8_inference_flag = r.u(1)?;
 
-    let width = (pic_width_in_mbs_minus1 + 1) * 16;
-    let height = (2 - frame_mbs_only_flag) * (pic_height_in_map_units_minus1 + 1) * 16;
+    // Checked arithmetic: `pic_width/height_*_minus1` come straight from `ue()` and can be
+    // hostile (up to ~u32::MAX) on a malformed/adversarial SPS reachable from the wire. An
+    // unchecked `+1`/`*16` would panic in debug and silently wrap a garbage resolution into
+    // `AMediaCodec.configure` in release. Returning `None` instead keeps the module's documented
+    // "a malformed SPS degrades to None rather than panicking" contract.
+    let width = pic_width_in_mbs_minus1.checked_add(1)?.checked_mul(16)?;
+    let height = (2 - frame_mbs_only_flag)
+        .checked_mul(pic_height_in_map_units_minus1.checked_add(1)?)?
+        .checked_mul(16)?;
 
     // Frame cropping trims the coded macroblock grid down to the displayed picture
     // (e.g. 1088 -> 1080).
@@ -293,8 +300,10 @@ pub fn sps_dimensions(sps: &[u8]) -> Option<(u32, u32)> {
         (sub_width_c, sub_height_c * (2 - frame_mbs_only_flag))
     };
 
-    let width = width.checked_sub((crop_l + crop_r) * crop_unit_x)?;
-    let height = height.checked_sub((crop_t + crop_b) * crop_unit_y)?;
+    let crop_x = crop_l.checked_add(crop_r)?.checked_mul(crop_unit_x)?;
+    let crop_y = crop_t.checked_add(crop_b)?.checked_mul(crop_unit_y)?;
+    let width = width.checked_sub(crop_x)?;
+    let height = height.checked_sub(crop_y)?;
     Some((width, height))
 }
 

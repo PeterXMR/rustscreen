@@ -559,7 +559,7 @@ pub fn run_stream_session_instrumented(
 
         // Periodic report so a long-running live session surfaces latency continuously.
         if last_report.elapsed() >= report_each {
-            on_report(&pipeline.report());
+            on_report(pipeline.report());
             last_report = Instant::now();
         }
     }

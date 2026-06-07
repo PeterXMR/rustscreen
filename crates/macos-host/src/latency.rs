@@ -273,9 +273,12 @@ impl PipelineLatency {
         self.report.dropped_frames += n;
     }
 
-    /// The accumulated report so far (cheap clone of the stage stats).
-    pub fn report(&self) -> LatencyReport {
-        self.report.clone()
+    /// Borrow the accumulated report so far. Returns a reference rather than cloning: a
+    /// [`LatencyReport`] holds six bounded sample rings (6 × up to `MAX_RETAINED_SAMPLES` u64s),
+    /// and the periodic ~2 s report tick runs on the streaming thread — cloning ~0.8 MB there
+    /// would steal hot-path time. Every caller only reads.
+    pub fn report(&self) -> &LatencyReport {
+        &self.report
     }
 }
 
