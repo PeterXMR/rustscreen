@@ -445,7 +445,7 @@ fn coalesce_to_latest_keyframe(mut backlog: Vec<EncodedFrame>) -> Vec<EncodedFra
 /// stopped) or the transport errors (peer disconnect).
 #[allow(clippy::too_many_arguments)]
 pub fn run_stream_session_instrumented(
-    frames: std::sync::mpsc::Receiver<EncodedFrame>,
+    frames: &std::sync::mpsc::Receiver<EncodedFrame>,
     write_half: &mut impl Write,
     agreed: AgreedConfig,
     offset: Option<ClockOffset>,
@@ -462,6 +462,12 @@ pub fn run_stream_session_instrumented(
     use std::time::Instant;
 
     let mut last_report = Instant::now();
+    // Per-connection gate: the phone's MediaCodec decoder is brand new on every (re)connect and
+    // can only start from a keyframe. Drop any P-frames that arrive before this connection's first
+    // IDR — they are undecodable by a fresh decoder. `seen_keyframe` resets to `false` on every
+    // call, so the guard is automatically re-armed after every reconnect (run_host calls this fn
+    // fresh per connection).
+    let mut seen_keyframe = false;
 
     // The handshake already negotiated this `agreed` config on the full-duplex transport before
     // the split; it is threaded in directly so the wire contract (codec) matches exactly what the
@@ -501,6 +507,21 @@ pub fn run_stream_session_instrumented(
                 }
 
                 for encoded in to_send {
+                    // A (re)connected decoder can only start at a keyframe. Drop any P-frames that
+                    // precede this connection's first keyframe — a fresh MediaCodec has no reference
+                    // for them, so sending them would show one undecodable frame before the IDR. This
+                    // closes the post-reconnect producer race (a lone P-frame can land before the
+                    // forced IDR) with zero hot-path cost — it only sheds frames the decoder can't use.
+                    // `seen_keyframe` is per-call, so it resets on every reconnect (run_host calls this
+                    // fresh each connection).
+                    if !seen_keyframe {
+                        if !encoded.keyframe {
+                            pipeline.record_dropped(1);
+                            continue;
+                        }
+                        seen_keyframe = true;
+                    }
+
                     let pts_us = encoded.pts_us;
                     let encode_micros = encoded.encode_micros;
                     // Real capture time stamped by the delegate (shared monotonic origin), NOT
@@ -1048,7 +1069,7 @@ mod tests {
         let mut sink: Vec<u8> = Vec::new();
 
         let summary = run_stream_session_instrumented(
-            rx,
+            &rx,
             &mut sink,
             default_agreed(),
             None, // no clock offset needed: this test asserts shed-load, not fusion
@@ -1111,7 +1132,7 @@ mod tests {
         let stop = AtomicBool::new(true); // stop already requested
 
         let summary = run_stream_session_instrumented(
-            rx,
+            &rx,
             &mut sink,
             default_agreed(),
             None,
@@ -1274,7 +1295,7 @@ mod tests {
         let mut sink: Vec<u8> = Vec::new();
 
         let summary = run_stream_session_instrumented(
-            rx,
+            &rx,
             &mut sink,
             default_agreed(),
             offset,
@@ -1356,7 +1377,7 @@ mod tests {
         let mut sink: Vec<u8> = Vec::new();
 
         let summary = run_stream_session_instrumented(
-            rx,
+            &rx,
             &mut sink,
             default_agreed(),
             None, // clock-sync failed → degrade to host-only stages
@@ -1419,7 +1440,7 @@ mod tests {
         let mut sink: Vec<u8> = Vec::new();
 
         let summary = run_stream_session_instrumented(
-            rx,
+            &rx,
             &mut sink,
             agreed.clone(),
             None,
@@ -1494,7 +1515,7 @@ mod tests {
         let mut sink: Vec<u8> = Vec::new();
 
         run_stream_session_instrumented(
-            rx,
+            &rx,
             &mut sink,
             default_agreed(),
             offset,
@@ -2059,5 +2080,86 @@ mod tests {
         assert_eq!(counting.total, 12);
 
         assert_eq!(sink, b"hello, world");
+    }
+
+    #[test]
+    fn instrumented_borrows_receiver_so_it_is_reusable_across_connections() {
+        // Drop the sender up front: with no live sender, each call sees `Disconnected`
+        // immediately and returns a zero-frame summary. The point of the test is that
+        // `rx` is still usable for the SECOND call — i.e. the param is borrowed, not moved.
+        let (tx, rx) = std::sync::mpsc::sync_channel::<EncodedFrame>(2);
+        drop(tx);
+        let (_stats_tx, stats_rx) = std::sync::mpsc::channel();
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        let now = || 0u64;
+
+        let mut pipeline = PipelineLatency::new(16);
+        let mut sink: Vec<u8> = Vec::new();
+        let s1 = run_stream_session_instrumented(
+            &rx,
+            &mut sink,
+            default_agreed(),
+            None,
+            &stats_rx,
+            &mut pipeline,
+            std::time::Duration::from_millis(1),
+            std::time::Duration::from_secs(3600),
+            now,
+            |_r| {},
+            &stop,
+        )
+        .unwrap();
+
+        let mut pipeline2 = PipelineLatency::new(16);
+        let mut sink2: Vec<u8> = Vec::new();
+        let s2 = run_stream_session_instrumented(
+            &rx,
+            &mut sink2,
+            default_agreed(),
+            None,
+            &stats_rx,
+            &mut pipeline2,
+            std::time::Duration::from_millis(1),
+            std::time::Duration::from_secs(3600),
+            now,
+            |_r| {},
+            &stop,
+        )
+        .unwrap();
+
+        assert_eq!(s1.frames, 0, "no sender → zero frames");
+        assert_eq!(s2.frames, 0, "receiver reusable for a second connection");
+    }
+
+    #[test]
+    fn a_pframe_before_the_first_keyframe_is_not_sent() {
+        // A freshly (re)connected decoder must receive a keyframe first. A lone P-frame that
+        // arrives before any keyframe (the post-reconnect producer race) must be DROPPED, not sent.
+        let (tx, rx) = std::sync::mpsc::sync_channel::<EncodedFrame>(4);
+        tx.send(delta_encoded(1000)).unwrap();
+        drop(tx); // capture then ends → loop sees Disconnected and exits
+        let (_stats_tx, stats_rx) = std::sync::mpsc::channel();
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        let now = || 0u64;
+        let mut pipeline = PipelineLatency::new(16);
+        let mut sink: Vec<u8> = Vec::new();
+        let summary = run_stream_session_instrumented(
+            &rx,
+            &mut sink,
+            default_agreed(),
+            None,
+            &stats_rx,
+            &mut pipeline,
+            std::time::Duration::from_millis(1),
+            std::time::Duration::from_secs(3600),
+            now,
+            |_r| {},
+            &stop,
+        )
+        .unwrap();
+        assert_eq!(
+            summary.frames, 0,
+            "a P-frame before the first keyframe must not be sent"
+        );
     }
 }
