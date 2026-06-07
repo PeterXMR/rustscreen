@@ -347,6 +347,17 @@ total under load); bounded depth proven; no deadlock across surface destroy/recr
 
 ### PR 6 — On-demand keyframe back-channel + IDR-bubble smoothing (categories E + F)
 
+> **Status: Part 1 (back-channel, F) implemented — branch `feat/p6-keyframe-backchannel`, pending
+> on-device measurement.** The phone's `InputPacer` now signals a drop-episode entry
+> (`Admission::DropAndRequestKeyframe`, emitted once per episode) and the receive loop sends
+> `Control::RequestKeyframe`; the host reader thread honours it via the tested
+> `session::forces_keyframe` classifier, setting the existing `needs_keyframe` IDR lever. This bounds
+> a phone-side drop-to-keyframe resync to ~1 RTT instead of waiting out the periodic GOP. **Part 2
+> (E — lengthen the GOP / intra-refresh) is DELIBERATELY DEFERRED:** per the conservation analysis it
+> is the risky half (removing the periodic safety-net can lengthen the worst-case freeze if a
+> requested IDR is repeatedly shed), so the 1 s periodic GOP is kept as the backstop and Part 1 ships
+> alone first. Host tests + clippy (default) + fmt green; the resync-latency win is the on-device gate.
+
 **Goal.** Remove the **periodic latency bubble** from the 1 s full-IDR GOP and **bound the cost of
 any drop-to-keyframe resync** by wiring a keyframe-request back-channel and (optionally) spreading
 I-macroblocks across frames (intra-refresh) for uniform frame sizes.
