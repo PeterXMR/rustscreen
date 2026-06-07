@@ -17,7 +17,7 @@ Apply this on every task:
 - **Never add unbounded buffering on the hot path.** Queues between stages must be bounded.
   Prefer drop-newest-with-resync over growing latency. A dropped *post-encode* frame breaks the
   H.264 reference chain, so any such drop MUST force the next frame to an IDR (keyframe) so the
-  decoder resyncs — see `crates/macos-host/src/bin/p5_stream.rs` (`needs_keyframe`). Pre-encode
+  decoder resyncs — see `crates/macos-host/src/serve.rs` (`needs_keyframe`). Pre-encode
   (pre-VideoToolbox-submit) drops are safe and need no resync.
 - **Keep the per-frame hot path lean.** In capture/encode/send/decode/present code, avoid
   blocking calls, heap allocation, lock contention, and dynamic dispatch (vtables) where a

@@ -6,9 +6,9 @@
 [![License: not finalized](https://img.shields.io/badge/license-not%20finalized-orange.svg)](#license)
 
 > **Status: live pipeline works.** The Mac's extended desktop renders on the Pixel 6a
-> over USB, with glass-to-glass latency instrumented and tuned (best ~80 ms p50; target
-> < 50 ms). What's left to make it a daily tool is three steps — see
-> [Status & roadmap](#status--roadmap) below.
+> over USB, with glass-to-glass latency instrumented and tuned to **~34 ms p50 (PR #27)** —
+> under the < 50 ms target and at the ~43 ms hardware floor. Remaining latency work is the
+> p95 tail / behaviour under load. See [Status & roadmap](#status--roadmap) below.
 
 ---
 
@@ -154,7 +154,8 @@ cargo build --workspace
 # Run the tests
 cargo test --workspace
 
-# Run the host binary (the live streaming host; launch from a terminal holding the Screen Recording grant)
+# Run the default host binary — prints the protocol version only. The live streaming host is
+# the `rustscreen` CLI (below) or the `p5_stream` bin, both built with --features live-capture,live-usb.
 cargo run -p macos-host
 ```
 
@@ -311,17 +312,17 @@ default" to suppress it on reconnect. Details in the
 ## Status & roadmap
 
 The live end-to-end pipeline **works**: the Mac's extended desktop renders on the
-Pixel 6a over a single USB-C cable, with glass-to-glass latency instrumented and tuned
-(best ~80 ms p50 measured on device; target < 50 ms). What remains to make it a
-daily-usable tool is **three steps, in priority order:**
+Pixel 6a over a single USB-C cable, with glass-to-glass latency instrumented and tuned to
+**~34 ms p50 (PR #27)** — under the < 50 ms target and at the ~43 ms hardware floor. The
+**three steps** that made it a daily-usable tool are now in place:
 
-1. **`rustscreen` terminal app** — install once, then `rustscreen start` runs the host
-   locally and auto-streams the moment the phone app is open; `rustscreen stop` ends it.
-2. **Automatic reconnect** — close and reopen the phone app, restart the host, or unplug
-   and replug the cable, and the connection re-establishes itself (handshake) with no
+1. **`rustscreen` terminal app** ✅ (PR #25) — install once, then `rustscreen start` runs the
+   host locally and auto-streams the moment the phone app is open; `rustscreen stop` ends it.
+2. **Automatic reconnect** ✅ (PR #26) — close and reopen the phone app, restart the host, or
+   unplug and replug the cable, and the connection re-establishes itself (handshake) with no
    manual restart, as long as the app is running on both sides.
-3. **Native-feel latency** — drive glass-to-glass below 50 ms so moving the mouse or a
-   window on the Mac appears on the phone with no perceptible lag.
+3. **Native-feel latency** ✅ (PR #27) — glass-to-glass p50 is ~34 ms, under the 50 ms target.
+   The remaining latency work is the p95 **tail** and behaviour under sustained motion/load.
 
 Full detail and per-step sub-tasks are in the execution tracker
 [`.planning/ROADMAP.md`](.planning/ROADMAP.md) (the "Active Priorities" section).

@@ -27,6 +27,8 @@ The live pipeline already works (the Mac desktop renders on the phone; PRs #21�
 
 **Goal (user's words, rephrased):** If either side goes away and comes back, it just reconnects — no restart dance. Close and reopen the phone app → reconnects. `rustscreen stop` then `start` again → reconnects. Unplug and replug the cable → reconnects. As long as the app is running on **both** Mac and phone, the link re-establishes itself automatically (the handshake).
 
+**✅ Shipped (PR #26):** `rustscreen start` is now the supervisor loop described below — it tears down each session on disconnect and returns to waiting, re-arming on phone-app close/reopen, host restart, and cable replug, exiting only on `rustscreen stop`.
+
 **What that means in code:**
 - `rustscreen start` (Priority 1) is **not** a one-shot that dies when the phone disappears — it is a **supervisor loop**: wait-for-accessory → run the handshake (`connect-hello` + `negotiate()`, both already built) → stream → on disconnect, tear that session down and **return to waiting**, re-arming for the next connect. The loop only exits on `rustscreen stop`.
 - Detect disconnect on all three triggers: phone app closed (accessory fd closes / read error), host restarted (phone re-offers the accessory), cable replug (USB re-enumeration into accessory mode).
@@ -39,7 +41,9 @@ The live pipeline already works (the Mac desktop renders on the phone; PRs #21�
 
 **Goal (user's words, rephrased):** Moving the mouse (or dragging a window) on the Mac should show on the phone with no perceptible lag — ideally it feels like one continuous screen.
 
-**What that means in code:** keep driving glass-to-glass latency toward the **< 50 ms target** (practical floor ~43 ms; the Mac's locked-60 Hz `CGVirtualDisplay` and the phone's 60 Hz panel make sub-~30 ms unreachable on this hardware — **do not chase sub-floor numbers**). Already shipped (`48c1b05`): host encoder in-flight pacing + VideoToolbox low-latency rate control + phone input pacing, which took best-case to **~80 ms p50**. Remaining levers, highest-impact first:
+**✅ Target met (PR #27): glass-to-glass is now ~34 ms p50**, under the **< 50 ms target** (practical floor ~43 ms; the Mac's locked-60 Hz `CGVirtualDisplay` and the phone's 60 Hz panel make sub-~30 ms unreachable on this hardware — **do not chase sub-floor numbers**). Shipped: host encoder in-flight pacing + VideoToolbox low-latency rate control + phone input pacing + the **phone decode-drain fix (PR #27 — the decisive win)**. The remaining work is the p95 **tail** / behaviour under load, not the median.
+
+**What that means in code:** the levers below were the pre-PR-#27 plan; note **lever 1 (non-blocking USB writes) was tried and REVERTED** — it regressed glass-to-glass to ~100 ms; the decode-drain fix was the real win. Levers as originally ranked:
 1. **Non-blocking USB writes** (`aoa.rs:267`, `session.rs:595`): the per-frame **blocking** `flush()` costs ~22 ms where the wire itself needs only ~1–2 ms. Multiple in-flight bulk transfers (`set_num_transfers(3–4)`) + a non-waiting flush — preserving the **C-01** "no unflushed partial frame before a blocking read" invariant — is **~18 ms off glass-to-glass, the single biggest remaining win.**
 2. **Real-time thread scheduling** for the capture / encode / USB threads → removes the 30–60 ms p95/p99 jitter spikes (the "occasionally feels laggy" cases), not the median.
 3. **Phone decoder hints** (`KEY_PRIORITY=0`, `operating-rate=60` in `mediacodec.rs`) → one line each, cheap, A/B-test on device.
