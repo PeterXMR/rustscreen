@@ -775,7 +775,7 @@ pub fn run_host(opts: &HostOpts, stop: &AtomicBool) -> std::io::Result<()> {
             Duration::from_secs(1), // heartbeat / idle-disconnect probe
             Duration::from_secs(2), // print a latency report every ~2 s
             now_us,
-            |report| print_report(report, offset),
+            |report| report_and_log(report, offset, now_us()),
             stop, // external stop (rustscreen stop → SIGTERM) breaks the stream into teardown
         );
 
@@ -789,8 +789,8 @@ pub fn run_host(opts: &HostOpts, stop: &AtomicBool) -> std::io::Result<()> {
             sink.ivars().in_flight.load(Ordering::Relaxed),
         );
 
-        // This connection's final latency report.
-        print_report(&pipeline.report(), offset);
+        // This connection's final latency report (also appended to the CSV log if enabled).
+        report_and_log(&pipeline.report(), offset, now_us());
         match &result {
             Ok(summary) => println!(
                 "rustscreen: connection ended cleanly — {} frames, {} bytes sent; encode mean {:.2} ms.",
@@ -911,6 +911,28 @@ fn print_report(r: &crate::latency::LatencyReport, offset: Option<protocol::cloc
         "  dropped frames (drop-to-keyframe shed load): {}",
         r.dropped_frames
     );
+    // One compact, grep-friendly line so a run is scannable at a glance / pipeable to a tracker.
+    if r.glass_to_glass.count() > 0 {
+        println!("  SUMMARY {}", r.summary_line());
+    }
+}
+
+/// Print a latency report and, if `RUSTSCREEN_LATENCY_CSV` is set, append one row to that file so
+/// results accumulate across runs and proposed improvements (one diffable benchmark log per
+/// session — see `docs/BENCHMARKS.md`). `elapsed_us` is process-monotonic microseconds, used as
+/// the row's ordered timestamp. Best-effort: a CSV write error is logged and the stream continues.
+fn report_and_log(
+    r: &crate::latency::LatencyReport,
+    offset: Option<protocol::clock::ClockOffset>,
+    elapsed_us: u64,
+) {
+    print_report(r, offset);
+    if let Some(path) = std::env::var_os("RUSTSCREEN_LATENCY_CSV") {
+        let elapsed_s = elapsed_us as f64 / 1_000_000.0;
+        if let Err(e) = r.append_csv(std::path::Path::new(&path), elapsed_s) {
+            eprintln!("rustscreen: latency CSV append to {path:?} failed: {e}");
+        }
+    }
 }
 
 #[cfg(test)]

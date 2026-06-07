@@ -50,6 +50,95 @@ pub struct LatencyReport {
     pub dropped_frames: u64,
 }
 
+impl LatencyReport {
+    /// Compact, grep-friendly one-line summary for the live log: glass-to-glass p50/p95 plus each
+    /// stage's p50 (all ms), and the shed/anomaly counters. Lets you eyeball a run at a glance and
+    /// `grep SUMMARY` a long log. The standing-queue tell to watch (PR 1 lesson): if `snd→arr`
+    /// climbs and plateaus while `drop=0`, frames are bufferbloating between host and phone.
+    pub fn summary_line(&self) -> String {
+        let p50 = |s: &LatencyStats| s.p50().map_or(f64::NAN, |v| v as f64 / 1000.0);
+        let p95 = |s: &LatencyStats| s.p95().map_or(f64::NAN, |v| v as f64 / 1000.0);
+        format!(
+            "G2G p50={:.1} p95={:.1} | cap→enc {:.1} | enc→snd {:.1} | snd→arr {:.1} | \
+             arr→dec {:.1} | dec→pres {:.1} | drop={} unmatched={} (n={})",
+            p50(&self.glass_to_glass),
+            p95(&self.glass_to_glass),
+            p50(&self.capture_to_encode),
+            p50(&self.encode_to_send),
+            p50(&self.send_to_arrive),
+            p50(&self.arrive_to_decode),
+            p50(&self.decode_to_present),
+            self.dropped_frames,
+            self.unmatched_stats,
+            self.glass_to_glass.count(),
+        )
+    }
+
+    /// CSV header matching [`Self::csv_row`]; written once when a fresh benchmark log is created.
+    pub fn csv_header() -> &'static str {
+        "elapsed_s,n,g2g_p50,g2g_p95,g2g_max,cap_enc_p50,cap_enc_p95,enc_snd_p50,enc_snd_p95,\
+         snd_arr_p50,snd_arr_p95,arr_dec_p50,arr_dec_p95,dec_pres_p50,dec_pres_p95,\
+         dropped,unmatched,anomalies"
+    }
+
+    /// One CSV row (all stage times in **ms**) for accumulating results across runs and proposed
+    /// improvements. `elapsed_s` is wall-seconds since the session started, so rows stay ordered.
+    pub fn csv_row(&self, elapsed_s: f64) -> String {
+        let p50 = |s: &LatencyStats| s.p50().map_or(0.0, |v| v as f64 / 1000.0);
+        let p95 = |s: &LatencyStats| s.p95().map_or(0.0, |v| v as f64 / 1000.0);
+        let mx = |s: &LatencyStats| s.max().map_or(0.0, |v| v as f64 / 1000.0);
+        format!(
+            "{:.1},{},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},\
+             {:.2},{:.2},{},{},{}",
+            elapsed_s,
+            self.glass_to_glass.count(),
+            p50(&self.glass_to_glass),
+            p95(&self.glass_to_glass),
+            mx(&self.glass_to_glass),
+            p50(&self.capture_to_encode),
+            p95(&self.capture_to_encode),
+            p50(&self.encode_to_send),
+            p95(&self.encode_to_send),
+            p50(&self.send_to_arrive),
+            p95(&self.send_to_arrive),
+            p50(&self.arrive_to_decode),
+            p95(&self.arrive_to_decode),
+            p50(&self.decode_to_present),
+            p95(&self.decode_to_present),
+            self.dropped_frames,
+            self.unmatched_stats,
+            self.anomalies,
+        )
+    }
+
+    /// Append one [`Self::csv_row`] to the benchmark log at `path`, writing [`Self::csv_header`]
+    /// first if the file is new/empty. Lets a live run accumulate a CSV you can diff across
+    /// proposed improvements (`RUSTSCREEN_LATENCY_CSV=/path` in `serve`). Best-effort: the caller
+    /// logs and continues on error rather than disturbing the stream.
+    pub fn append_csv(&self, path: &std::path::Path, elapsed_s: f64) -> std::io::Result<()> {
+        use std::io::Write as _;
+        // Create the parent directory if the user pointed RUSTSCREEN_LATENCY_CSV at a path whose
+        // folder doesn't exist yet (e.g. ~/rustscreen-bench/run.csv) — otherwise the open below
+        // fails with "No such file or directory" on every report.
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)?;
+            }
+        }
+        let fresh = std::fs::metadata(path)
+            .map(|m| m.len() == 0)
+            .unwrap_or(true);
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)?;
+        if fresh {
+            writeln!(f, "{}", Self::csv_header())?;
+        }
+        writeln!(f, "{}", self.csv_row(elapsed_s))
+    }
+}
+
 /// Fuses host-side and phone-side per-frame timestamps (correlated by `pts_us`) into a
 /// per-stage + glass-to-glass [`LatencyReport`]. Host timestamps wait in a bounded FIFO
 /// keyed by `pts_us` until the phone's `Frame::Stats` arrives (or they are evicted).
@@ -403,6 +492,55 @@ mod tests {
             5,
             "drop-to-keyframe counts accumulate so the report surfaces total shed load"
         );
+    }
+
+    #[test]
+    fn summary_line_reports_glass_to_glass_p50() {
+        let mut p = PipelineLatency::new(16);
+        p.record_host(1000, 0, 8, 10);
+        p.record_stats(1000, 110, 120, 130, offset(100)); // g2g = 30 µs = 0.0 ms rounded
+        let line = p.report().summary_line();
+        assert!(
+            line.contains("G2G p50="),
+            "summary must lead with glass-to-glass: {line}"
+        );
+        assert!(
+            line.contains("(n=1)"),
+            "summary must show the sample count: {line}"
+        );
+    }
+
+    #[test]
+    fn csv_row_column_count_matches_header() {
+        // The CSV is only useful if every row lines up with the header — guard that invariant so
+        // a future column add/remove can't silently desync the benchmark log.
+        let header_cols = LatencyReport::csv_header().split(',').count();
+        let row_cols = LatencyReport::default().csv_row(12.5).split(',').count();
+        assert_eq!(
+            header_cols, row_cols,
+            "csv_row must have one field per header column"
+        );
+    }
+
+    #[test]
+    fn append_csv_writes_header_once_then_rows() {
+        // Two appends to a fresh file: header written exactly once, then one row per call — so a
+        // run accumulates a diffable benchmark log (RUSTSCREEN_LATENCY_CSV).
+        // Use a NON-existent subdirectory so the test also pins parent-dir creation (the
+        // RUSTSCREEN_LATENCY_CSV → "No such file or directory" bug fix).
+        let dir = std::env::temp_dir().join(format!("rustscreen-bench-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("run.csv");
+        let r = LatencyReport::default();
+        r.append_csv(&path, 2.0).unwrap();
+        r.append_csv(&path, 4.0).unwrap();
+        let body = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = body.lines().collect();
+        assert_eq!(lines.len(), 3, "1 header + 2 rows: {body}");
+        assert_eq!(lines[0], LatencyReport::csv_header());
+        assert!(lines[1].starts_with("2.0,"));
+        assert!(lines[2].starts_with("4.0,"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

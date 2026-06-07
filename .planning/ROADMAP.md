@@ -47,6 +47,8 @@ The live pipeline already works (the Mac desktop renders on the phone; PRs #21�
 
 Verify **every** latency change against the on-device per-stage report (the `run-on-device` skill prints capture/encode/send/decode/present + glass-to-glass), not by assumption. This is old **ladder item 6 step 2** plus the documented frontier TODOs.
 
+**Execution plan (multi-PR split):** the seven levers above are sequenced into independently-shippable PRs — ordered by leverage, each with a measurement gate — in [`docs/superpowers/plans/2026-06-07-native-feel-latency-multi-pr-plan.md`](../docs/superpowers/plans/2026-06-07-native-feel-latency-multi-pr-plan.md). PR 1 (non-blocking USB writes) is the headline ~18 ms win; PRs 2–4 are jitter/present polish; PR 5 (phone thread split) is gated on whether PRs 1–4 already clear < 50 ms p50; PRs 6–7 cover the IDR bubble and cold-start.
+
 **Done when:** measured glass-to-glass is consistently < 50 ms p50 with no visible spikes, and dragging a window / moving the cursor on the Mac looks real-time on the phone.
 
 ---

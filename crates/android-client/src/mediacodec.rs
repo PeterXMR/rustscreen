@@ -430,10 +430,24 @@ impl MediaCodecDecoder {
                 presentationTimeUs: 0,
                 flags: 0,
             };
-            // SAFETY: `codec` is a started decoder; `info` is a valid out-param.
-            let out_index = unsafe {
-                sys::AMediaCodec_dequeueOutputBuffer(codec, &mut info, DEQUEUE_TIMEOUT_US)
+            // Block (up to DEQUEUE_TIMEOUT_US) ONLY while waiting for the first buffer of this
+            // drain; once we have at least one, poll the rest non-blocking (timeout 0). The old
+            // code used the full 10 ms timeout on EVERY iteration, so after collecting the newest
+            // buffer the trailing "is there another?" poll always blocked the full ~10 ms before
+            // returning TRY_AGAIN_LATER. That wasted ~10 ms per frame on the single decode thread:
+            // it inflated `decode→present` to ~one timeout AND, worse, kept the thread from reading
+            // the next access unit off USB — surfacing upstream as `send→arrive`. With LOW_LATENCY
+            // the decoder emits ~one buffer per input, so in steady state the previous frame is
+            // already decoded and the first dequeue returns immediately; the timeout now only bites
+            // on a genuine stall/startup. (Lowest-latency: drain what's ready, never block for more.)
+            let timeout = if ready.is_empty() {
+                DEQUEUE_TIMEOUT_US
+            } else {
+                0
             };
+            // SAFETY: `codec` is a started decoder; `info` is a valid out-param.
+            let out_index =
+                unsafe { sys::AMediaCodec_dequeueOutputBuffer(codec, &mut info, timeout) };
 
             if out_index >= 0 {
                 // Decoded buffer ready: stamp decode-complete now (the dequeue IS the decode).
@@ -485,12 +499,24 @@ impl MediaCodecDecoder {
             );
         }
 
-        // Present the newest decoded buffer WITH render so it composites onto the ANativeWindow
-        // (D3 — no CPU copy back to us); stamp present right after. The global clock keeps these
-        // timestamps in the same epoch as arrive_us / ClockPong t1,t2.
+        // Present the newest decoded buffer onto the ANativeWindow (D3 — no CPU copy back to us)
+        // using the TIMESTAMPED release so the decode thread does NOT block on the next vsync
+        // (latency PR 4 / research category D). The boolean form `releaseOutputBuffer(idx, true)`
+        // couples this thread to SurfaceFlinger's vsync — it blocks ~one refresh (the measured
+        // ~13 ms `decode→present`) — and while it blocks we are NOT draining USB, which is the
+        // dominant upstream phone-pull cost (the host's transfer can't complete until we read the
+        // next bytes, so it surfaces as `encode→send`/`send→arrive`). `releaseOutputBufferAtTime`
+        // hands the buffer to the compositor with a desired present time and returns immediately;
+        // SurfaceFlinger scans it out at the next vsync (the unavoidable panel latency) while we
+        // get straight back to reading the next access unit. A timestamp of "now" = present ASAP.
+        // `present_us` now stamps the HANDOFF (actual scanout is ~one vsync later, as before — but
+        // it no longer stalls this thread); the global clock keeps it in the same epoch as
+        // arrive_us / ClockPong t1,t2.
         // SAFETY: `newest_idx` is a valid output buffer index just dequeued and not yet released.
-        let status = unsafe { sys::AMediaCodec_releaseOutputBuffer(codec, newest_idx, true) };
-        check(status, "releaseOutputBuffer(render=true)")?;
+        let status = unsafe {
+            sys::AMediaCodec_releaseOutputBufferAtTime(codec, newest_idx, monotonic_now_ns())
+        };
+        check(status, "releaseOutputBufferAtTime(render now)")?;
         let present_us = crate::now_us();
         presented.push(PresentedFrame {
             pts_us: newest_pts,
@@ -499,4 +525,46 @@ impl MediaCodecDecoder {
         });
         Ok(())
     }
+}
+
+/// Current `CLOCK_MONOTONIC` time in nanoseconds — the timebase
+/// [`sys::AMediaCodec_releaseOutputBufferAtTime`] expects for the desired present time (the same
+/// domain as `System.nanoTime()` and the Choreographer vsync clock). Returning "now" presents the
+/// frame as soon as possible **without blocking the decode thread on vsync** (PR 4).
+///
+/// Declared directly against libc (`clock_gettime`) rather than pulling the `libc` crate for one
+/// call — the symbol is always linked on Android. `c_long` matches bionic's `time_t`/`tv_nsec`
+/// (both `long`) on every Android ABI (64-bit on lp64 targets, 32-bit on ilp32), so the
+/// `timespec` layout is correct without per-ABI gating.
+// `i64::from(c_long)` is a real widening on 32-bit ABIs (`c_long == i32`) but a no-op on lp64
+// (`c_long == i64`), where clippy flags it as a useless conversion. We target arm64 (lp64) in
+// practice, so allow it here to keep the source correct for both without a per-ABI `cfg`.
+#[allow(clippy::useless_conversion)]
+fn monotonic_now_ns() -> i64 {
+    use core::ffi::{c_int, c_long};
+    #[repr(C)]
+    struct Timespec {
+        tv_sec: c_long,
+        tv_nsec: c_long,
+    }
+    extern "C" {
+        fn clock_gettime(clk_id: c_int, tp: *mut Timespec) -> c_int;
+    }
+    const CLOCK_MONOTONIC: c_int = 1;
+    let mut ts = Timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `ts` is a valid out-param for the duration of the call and CLOCK_MONOTONIC is always
+    // available. On the (practically impossible) failure path we return 0 — a timestamp in the far
+    // past, which the codec also treats as "present ASAP" — so the present still happens.
+    let rc = unsafe { clock_gettime(CLOCK_MONOTONIC, &mut ts) };
+    if rc != 0 {
+        return 0;
+    }
+    // `i64::from` (not `as i64`) widens correctly whether `c_long` is 32-bit (ilp32 ABIs) or
+    // 64-bit (lp64) — and is a no-op the cast lint won't flag on lp64 where `c_long == i64`.
+    i64::from(ts.tv_sec)
+        .saturating_mul(1_000_000_000)
+        .saturating_add(i64::from(ts.tv_nsec))
 }
