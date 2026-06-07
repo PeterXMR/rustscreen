@@ -51,9 +51,11 @@ fi
 echo "==> Codesigning (hardened runtime) $APP_BUNDLE"
 # --options runtime enables the hardened runtime (required for notarization).
 # --timestamp embeds a secure timestamp (required for notarization).
-# Sign nested code first if any is ever added; for a single-binary bundle this
-# one invocation is sufficient.
-codesign --force --deep \
+# NOTE: --deep is intentionally NOT used. Apple deprecates --deep for *signing* (it is only
+# valid for verification) — nested code must be signed inside-out, individually. For this
+# single-binary bundle one invocation is sufficient; when a helper/framework is ever added,
+# sign it first (inside-out) and keep this top-level sign last.
+codesign --force \
     --options runtime \
     --timestamp \
     --entitlements "$ENTITLEMENTS" \

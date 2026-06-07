@@ -44,7 +44,7 @@ while [[ $# -gt 0 ]]; do
             shift 2
             ;;
         -h|--help)
-            sed -n '2,30p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+            sed -n '2,28p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
             exit 0
             ;;
         *)
@@ -59,9 +59,14 @@ if [[ "$(uname -s)" != "Darwin" ]]; then
     exit 1
 fi
 
-# Pull the version out of the workspace metadata so it lives in one place.
+# Pull the version out of the [workspace.metadata.rustscreen] section so it lives in one place.
+# Scope the match to that section (awk sets a flag on the header, then prints the first
+# `version = "..."` after it) instead of grabbing the first version-like line in the whole file —
+# the workspace Cargo.toml has no [package], so the old `head -n1` worked only by luck of ordering
+# and would silently pick up an unrelated key added above the metadata block.
 VERSION="$(
-    sed -n 's/^version = "\(.*\)".*/\1/p' "$REPO_ROOT/Cargo.toml" | head -n1
+    awk -F'"' '/^\[workspace\.metadata\.rustscreen\]/{f=1} f && /^version = /{print $2; exit}' \
+        "$REPO_ROOT/Cargo.toml"
 )"
 VERSION="${VERSION:-0.0.0}"
 
