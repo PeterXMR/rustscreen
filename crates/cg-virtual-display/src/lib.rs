@@ -213,20 +213,38 @@ impl VirtualDisplay {
         self.display_id
     }
 
-    /// Place this display on `side` of the main display via `CGConfigureDisplayOrigin`.
-    /// Non-fatal: on any CoreGraphics error the display simply stays at its default macOS
-    /// position (stable identity still lets macOS remember a later manual rearrange).
+    /// Pin the primary physical display as the **main** screen (origin 0,0) and place this virtual
+    /// display on `side` of it, via one `CGConfigureDisplayOrigin` transaction.
+    ///
+    /// Pinning the physical display matters because macOS can leave a freshly-created virtual
+    /// display at origin (0,0) — which makes the *phone* the primary screen (menu bar + new windows
+    /// open there). Anchoring the built-in (laptop) panel at (0,0) keeps the Mac screen as main and
+    /// the phone as a side display, regardless of any arrangement macOS remembered. Non-fatal: on
+    /// any CoreGraphics error the display simply stays at its default macOS position.
     pub fn arrange(&self, side: Side) {
-        // SAFETY: a pure CG display-configuration transaction; `display_id` is this display's
-        // own id and every begin is balanced by exactly one complete or cancel on every path.
+        // SAFETY: a pure CG display-configuration transaction; `display_id` is this display's own
+        // id and every begin is balanced by exactly one complete or cancel on every path.
         unsafe {
-            let main_id = cg::CGMainDisplayID();
-            let mb = cg::CGDisplayBounds(main_id);
+            // Anchor on the primary PHYSICAL display (built-in panel if present, else the first
+            // active non-virtual display). If only the virtual display is active there is nothing to
+            // anchor to — leave the default position.
+            let anchor = match primary_physical_display(self.display_id) {
+                Some(id) => id,
+                None => {
+                    eprintln!(
+                        "cg-virtual-display: arrange: no physical display to anchor; leaving default position"
+                    );
+                    return;
+                }
+            };
+            // We pin the anchor to (0,0) in this same transaction, so compute the virtual display's
+            // side placement against an anchor whose origin is (0,0).
+            let ab = cg::CGDisplayBounds(anchor);
             let main = DisplayBounds {
-                x: mb.origin.x as i32,
-                y: mb.origin.y as i32,
-                width: mb.size.width as i32,
-                height: mb.size.height as i32,
+                x: 0,
+                y: 0,
+                width: ab.size.width as i32,
+                height: ab.size.height as i32,
             };
             // The virtual display's own bounds give its (point) size for placement.
             let vb = cg::CGDisplayBounds(self.display_id);
@@ -240,11 +258,21 @@ impl VirtualDisplay {
                 );
                 return;
             }
+            // 1. Pin the physical display to (0,0) → it becomes / stays the main display. Skipped if
+            //    the anchor somehow IS this virtual display (only-virtual case is handled above).
+            if anchor != self.display_id
+                && cg::CGConfigureDisplayOrigin(token, anchor, 0, 0) != 0
+            {
+                eprintln!(
+                    "cg-virtual-display: arrange: pin-main failed; still placing the virtual display"
+                );
+            }
+            // 2. Place the virtual display on the requested side of the now-(0,0) main display.
             if cg::CGConfigureDisplayOrigin(token, self.display_id, ox, oy) != 0 {
                 eprintln!(
                     "cg-virtual-display: arrange: set-origin failed; leaving default position"
                 );
-                // Discard the open transaction so the rejected origin is not applied.
+                // Discard the open transaction so neither change is applied.
                 // `CGCancelDisplayConfiguration` rolls back; `CGComplete*` would commit it.
                 let _ = cg::CGCancelDisplayConfiguration(token);
                 return;
@@ -255,6 +283,31 @@ impl VirtualDisplay {
             }
         }
     }
+}
+
+/// The display to keep as the primary ("main") screen: the built-in panel if present, otherwise
+/// the first active display that is not our virtual display. `None` if only the virtual display is
+/// active (a headless Mac with nothing else attached) — then [`VirtualDisplay::arrange`] leaves the
+/// arrangement untouched.
+///
+/// # Safety
+/// Calls the CoreGraphics display-list FFI; valid to call from any thread.
+unsafe fn primary_physical_display(virtual_id: cg::CGDirectDisplayID) -> Option<cg::CGDirectDisplayID> {
+    let mut ids = [0u32; 16];
+    let mut count: u32 = 0;
+    if cg::CGGetActiveDisplayList(ids.len() as u32, ids.as_mut_ptr(), &mut count) != 0 {
+        return None;
+    }
+    let active = &ids[..(count as usize).min(ids.len())];
+    // Prefer the built-in panel (the laptop screen).
+    if let Some(&id) = active
+        .iter()
+        .find(|&&id| id != virtual_id && cg::CGDisplayIsBuiltin(id) != 0)
+    {
+        return Some(id);
+    }
+    // No built-in (e.g. a desktop Mac): the first active non-virtual display.
+    active.iter().copied().find(|&id| id != virtual_id)
 }
 
 impl Drop for VirtualDisplay {
@@ -293,7 +346,6 @@ mod cg {
     pub type CGDisplayConfigRef = *mut core::ffi::c_void;
 
     extern "C" {
-        pub fn CGMainDisplayID() -> CGDirectDisplayID;
         pub fn CGDisplayBounds(display: CGDirectDisplayID) -> CGRect;
         pub fn CGBeginDisplayConfiguration(config: *mut CGDisplayConfigRef) -> i32;
         pub fn CGConfigureDisplayOrigin(
@@ -304,6 +356,12 @@ mod cg {
         ) -> i32;
         pub fn CGCompleteDisplayConfiguration(config: CGDisplayConfigRef, option: u32) -> i32;
         pub fn CGCancelDisplayConfiguration(config: CGDisplayConfigRef) -> i32;
+        pub fn CGGetActiveDisplayList(
+            max_displays: u32,
+            active_displays: *mut CGDirectDisplayID,
+            display_count: *mut u32,
+        ) -> i32;
+        pub fn CGDisplayIsBuiltin(display: CGDirectDisplayID) -> i32;
     }
 }
 
