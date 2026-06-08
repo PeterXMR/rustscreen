@@ -1,5 +1,6 @@
 package com.rustscreen.client
 
+import android.app.ActivityManager
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -8,11 +9,8 @@ import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
-import android.hardware.usb.UsbAccessory
-import android.hardware.usb.UsbManager
 import android.os.Build
 import android.os.IBinder
-import android.os.ParcelFileDescriptor
 import android.os.Process
 import android.util.Log
 import java.util.concurrent.atomic.AtomicBoolean
@@ -47,20 +45,18 @@ class SessionService : Service() {
             stopAndExit()
             return START_NOT_STICKY
         }
-        // Must call startForeground promptly (within ~5s of startForegroundService) or the system
-        // crashes us — do it before any work, regardless of whether the accessory is still valid.
+        // The accessory is opened by MainActivity (the working path — opening a parcelled UsbAccessory
+        // here returned null on reconnect and spun the poll); we receive its already-detached fd. The
+        // open accessory justifies the connectedDevice FGS type, so go foreground immediately.
         startInForeground()
-        val accessory: UsbAccessory? =
-            intent?.getParcelableExtra(EXTRA_ACCESSORY)
-        if (accessory == null) {
-            Log.w(TAG, "no accessory in start intent — stopping service")
-            active.set(false)
-            stopForeground(STOP_FOREGROUND_REMOVE)
-            stopSelf()
+        val fd = intent?.getIntExtra(EXTRA_FD, -1) ?: -1
+        if (fd < 0) {
+            Log.w(TAG, "no fd in start intent — stopping service")
+            endNoSession()
             return START_NOT_STICKY
         }
-        startSession(accessory)
-        // NOT sticky: a null-intent restart would carry no accessory; the foreground Activity's poll
+        runSession(fd)
+        // NOT sticky: a null-intent restart would carry no fd; the foreground Activity's poll
         // re-claims and restarts us on the next attach instead.
         return START_NOT_STICKY
     }
@@ -104,31 +100,22 @@ class SessionService : Service() {
                 ).build(),
             )
             .build()
-        if (Build.VERSION.SDK_INT >= 34) {
-            startForeground(NOTIF_ID, notif, ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE)
-        } else {
-            startForeground(NOTIF_ID, notif)
+        try {
+            if (Build.VERSION.SDK_INT >= 34) {
+                startForeground(NOTIF_ID, notif, ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE)
+            } else {
+                startForeground(NOTIF_ID, notif)
+            }
+            Log.i(TAG, "startForeground OK — process pinned at foreground priority")
+        } catch (t: Throwable) {
+            // If this fails the process stays cached → Android will freeze/kill it on background.
+            // Surface it loudly so the failure mode is diagnosable rather than silent.
+            Log.e(TAG, "startForeground FAILED — process will be frozen/killed when backgrounded", t)
         }
     }
 
-    private fun startSession(accessory: UsbAccessory) {
-        val usb = getSystemService(Context.USB_SERVICE) as UsbManager
-        val pfd: ParcelFileDescriptor? =
-            if (usb.hasPermission(accessory)) usb.openAccessory(accessory) else null
-        if (pfd == null) {
-            Log.w(TAG, "openAccessory returned null / no permission — stopping service")
-            endNoSession()
-            return
-        }
-        val fd = pfd.detachFd()
-        // Defense-in-depth: File::from_raw_fd(-1) on the Rust side is UB. detachFd() on a freshly
-        // opened descriptor returns a valid fd, so this only guards a platform-specific deviation.
-        if (fd < 0) {
-            Log.e(TAG, "detachFd() returned invalid fd $fd — aborting")
-            endNoSession()
-            return
-        }
-        Log.i(TAG, "accessory opened — running decode session on fd $fd")
+    private fun runSession(fd: Int) {
+        Log.i(TAG, "running decode session on fd $fd")
         Thread({
             val endedByHostStop = try {
                 // Blocks running the live decode session until the host disconnects (EOF/error) or
@@ -165,10 +152,20 @@ class SessionService : Service() {
 
     private fun stopAndExit() {
         active.set(false)
+        // Remove the app's task(s) BEFORE killing the process. Without this, killing a process whose
+        // activity was foreground (TOP) and whose task still exists makes Android restart the
+        // activity — which is why `rustscreen stop` left the app relaunching/reconnecting instead of
+        // staying closed. finishAndRemoveTask drops the task so there is nothing to restart (mirrors
+        // the pre-service MainActivity.finishAndRemoveTask()).
+        runCatching {
+            getSystemService(ActivityManager::class.java)
+                ?.appTasks
+                ?.forEach { it.finishAndRemoveTask() }
+        }
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
-        // Kill the process so the next launch is genuinely cold (fresh native state) — mirrors the
-        // prior on-host-Bye behavior and guarantees a clean re-claim of the re-enumerated accessory.
+        // Kill the process so the next launch is genuinely cold (fresh native state) — guarantees a
+        // clean re-claim of the re-enumerated accessory on the next `rustscreen start`.
         Process.killProcess(Process.myPid())
     }
 
@@ -176,7 +173,7 @@ class SessionService : Service() {
         private const val TAG = "RustScreen"
         private const val CHANNEL_ID = "rustscreen_session"
         private const val NOTIF_ID = 1
-        const val EXTRA_ACCESSORY = "accessory"
+        const val EXTRA_FD = "fd"
         const val ACTION_STOP = "com.rustscreen.client.STOP_SESSION"
 
         /**
@@ -187,10 +184,11 @@ class SessionService : Service() {
          */
         val active = AtomicBoolean(false)
 
-        /** Start the foreground session service for [accessory] (already permission-checked). */
-        fun start(context: Context, accessory: UsbAccessory) {
+        /** Start the foreground session service with an already-open accessory [fd] (detached by
+         *  MainActivity; ownership moves to the service's session thread). */
+        fun start(context: Context, fd: Int) {
             val i = Intent(context, SessionService::class.java)
-                .putExtra(EXTRA_ACCESSORY, accessory)
+                .putExtra(EXTRA_FD, fd)
             if (Build.VERSION.SDK_INT >= 26) {
                 context.startForegroundService(i)
             } else {

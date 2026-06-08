@@ -12,6 +12,7 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.ParcelFileDescriptor
 import android.util.Log
 import android.view.Surface
 import android.view.SurfaceHolder
@@ -201,16 +202,30 @@ class MainActivity : Activity() {
         return list.firstOrNull { it.manufacturer == EXPECTED_MANUFACTURER } ?: list.firstOrNull()
     }
 
-    // Glue only: claim the session and hand the accessory to the foreground [SessionService], which
-    // opens it and runs the blocking decode session on its own thread. Running the session in a
-    // foreground service (not a plain Activity thread) is what stops Android from freezing/killing
-    // the process when the user switches to another app — see [SessionService] for the on-device
-    // root cause. The render surface stays owned by this Activity and reaches the service's decode
-    // thread through the process-global native channels.
+    // Glue only: open the accessory HERE (the working path — opening a parcelled UsbAccessory inside
+    // the service returned null on reconnect and spun the poll), detach its fd, and hand the fd to the
+    // foreground [SessionService], which runs the blocking decode session on its own thread. Running
+    // the session in a foreground service (not a plain Activity thread) is what stops Android from
+    // freezing/killing the process when the user switches to another app — see [SessionService] for
+    // the on-device root cause. The render surface stays owned by this Activity and reaches the
+    // service's decode thread through the process-global native channels.
     private fun openAndRun(accessory: UsbAccessory) {
         // BL-01: claim the session atomically and exactly once, BEFORE any side effect. The service
-        // releases the latch when the session ends or an open attempt fails.
+        // releases the latch when the session ends.
         if (!SessionService.active.compareAndSet(false, true)) return
+        val pfd: ParcelFileDescriptor = usb.openAccessory(accessory) ?: run {
+            Log.w(TAG, "openAccessory returned null even though permission is granted")
+            SessionService.active.set(false) // release so a later attach can retry
+            return
+        }
+        val fd = pfd.detachFd()
+        // Defense-in-depth: File::from_raw_fd(-1) on the Rust side is UB. detachFd() on a freshly
+        // opened descriptor returns a valid fd, so this only guards a platform-specific deviation.
+        if (fd < 0) {
+            Log.e(TAG, "detachFd() returned invalid fd $fd; aborting")
+            SessionService.active.set(false)
+            return
+        }
         // Re-deposit the surface for THIS session. The native handoff is consume-once, so without
         // this a re-attach (surface already created, slot drained by a previous session) would time
         // out waiting for a surface that surfaceCreated will never re-announce. If the surface isn't
@@ -219,15 +234,16 @@ class MainActivity : Activity() {
             Log.i(TAG, "re-depositing existing surface for new decode session")
             nativeOnSurface(surface)
         }
-        Log.i(TAG, "starting foreground session service for the accessory")
+        Log.i(TAG, "accessory opened (fd $fd) — starting foreground session service")
         try {
-            SessionService.start(this, accessory)
+            SessionService.start(this, fd)
         } catch (t: Throwable) {
             // startForegroundService is only disallowed from the background; the accessory poll runs
-            // only while we are foreground, so this should not fire — but release the latch if it does
-            // so a later attach can retry.
+            // only while we are foreground, so this should not fire — but reclaim the fd + release the
+            // latch if it does so a later attach can retry.
+            runCatching { ParcelFileDescriptor.adoptFd(fd).close() }
             SessionService.active.set(false)
-            Log.e(TAG, "failed to start session service", t)
+            Log.e(TAG, "failed to start session service; reclaimed accessory fd", t)
         }
     }
 
