@@ -694,6 +694,11 @@ pub fn run_host(opts: &HostOpts, stop: &AtomicBool) -> std::io::Result<()> {
         let (pong_tx, pong_rx) = mpsc::channel::<(Frame, u64)>();
         let (stats_tx, stats_rx) = mpsc::channel::<Frame>();
         let reader_stop = Arc::clone(&reader_local_stop);
+        // The reader honours an inbound Control::RequestKeyframe (the phone's PLI analog, sent
+        // when its InputPacer enters a drop episode) by forcing the next encoded frame to an IDR
+        // — it shares the capture delegate's `needs_keyframe` lever, so a phone-side drop resyncs
+        // in ~1 RTT instead of waiting out the periodic GOP.
+        let reader_needs_keyframe = Arc::clone(&sink.ivars().needs_keyframe);
         let reader = std::thread::spawn(move || {
             let mut read_half = read_half;
             // A bounded per-read timeout lets the reader notice the stop flag promptly while idle
@@ -715,6 +720,13 @@ pub fn run_host(opts: &HostOpts, stop: &AtomicBool) -> std::io::Result<()> {
                         if stats_tx.send(frame).is_err() {
                             break; // main thread ended
                         }
+                    }
+                    Ok(frame) if crate::session::forces_keyframe(&frame) => {
+                        // Bound the phone's drop-episode resync to ~1 RTT: force the next encoded
+                        // frame to an IDR. Idempotent — re-setting an already-set flag is harmless,
+                        // and the capture delegate clears it with swap(false) when it forces the
+                        // frame; the periodic GOP remains the backstop if this IDR is itself shed.
+                        reader_needs_keyframe.store(true, Ordering::Relaxed);
                     }
                     Ok(_) => {} // ignore other inbound frames
                     Err(e) => {

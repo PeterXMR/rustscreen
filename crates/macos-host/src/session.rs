@@ -38,6 +38,19 @@ use crate::{
 use protocol::clock::ClockOffset;
 
 // ---------------------------------------------------------------------------
+
+/// True when an inbound frame from the phone asks the host to force a keyframe.
+///
+/// The phone emits [`Control::RequestKeyframe`] the moment its `InputPacer` enters a drop
+/// episode — a non-keyframe was dropped, so the decoder's H.264 reference chain is broken until
+/// the next IDR. The host honours it by setting `needs_keyframe` (forcing the next encoded frame
+/// to an IDR), bounding the phone's resync to ~1 RTT instead of waiting out the periodic GOP (up
+/// to ~1 s). Every other inbound frame is a no-op for the encoder. Pure, so it is unit-tested
+/// off-hardware; the live reader thread in `serve.rs` is the only production caller.
+#[cfg(any(test, all(feature = "live-capture", feature = "live-usb")))]
+pub(crate) fn forces_keyframe(frame: &Frame) -> bool {
+    matches!(frame, Frame::Control(Control::RequestKeyframe))
+}
 // Error type
 // ---------------------------------------------------------------------------
 
@@ -667,6 +680,23 @@ mod tests {
     use crate::encode::EncodedFrame;
     use std::collections::VecDeque;
     use std::io::Cursor;
+
+    #[test]
+    fn only_request_keyframe_control_forces_an_idr() {
+        // The phone sends Control::RequestKeyframe on a drop-episode; the host must force a
+        // keyframe for that and ONLY that inbound frame — every other control / inbound frame
+        // is a no-op for the encoder.
+        assert!(forces_keyframe(&Frame::Control(Control::RequestKeyframe)));
+        assert!(!forces_keyframe(&Frame::Control(Control::Bye)));
+        assert!(!forces_keyframe(&Frame::Control(Control::Pause)));
+        assert!(!forces_keyframe(&Frame::Control(Control::Resume)));
+        assert!(!forces_keyframe(&Frame::Control(Control::Heartbeat)));
+        assert!(!forces_keyframe(&Frame::ClockPong {
+            t0_us: 0,
+            t1_us: 0,
+            t2_us: 0,
+        }));
+    }
 
     // -----------------------------------------------------------------------
     // Fake Capturer (same pattern as encode.rs)

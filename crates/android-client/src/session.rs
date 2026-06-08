@@ -42,7 +42,7 @@ use protocol::messages::{
 };
 
 use crate::decode::{DecodeError, DecodeSession, VideoDecoder};
-use crate::pacing::InputPacer;
+use crate::pacing::{Admission, InputPacer};
 
 // Re-export negotiate so callers that need it don't have to reach into protocol directly.
 use protocol::messages::negotiate;
@@ -326,7 +326,20 @@ pub fn run_session_with_clock<T: Read + Write>(
                 // Input-side pacing (latency item A): admit only while the decoder's in-flight
                 // depth is under the cap; otherwise drop forward to the next keyframe but still
                 // pump the decoder so its output/surface stay current.
-                let presented = if pacer.admit(*keyframe, decoder.in_flight()) {
+                let admission = pacer.admit(*keyframe, decoder.in_flight());
+                // On the FIRST drop of an episode, ask the host for an out-of-band keyframe
+                // (the WebRTC PLI analog) so the resync is bounded to ~1 RTT instead of waiting
+                // out the periodic GOP (up to ~1 s). The pacer emits this once per episode, so a
+                // burst of dropped deltas cannot flood this single-threaded loop; the periodic
+                // GOP remains the backstop if the request or its forced IDR is itself lost.
+                // Flush so the host's reader thread sees it promptly behind a buffered transport.
+                if admission == Admission::DropAndRequestKeyframe {
+                    Frame::Control(Control::RequestKeyframe)
+                        .write_to(transport)
+                        .map_err(SessionError::from)?;
+                    transport.flush().map_err(SessionError::from)?;
+                }
+                let presented = if admission == Admission::Feed {
                     // Stamp arrival ONLY for admitted frames: a dropped frame never decodes or
                     // presents, so it must not enter the bounded StatsTracker FIFO (where its
                     // orphan record could evict an admitted frame's record under burst drops).
@@ -573,6 +586,16 @@ mod tests {
             f.write_to(&mut buf).unwrap();
         }
         MemTransport::new(buf)
+    }
+
+    /// Decode every protocol `Frame` the client wrote back to its transport write-sink.
+    fn frames_in(bytes: &[u8]) -> Vec<Frame> {
+        let mut cur = io::Cursor::new(bytes);
+        let mut out = Vec::new();
+        while let Ok(f) = Frame::read_from(&mut cur) {
+            out.push(f);
+        }
+        out
     }
 
     // -------------------------------------------------------------------------
@@ -1198,5 +1221,59 @@ mod tests {
 
         assert_eq!(summary.input_frames_dropped, 0);
         assert_eq!(ds.decoded_count(), 1, "keyframe decoded despite high depth");
+    }
+
+    #[test]
+    fn requests_keyframe_from_host_on_input_drop_episode() {
+        // VideoConfig + keyframe (admitted) then two deltas while the decoder is saturated
+        // (in_flight == MAX_IN_FLIGHT): the pacer drops both. The client must ask the host for
+        // an out-of-band keyframe EXACTLY ONCE — on drop-episode entry — so the resync is
+        // bounded to ~1 RTT instead of the periodic GOP, without flooding the host with a
+        // request per dropped delta.
+        let frames = [
+            Frame::VideoConfig {
+                codec: VideoCodec::H264,
+                sps_pps: sps_pps_bytes(),
+            },
+            Frame::Video {
+                pts_us: 0,
+                keyframe: true,
+                nal: bare_keyframe_nal(),
+            },
+            Frame::Video {
+                pts_us: 16_666,
+                keyframe: false,
+                nal: delta_nal(),
+            },
+            Frame::Video {
+                pts_us: 33_333,
+                keyframe: false,
+                nal: delta_nal(),
+            },
+        ];
+        let mut t = transport_with_frames(&frames);
+        let mut ds = DecodeSession::new();
+        // in_flight() is consulted once per Video frame: keyframe sees depth 0 (admitted);
+        // each delta sees depth 2 (== MAX_IN_FLIGHT → dropped).
+        let mut dec = RecordingDecoder {
+            in_flight_script: std::cell::RefCell::new(VecDeque::from(vec![0usize, 2usize, 2usize])),
+            ..RecordingDecoder::default()
+        };
+        let caps = default_client_caps();
+
+        let summary = run_session(&mut t, &caps, &mut ds, &mut dec).unwrap();
+
+        assert_eq!(
+            summary.input_frames_dropped, 2,
+            "both saturated deltas were dropped"
+        );
+        let requests = frames_in(&t.write_sink)
+            .into_iter()
+            .filter(|f| matches!(f, Frame::Control(Control::RequestKeyframe)))
+            .count();
+        assert_eq!(
+            requests, 1,
+            "exactly one keyframe request is sent per drop episode"
+        );
     }
 }
