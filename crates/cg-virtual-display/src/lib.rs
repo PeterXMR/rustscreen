@@ -214,7 +214,7 @@ impl VirtualDisplay {
     }
 
     /// Pin the primary physical display as the **main** screen (origin 0,0) and place this virtual
-    /// display on `side` of it, via one `CGConfigureDisplayOrigin` transaction.
+    /// display on `side` of it. Both origins are set inside one CG display-configuration transaction.
     ///
     /// Pinning the physical display matters because macOS can leave a freshly-created virtual
     /// display at origin (0,0) — which makes the *phone* the primary screen (menu bar + new windows
@@ -258,12 +258,18 @@ impl VirtualDisplay {
                 );
                 return;
             }
-            // 1. Pin the physical display to (0,0) → it becomes / stays the main display. Skipped if
-            //    the anchor somehow IS this virtual display (only-virtual case is handled above).
-            if anchor != self.display_id && cg::CGConfigureDisplayOrigin(token, anchor, 0, 0) != 0 {
+            // 1. Pin the physical display to (0,0) → it becomes / stays the main display. This is the
+            //    whole point of arrange(), and the virtual display's origin below is computed assuming
+            //    the anchor lands at (0,0); if the pin fails, discard the transaction rather than
+            //    commit a placement based on a false assumption (which could overlap the un-moved
+            //    anchor). (`primary_physical_display` already excludes our own id, so anchor is always
+            //    a different display — no self-pin guard needed.)
+            if cg::CGConfigureDisplayOrigin(token, anchor, 0, 0) != 0 {
                 eprintln!(
-                    "cg-virtual-display: arrange: pin-main failed; still placing the virtual display"
+                    "cg-virtual-display: arrange: pin-main failed; leaving default position"
                 );
+                let _ = cg::CGCancelDisplayConfiguration(token);
+                return;
             }
             // 2. Place the virtual display on the requested side of the now-(0,0) main display.
             if cg::CGConfigureDisplayOrigin(token, self.display_id, ox, oy) != 0 {
@@ -275,8 +281,13 @@ impl VirtualDisplay {
                 let _ = cg::CGCancelDisplayConfiguration(token);
                 return;
             }
-            // 0 = kCGConfigureForAppOnly: the change lives for as long as we hold the display.
-            if cg::CGCompleteDisplayConfiguration(token, 0) != 0 {
+            // 1 = kCGConfigureForSession. App-only (0) is private to THIS process and does NOT move
+            // the system-wide main display / menu bar — designating the main display requires at least
+            // session scope. The arrangement still reverts cleanly when the host exits: dropping the
+            // CGVirtualDisplay removes the side display and macOS reflows the built-in back to sole
+            // main. (Permanent (2) would be wrong — it pollutes the user's saved layout with a
+            // transient USB display.)
+            if cg::CGCompleteDisplayConfiguration(token, 1) != 0 {
                 eprintln!("cg-virtual-display: arrange: complete-config failed");
             }
         }
