@@ -505,7 +505,9 @@ pub fn run_stream_session_instrumented(
             // rejects the next `rustscreen start` until the app is force-killed. `Control::Bye` is a
             // clean frame-boundary signal the phone's run_session already handles (→ ends the
             // session, releases the latch). Best-effort: if the peer is already gone the write just
-            // fails; tear down regardless.
+            // fails; tear down regardless. The write/flush is bounded by the write half's 5 s write
+            // timeout (set in run_host), so a vanished phone delays `stop` by at most that, never
+            // indefinitely.
             let _ = Frame::Control(Control::Bye).write_to(&mut counting);
             let _ = counting.flush();
             break;

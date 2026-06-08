@@ -1011,8 +1011,9 @@ const HELLO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 /// disconnect) promptly without re-enumerating the phone.
 const HELLO_POLL: std::time::Duration = std::time::Duration::from_secs(1);
 
-/// Read timeout for the pre-split handshake + clock-sync reads (between [`bring_up_aoa`] and the
-/// transport `split`). Generous on purpose: the phone does its render-surface rendezvous BEFORE it
+/// Read timeout for the pre-split handshake reads (between [`bring_up_aoa`] and the transport
+/// `split`; clock-sync runs AFTER the split on the reader thread's own 250 ms poll, so it is not
+/// covered here). Generous on purpose: the phone does its render-surface rendezvous BEFORE it
 /// replies to the handshake, so on a COLD launch (the app closed itself on the previous `rustscreen
 /// stop`, so `start` relaunches it fresh) the reply can lag the connect-hello by a few seconds. It
 /// must exceed the phone's 10s surface wait so the host doesn't give up first, and it must NOT be a
@@ -1063,9 +1064,10 @@ fn bring_up_aoa(stop: &std::sync::atomic::AtomicBool) -> std::io::Result<crate::
         match recv_frame(&mut transport) {
             Ok((_tag, _hello)) => {
                 // Hello received. Restore a generous read timeout before returning: the caller runs
-                // the handshake + clock-sync on this transport BEFORE splitting it, and inheriting
-                // the 1s HELLO_POLL would make those reads time out mid-frame on a slow cold-launched
-                // phone — desyncing the framing and failing the handshake. (See HANDSHAKE_READ_TIMEOUT.)
+                // the handshake on this transport BEFORE splitting it (clock-sync runs after the
+                // split on the reader thread's own poll), and inheriting the 1s HELLO_POLL would make
+                // those handshake reads time out mid-frame on a slow cold-launched phone — desyncing
+                // the framing and failing the handshake. (See HANDSHAKE_READ_TIMEOUT.)
                 transport.set_read_timeout(HANDSHAKE_READ_TIMEOUT);
                 return Ok(transport);
             }
