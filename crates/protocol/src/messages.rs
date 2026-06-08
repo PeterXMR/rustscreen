@@ -419,9 +419,15 @@ impl Frame {
                 // Validate coordinates: reject NaN and infinities, clamp to [0.0, 1.0].
                 // A malicious or buggy peer could send out-of-range values that would
                 // cause undefined behavior in CGEvent injection on the host.
-                if touch.nx.is_nan() || touch.ny.is_nan() || !touch.nx.is_finite() || !touch.ny.is_finite() {
+                if touch.nx.is_nan()
+                    || touch.ny.is_nan()
+                    || !touch.nx.is_finite()
+                    || !touch.ny.is_finite()
+                {
                     return Err(MessageError::Decode(
-                        <postcard::Error as serde::de::Error>::custom("touch coordinates must be finite"),
+                        <postcard::Error as serde::de::Error>::custom(
+                            "touch coordinates must be finite",
+                        ),
                     ));
                 }
                 let validated = TouchEvent {

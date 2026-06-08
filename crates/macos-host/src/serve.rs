@@ -877,7 +877,8 @@ pub fn run_host(opts: &HostOpts, stop: &AtomicBool) -> std::io::Result<()> {
                 let nanos = std::time::Instant::now().elapsed().as_nanos() as u64;
                 let jitter_range = backoff_ms / 4;
                 let jitter = (nanos % (jitter_range * 2)).saturating_sub(jitter_range) as i64;
-                let backoff_ms = (backoff_ms as i64 + jitter).max(RECONNECT_BACKOFF_BASE_MS as i64) as u64;
+                let backoff_ms =
+                    (backoff_ms as i64 + jitter).max(RECONNECT_BACKOFF_BASE_MS as i64) as u64;
                 println!("rustscreen: reconnect backoff {} ms", backoff_ms);
                 std::thread::sleep(Duration::from_millis(backoff_ms));
                 reconnect_attempt = reconnect_attempt.saturating_add(1);
