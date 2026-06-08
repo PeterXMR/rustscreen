@@ -41,6 +41,7 @@ use protocol::messages::VideoCodec;
 use protocol::nal::CodecConfig;
 
 use crate::decode::{DecodeError, DecoderInput, PresentedFrame, VideoDecoder};
+use crate::rendezvous::SurfaceChange;
 
 // Link the NDK media library. `ndk-sys` only declares the FFI signatures and links
 // `libandroid` (for `ANativeWindow_*`), NOT `libmediandk` — so the `AMediaCodec_*` /
@@ -101,7 +102,31 @@ impl NativeWindow {
     fn as_ptr(&self) -> *mut sys::ANativeWindow {
         self.ptr.as_ptr()
     }
+
+    /// Acquire a second owned handle to the same `ANativeWindow` (refcount++). The one surface
+    /// from `surfaceCreated` is handed to two independent consumers — the consume-once
+    /// [`crate::rendezvous::WindowSlot`] (a fresh session's initial take) and the live
+    /// [`SURFACE_MAILBOX`] (a running session's mid-session swap) — so each needs its own
+    /// reference to release on `Drop`.
+    ///
+    /// `ANativeWindow_acquire`/`_release` are the documented refcount pair, so the underlying
+    /// window stays alive until BOTH handles drop.
+    pub fn clone_acquire(&self) -> NativeWindow {
+        // SAFETY: `ptr` is a live `ANativeWindow` we already hold a reference to; `acquire`
+        // bumps its refcount, and the returned handle releases exactly that reference on `Drop`.
+        unsafe { sys::ANativeWindow_acquire(self.ptr.as_ptr()) };
+        NativeWindow { ptr: self.ptr }
+    }
 }
+
+/// Live render-surface channel for the running decode session. `nativeOnSurface` deposits each
+/// recreated surface (app foregrounded) and `nativeOnSurfaceDestroyed` marks it lost (app
+/// backgrounded); the session loop drains this via [`VideoDecoder::poll_surface`] every iteration
+/// and re-points the codec with `AMediaCodec_setOutputSurface` — keeping ONE session + codec (and
+/// thus the intact H.264 reference chain) alive across the transition instead of tearing down and
+/// reconnecting. See the module-level note on [`crate::rendezvous::SurfaceMailbox`].
+pub static SURFACE_MAILBOX: crate::rendezvous::SurfaceMailbox<NativeWindow> =
+    crate::rendezvous::SurfaceMailbox::new();
 
 impl Drop for NativeWindow {
     fn drop(&mut self) {
@@ -130,6 +155,12 @@ pub struct MediaCodecDecoder {
     queued: Cell<u64>,
     /// Output buffers pulled from `dequeueOutputBuffer` so far (rendered or dropped).
     dequeued: Cell<u64>,
+    /// Whether a live render surface is currently bound. `false` while the app is backgrounded
+    /// (its `SurfaceView` surface destroyed): `drain_output` then releases decoded buffers
+    /// WITHOUT render — the codec keeps draining (no abandoned-`BufferQueue` error spam, no
+    /// input-queue stall) but nothing is presented until a surface returns. Re-enabled by
+    /// `set_output_surface` on foreground. Single decode-thread access, so `Cell`.
+    render_enabled: Cell<bool>,
 }
 
 impl MediaCodecDecoder {
@@ -141,6 +172,7 @@ impl MediaCodecDecoder {
             codec: None,
             queued: Cell::new(0),
             dequeued: Cell::new(0),
+            render_enabled: Cell::new(true),
         }
     }
 }
@@ -148,8 +180,10 @@ impl MediaCodecDecoder {
 /// RAII wrapper over a started `AMediaCodec` (stopped + deleted on `Drop`).
 struct Codec {
     ptr: NonNull<sys::AMediaCodec>,
-    /// Kept alive for the codec's lifetime: the codec renders into this window.
-    _window: NativeWindow,
+    /// Kept alive for as long as the codec renders into it. Replaced (old handle dropped →
+    /// `ANativeWindow_release`) by [`MediaCodecDecoder::set_output_surface`] on a mid-session
+    /// surface swap.
+    window: NativeWindow,
 }
 
 impl Drop for Codec {
@@ -290,7 +324,7 @@ impl VideoDecoder for MediaCodecDecoder {
 
                 Ok(Codec {
                     ptr: codec_ptr,
-                    _window: window,
+                    window,
                 })
             })();
 
@@ -397,9 +431,68 @@ impl VideoDecoder for MediaCodecDecoder {
         self.drain_output(codec, &mut presented)?;
         Ok(presented)
     }
+
+    fn poll_surface(&mut self) -> Result<bool, DecodeError> {
+        // Steady-state fast path: one Relaxed load, no lock, on every frame where nothing changed.
+        if !SURFACE_MAILBOX.is_dirty() {
+            return Ok(false);
+        }
+        match SURFACE_MAILBOX.take() {
+            // App foregrounded / surface re-created: re-point the live codec onto the new surface.
+            SurfaceChange::Swap(window) => {
+                if self.codec.is_some() {
+                    self.set_output_surface(window)?;
+                    // Signal the caller to request a host keyframe: the codec's decoded reference
+                    // frames survived the background (we kept draining, just skipped render), so a
+                    // delta would in principle render correctly — but an IDR is cheap insurance that
+                    // the freshly-bound surface paints a clean frame immediately.
+                    Ok(true)
+                } else {
+                    // Surface churn before the first `configure` (cold launch-by-plug): just update
+                    // the not-yet-bound window `configure` will consume. The consume-once
+                    // `WindowSlot` still drives the initial bind; this only keeps it freshest.
+                    self.window = Some(window);
+                    Ok(false)
+                }
+            }
+            // App backgrounded: the surface is gone. Pause rendering (release without present) so
+            // the codec keeps draining into nothing instead of spamming the abandoned BufferQueue
+            // and stalling. A no-op if we never configured.
+            SurfaceChange::Lost => {
+                self.render_enabled.set(false);
+                Ok(false)
+            }
+            SurfaceChange::None => Ok(false),
+        }
+    }
 }
 
 impl MediaCodecDecoder {
+    /// Re-point the running codec's output onto `window` without tearing it down
+    /// (`AMediaCodec_setOutputSurface`), then drop the previous window handle (releasing its
+    /// `ANativeWindow` reference) and re-enable rendering. The decoder keeps its decoded reference
+    /// frames, so the H.264 stream stays valid across the swap — this is the low-latency recovery
+    /// from a background/foreground surface re-create (vs. a full session reconnect).
+    fn set_output_surface(&mut self, window: NativeWindow) -> Result<(), DecodeError> {
+        let codec = self
+            .codec
+            .as_mut()
+            .ok_or_else(|| DecodeError::Adapter("set_output_surface before configure".into()))?;
+        // SAFETY: `codec.ptr` is a started decoder; `window` is a live `ANativeWindow` we own
+        // (acquired in `nativeOnSurface`). `setOutputSurface` rebinds the output; on success the
+        // codec renders into the new window from the next released buffer on.
+        let status =
+            unsafe { sys::AMediaCodec_setOutputSurface(codec.ptr.as_ptr(), window.as_ptr()) };
+        check(status, "AMediaCodec_setOutputSurface")?;
+        // Replace the kept-alive handle: the old window's `ANativeWindow` reference is released on
+        // drop here, the new one lives for as long as the codec renders into it.
+        codec.window = window;
+        self.render_enabled.set(true);
+        log::info!(
+            "MediaCodecDecoder: swapped output surface (app foreground / surface re-create)"
+        );
+        Ok(())
+    }
     /// Pull ready decoded frames and render them onto the surface (`render = true`),
     /// appending one [`PresentedFrame`] per rendered buffer to `presented`.
     ///
@@ -512,6 +605,18 @@ impl MediaCodecDecoder {
         // `present_us` now stamps the HANDOFF (actual scanout is ~one vsync later, as before — but
         // it no longer stalls this thread); the global clock keeps it in the same epoch as
         // arrive_us / ClockPong t1,t2.
+        if !self.render_enabled.get() {
+            // No live surface (app backgrounded): release WITHOUT render so the buffer returns to
+            // the codec and the pipeline keeps draining — but present nothing. This is what stops
+            // the abandoned-`BufferQueue` error spam and the input-queue stall that a teardown-free
+            // background used to cause. The frame still decoded (it is a valid reference for later
+            // deltas), so the stream stays intact for the foreground swap.
+            // SAFETY: `newest_idx` is a valid output buffer just dequeued and not yet released.
+            let status = unsafe { sys::AMediaCodec_releaseOutputBuffer(codec, newest_idx, false) };
+            check(status, "releaseOutputBuffer(no surface, drop)")?;
+            return Ok(());
+        }
+
         // SAFETY: `newest_idx` is a valid output buffer index just dequeued and not yet released.
         let status = unsafe {
             sys::AMediaCodec_releaseOutputBufferAtTime(codec, newest_idx, monotonic_now_ns())

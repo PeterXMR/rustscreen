@@ -290,6 +290,12 @@ mod android {
                 }
             };
             log::info!("nativeOnSurface: surface ready — depositing for the USB decode session");
+            // Feed BOTH channels: the live mailbox lets a *running* session swap onto this surface
+            // mid-flight (app foregrounded / surface re-create) without reconnecting; the
+            // consume-once SURFACE_SLOT still drives a *fresh* session's initial bind (cold launch
+            // / genuine reconnect). They are independent consumers, so acquire a second
+            // `ANativeWindow` reference for the mailbox — each releases its own on drop.
+            crate::mediacodec::SURFACE_MAILBOX.deposit(window.clone_acquire());
             SURFACE_SLOT.put(window);
         });
     }
@@ -299,9 +305,10 @@ mod android {
     /// onto a now-dead surface (the destroy-before-take race on the launch-by-plug path), and so
     /// a surface deposited but never consumed does not leak its `ANativeWindow` reference.
     ///
-    /// For the MVP single-connect pipeline a surface lost *after* a session already claimed it
-    /// still ends only when the host disconnects (USB EOF) — robust mid-session surface-recreate
-    /// is deferred to the hotplug ladder item.
+    /// A surface lost *after* a session already claimed it (app backgrounded mid-stream) is now
+    /// handled live via [`crate::mediacodec::SURFACE_MAILBOX`]: this marks it lost so the running
+    /// decoder pauses rendering, and the next `nativeOnSurface` deposits the recreated surface for
+    /// the session to swap onto — no teardown, no reconnect.
     #[cfg(feature = "live-decode")]
     #[no_mangle]
     pub extern "system" fn Java_com_rustscreen_client_MainActivity_nativeOnSurfaceDestroyed(
@@ -311,6 +318,10 @@ mod android {
         jni_guard("nativeOnSurfaceDestroyed", || {
             log::info!("nativeOnSurfaceDestroyed: surface gone — retracting any unclaimed window");
             SURFACE_SLOT.clear();
+            // Tell a *running* session its render surface is gone so it pauses rendering (releases
+            // decoded buffers without present) instead of spamming the now-abandoned BufferQueue
+            // and stalling. The session resumes on the next `nativeOnSurface` swap.
+            crate::mediacodec::SURFACE_MAILBOX.mark_lost();
         });
     }
 }

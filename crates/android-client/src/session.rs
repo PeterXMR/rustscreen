@@ -316,6 +316,20 @@ pub fn run_session_with_clock<T: Read + Write>(
     let mut ended_by_host_bye = false;
 
     loop {
+        // Apply any pending render-surface change (app background/foreground) before blocking on
+        // the next read. This keeps ONE session + codec (and its intact H.264 reference chain)
+        // alive across the transition: the decoder re-points onto a recreated surface, or pauses
+        // rendering onto a destroyed one, instead of rendering into an abandoned BufferQueue,
+        // stalling, and forcing a full reconnect (which desyncs the AOA byte stream). On a swap
+        // onto a NEW surface, ask the host for an out-of-band keyframe so it paints clean within
+        // ~1 RTT rather than waiting out the periodic GOP. Cheap (one Relaxed load) when idle.
+        if decoder.poll_surface().map_err(SessionError::Decode)? {
+            Frame::Control(Control::RequestKeyframe)
+                .write_to(transport)
+                .map_err(SessionError::from)?;
+            transport.flush().map_err(SessionError::from)?;
+        }
+
         let frame = match Frame::read_from(transport) {
             Ok(f) => f,
             Err(e) if is_clean_eof(&e) => {
