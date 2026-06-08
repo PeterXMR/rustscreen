@@ -416,14 +416,11 @@ impl Frame {
             }
             tag::TOUCH => {
                 let touch = decode_canonical::<TouchEvent>(payload)?;
-                // Validate coordinates: reject NaN and infinities, clamp to [0.0, 1.0].
-                // A malicious or buggy peer could send out-of-range values that would
-                // cause undefined behavior in CGEvent injection on the host.
-                if touch.nx.is_nan()
-                    || touch.ny.is_nan()
-                    || !touch.nx.is_finite()
-                    || !touch.ny.is_finite()
-                {
+                // Validate coordinates: reject non-finite values, clamp the rest to [0.0, 1.0].
+                // `is_finite()` is false for both NaN and ±inf, so it covers both. A buggy or
+                // hostile peer could otherwise feed garbage into host-side coordinate mapping
+                // once touch injection is wired.
+                if !touch.nx.is_finite() || !touch.ny.is_finite() {
                     return Err(MessageError::Decode(
                         <postcard::Error as serde::de::Error>::custom(
                             "touch coordinates must be finite",
