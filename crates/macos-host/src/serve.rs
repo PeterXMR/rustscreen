@@ -613,6 +613,11 @@ pub fn run_host(opts: &HostOpts, stop: &AtomicBool) -> std::io::Result<()> {
     // Everything above (virtual display, capture, encoder, channel) is warm and shared; each
     // iteration rebuilds only the per-connection half (AOA transport, reader thread, clock-sync,
     // stream). `stop` breaks the loop into the single teardown below; a plain disconnect loops back.
+    // Bring the phone app to the foreground (adb) BEFORE the AOA handshake, while the phone is still
+    // in normal USB mode. This is the "open it" trigger tied to `rustscreen start`; the app's own
+    // foreground accessory poll (MainActivity) then claims the accessory once the AOA switch lands —
+    // so we never depend on the USB_ACCESSORY_ATTACHED intent, which Android Auto can intercept.
+    ensure_android_app_running();
     println!("rustscreen: waiting for the phone (open the app to start streaming)…");
     'reconnect: loop {
         if stop.load(Ordering::Relaxed) {
@@ -627,7 +632,7 @@ pub fn run_host(opts: &HostOpts, stop: &AtomicBool) -> std::io::Result<()> {
             if stop.load(Ordering::Relaxed) {
                 break 'reconnect;
             }
-            match bring_up_aoa() {
+            match bring_up_aoa(stop) {
                 Ok(t) => break t,
                 Err(_) => std::thread::sleep(Duration::from_millis(200)),
             }
@@ -961,16 +966,61 @@ fn report_and_log(
     }
 }
 
+/// Best-effort: bring the RustScreen client app to the foreground on the connected phone before the
+/// AOA handshake, so the user never opens it by hand after `rustscreen start`.
+///
+/// Runs while the phone is still in normal USB mode (adb alive); **non-fatal** — if adb is missing or
+/// the phone isn't reachable we log and fall back to manual open, so a phone without USB-debugging
+/// still works the old way. `am start -W` blocks until the activity is drawn, so there is no
+/// fixed-sleep race: once it returns, the app is foreground and its accessory poll is live, ready to
+/// claim the accessory the instant the AOA switch completes — independent of the
+/// `USB_ACCESSORY_ATTACHED` intent (which Android Auto can intercept). Android Auto is never touched.
+fn ensure_android_app_running() {
+    const ACTIVITY: &str = "com.rustscreen.client/.MainActivity";
+    match std::process::Command::new("adb")
+        .args(["shell", "am", "start", "-W", "-n", ACTIVITY])
+        .output()
+    {
+        Ok(o) if o.status.success() => {
+            println!("rustscreen: brought the phone app to the foreground (adb am start).");
+        }
+        Ok(o) => eprintln!(
+            "rustscreen: `adb am start` failed ({}); open the RustScreen app on the phone manually.",
+            String::from_utf8_lossy(&o.stderr).trim()
+        ),
+        Err(e) => eprintln!(
+            "rustscreen: adb not available ({e}); open the RustScreen app on the phone manually."
+        ),
+    }
+}
+
+/// Total time to wait for the phone's connect-hello on ONE accessory enumeration before giving up
+/// and letting the reconnect loop re-handshake. Kept generous because the host must NOT re-enumerate
+/// the phone while the user is opening the app: each AOA re-handshake (req 51/52/53) re-enumerates
+/// the accessory, which dismisses Android's "Open RustScreen?" dialog and kills an in-progress app
+/// attach — churning it every few seconds prevents the app from ever connecting. We wait patiently
+/// on the SAME connection instead (see [`bring_up_aoa`]).
+const HELLO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Per-poll read timeout while waiting for the hello — short so the wait notices `stop` (and a real
+/// disconnect) promptly without re-enumerating the phone.
+const HELLO_POLL: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// Bring up the live AOA transport and read the device's connect-hello.
 ///
 /// Mirrors `p1_echo`: enumerate → device-level AOA handshake (req 51/52/53) → re-enumerate in
 /// accessory mode → claim the accessory interface → read the one-frame hello the phone sends the
 /// instant it owns the accessory fd (so its reader is live before we write the handshake).
-fn bring_up_aoa() -> std::io::Result<crate::aoa::AoaTransport> {
+///
+/// After the single handshake, wait for the hello **on the same connection** (no re-handshake) so
+/// the phone's accessory stays stable while the user/app opens it — re-enumerating mid-wait is what
+/// stops the app from ever attaching. Polls `stop` so `rustscreen stop` stays prompt.
+fn bring_up_aoa(stop: &std::sync::atomic::AtomicBool) -> std::io::Result<crate::aoa::AoaTransport> {
     use crate::aoa;
     use crate::transport::recv_frame;
     use nusb::MaybeFuture;
-    use std::time::Duration;
+    use std::sync::atomic::Ordering;
+    use std::time::{Duration, Instant};
 
     let candidate = aoa::find_candidate()?;
     let dev = candidate
@@ -981,9 +1031,38 @@ fn bring_up_aoa() -> std::io::Result<crate::aoa::AoaTransport> {
     drop(dev);
     let acc = aoa::reacquire(Duration::from_secs(5))?;
     let mut transport = aoa::open_transport(&acc)?;
-    let (_tag, hello) = recv_frame(&mut transport)?;
-    let _ = hello;
-    Ok(transport)
+    // Poll for the hello on the SAME enumeration with a short per-read timeout, up to HELLO_TIMEOUT
+    // total. The hello is one tiny frame, so a poll timeout only ever fires before its first byte
+    // (a clean "no hello yet") — never mid-frame. Streaming later overrides this on the split
+    // read-half with its own 250 ms poll.
+    transport.set_read_timeout(HELLO_POLL);
+    let deadline = Instant::now() + HELLO_TIMEOUT;
+    loop {
+        if stop.load(Ordering::Relaxed) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "stop requested while waiting for the phone",
+            ));
+        }
+        match recv_frame(&mut transport) {
+            Ok((_tag, _hello)) => return Ok(transport),
+            Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
+                if Instant::now() >= deadline {
+                    eprintln!(
+                        "rustscreen: no connect-hello within {}s — re-running AOA bring-up. Open the \
+                         RustScreen app on the phone; tick \"use by default\" in the USB dialog so it \
+                         auto-opens next time.",
+                        HELLO_TIMEOUT.as_secs()
+                    );
+                    return Err(e);
+                }
+                // No hello yet — keep waiting on the SAME connection (no re-handshake/churn).
+            }
+            // A genuine transport error (real disconnect / phone reverted) → let the caller
+            // re-handshake from scratch.
+            Err(e) => return Err(e),
+        }
+    }
 }
 
 #[cfg(test)]

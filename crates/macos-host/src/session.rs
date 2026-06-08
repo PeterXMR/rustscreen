@@ -499,6 +499,15 @@ pub fn run_stream_session_instrumented(
         // normal teardown below runs (final stats drain + byte tally). Checked between whole
         // frames, never mid-write, so the wire framing stays intact.
         if stop.load(Ordering::Relaxed) {
+            // Tell the phone the session is over BEFORE we tear down. On stop the phone's blocking
+            // read gets NO EOF — the Mac keeps the USB link up; only this worker exits — so without
+            // an explicit Bye the phone freezes on its last frame with its accessory latch held and
+            // rejects the next `rustscreen start` until the app is force-killed. `Control::Bye` is a
+            // clean frame-boundary signal the phone's run_session already handles (→ ends the
+            // session, releases the latch). Best-effort: if the peer is already gone the write just
+            // fails; tear down regardless.
+            let _ = Frame::Control(Control::Bye).write_to(&mut counting);
+            let _ = counting.flush();
             break;
         }
         match frames.recv_timeout(heartbeat) {
@@ -1176,8 +1185,25 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(summary.frames, 0, "stop breaks before any frame is sent");
-        assert!(sink.is_empty(), "no bytes written once stop is observed");
+        assert_eq!(
+            summary.frames, 0,
+            "stop breaks before any video frame is sent"
+        );
+        // On stop, the host must send a graceful Control::Bye so the phone ends its session and
+        // releases its accessory latch. Without it the phone (whose blocking read gets no EOF while
+        // the USB link stays up — only this worker exits) freezes on the last frame and rejects the
+        // next `rustscreen start` until the app is force-killed.
+        let mut cur = std::io::Cursor::new(&sink);
+        let frame = Frame::read_from(&mut cur).expect("stop must send a Control::Bye frame");
+        assert!(
+            matches!(frame, Frame::Control(Control::Bye)),
+            "stop sends Control::Bye, got {frame:?}"
+        );
+        assert_eq!(
+            cur.position() as usize,
+            sink.len(),
+            "Bye is the only frame sent on stop"
+        );
     }
 
     #[test]
