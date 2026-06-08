@@ -296,6 +296,15 @@ impl Write for AoaTransport {
 }
 
 impl AoaTransport {
+    /// Bound how long a blocking `read()` on the undivided transport waits before returning
+    /// [`io::ErrorKind::TimedOut`]. Delegates to the read endpoint (same semantics as
+    /// [`AoaReadHalf::set_read_timeout`]). The host bring-up uses this to poll for the connect-hello
+    /// with a short per-read timeout, so it can notice `stop` instead of blocking forever on a bulk
+    /// IN the phone will never satisfy while the app is still opening.
+    pub fn set_read_timeout(&mut self, timeout: std::time::Duration) {
+        self.reader.set_read_timeout(timeout);
+    }
+
     /// Split into independent read and write halves so the host can read inbound `Frame::Stats`
     /// on a dedicated thread while the main thread streams video on the write half. Each half
     /// owns one nusb endpoint.

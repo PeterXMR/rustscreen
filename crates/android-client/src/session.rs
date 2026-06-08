@@ -185,6 +185,11 @@ pub struct SessionSummary {
     pub input_frames_dropped: u64,
     /// The negotiated streaming configuration (present when the handshake succeeded).
     pub agreed: Option<AgreedConfig>,
+    /// `true` when the loop exited because the host sent [`Control::Bye`] (a deliberate
+    /// `rustscreen stop`), as opposed to a plain EOF/disconnect (a cable replug). The app uses this
+    /// to decide whether to CLOSE itself (host stopped → close) or stay alive and keep polling for
+    /// the host to reconnect (replug → wait). Only an explicit `Bye` sets this.
+    pub ended_by_host_bye: bool,
 }
 
 /// Returns `true` when `e` is an end-of-stream signalled by [`io::ErrorKind::UnexpectedEof`].
@@ -306,6 +311,9 @@ pub fn run_session_with_clock<T: Read + Write>(
     let mut stats = StatsTracker::new(STATS_TRACKER_CAPACITY);
     let mut pacer = InputPacer::new(MAX_IN_FLIGHT);
     let mut input_frames_dropped: u64 = 0;
+    // Set only by the `Control::Bye` arm: distinguishes a deliberate host stop (→ app closes) from
+    // a plain EOF/disconnect (→ app stays and waits for reconnect). See [`SessionSummary`].
+    let mut ended_by_host_bye = false;
 
     loop {
         let frame = match Frame::read_from(transport) {
@@ -388,7 +396,11 @@ pub fn run_session_with_clock<T: Read + Write>(
                 }
             }
             Frame::Control(Control::Bye) => {
-                // Graceful disconnect requested; exit the loop cleanly.
+                // Host deliberately stopped the session (`rustscreen stop`). Exit cleanly AND flag
+                // it so the app closes itself rather than waiting for a reconnect (which a plain
+                // EOF/replug does). This is the in-band "close the app" signal — reachable over the
+                // live USB connection even while the phone is in accessory mode (adb is not).
+                ended_by_host_bye = true;
                 break;
             }
             Frame::Control(_) => {
@@ -413,6 +425,7 @@ pub fn run_session_with_clock<T: Read + Write>(
         configured: decode_session.configured(),
         input_frames_dropped,
         agreed: Some(agreed),
+        ended_by_host_bye,
     })
 }
 
@@ -780,6 +793,11 @@ mod tests {
         assert_eq!(summary.decoded_count, 1);
         assert_eq!(summary.keyframe_count, 1);
         assert!(summary.configured);
+        // Bye is the deliberate host-stop signal → the app must close itself (not wait for reconnect).
+        assert!(
+            summary.ended_by_host_bye,
+            "Control::Bye must flag a host stop so the app closes"
+        );
     }
 
     #[test]
@@ -818,6 +836,12 @@ mod tests {
         assert_eq!(summary.keyframe_count, 1);
         assert!(summary.configured);
         assert_eq!(summary.input_frames_dropped, 0);
+        // A plain EOF is a disconnect/replug, NOT a host stop — the app must stay alive and wait
+        // for reconnect, so this flag stays false (only Control::Bye sets it).
+        assert!(
+            !summary.ended_by_host_bye,
+            "clean EOF must NOT flag a host stop (app should wait for reconnect, not close)"
+        );
         // Agreed config must reflect the host offer.
         let agreed = summary.agreed.unwrap();
         assert_eq!(agreed.width, 2400);

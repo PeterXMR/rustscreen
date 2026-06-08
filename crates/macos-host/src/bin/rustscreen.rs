@@ -191,6 +191,9 @@ fn cmd_stop() {
             }
             let _ = std::fs::remove_file(&pid_path);
             println!("rustscreen: stopped (pid {pid}).");
+            // The phone app closes itself: the worker sends `Control::Bye` over the live USB
+            // connection on stop, and the app kills its process on receipt (adb is unreachable here
+            // anyway while the phone is in accessory mode).
         }
         Some(pid) => {
             let _ = std::fs::remove_file(&pid_path);
