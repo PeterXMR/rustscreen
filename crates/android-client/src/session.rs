@@ -328,6 +328,12 @@ pub fn run_session_with_clock<T: Read + Write>(
                 .write_to(transport)
                 .map_err(SessionError::from)?;
             transport.flush().map_err(SessionError::from)?;
+            // Gate rendering to the next keyframe: a mid-GOP `setOutputSurface` makes the decoder
+            // render the in-flight P-frames as garbage on the freshly recreated surface (the
+            // "glitch for a few seconds" on app foreground). Drop every frame until the IDR we just
+            // requested lands, so the new surface's FIRST painted frame is clean. Mirrors the host's
+            // consumer-side `seen_keyframe` reconnect guard; black for ~1 RTT beats seconds of glitch.
+            pacer.resync_to_keyframe();
         }
 
         let frame = match Frame::read_from(transport) {
