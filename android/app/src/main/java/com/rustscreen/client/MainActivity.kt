@@ -18,21 +18,18 @@ import android.view.Surface
 import android.view.SurfaceHolder
 import android.view.SurfaceView
 import android.view.WindowManager
-import java.util.concurrent.atomic.AtomicBoolean
 
 class MainActivity : Activity() {
 
     private val usb by lazy { getSystemService(Context.USB_SERVICE) as UsbManager }
 
-    // "An echo session is in progress" latch (BL-01). `maybeHandleAccessory`/`openAndRun`
-    // are reachable from onCreate, onResume, onNewIntent AND the permission BroadcastReceiver,
-    // so `AtomicBoolean.compareAndSet` makes "claim the accessory exactly once" a single
-    // atomic step — two paths can't both open it / double-detach the fd / spawn two echo
-    // threads. It is RELEASED when a session ends (echo loop returns) or any open attempt
-    // fails, so a later attach can re-attempt. This deliberately is NOT a permanent one-shot:
-    // a permanent latch could latch onto a stale/half-registered accessory (the device-side
-    // handoff race in HARDWARE-FINDINGS.md) and then never retry.
-    private val sessionActive = AtomicBoolean(false)
+    // "A decode session is in progress" latch (BL-01) now lives on [SessionService.active] so the
+    // claim is atomic across this Activity's poll/permission paths AND the service's session thread
+    // (which releases it when the session ends). `maybeHandleAccessory`/`openAndRun` are reachable
+    // from onCreate, onResume, onNewIntent AND the permission BroadcastReceiver, so a single
+    // `compareAndSet` keeps "claim the accessory exactly once" atomic — two paths can't both claim it
+    // / double-start the service. Not a permanent one-shot: it is released so a later attach (replug,
+    // stale/half-registered accessory) can re-attempt.
 
     // The current render surface, tracked across its create/destroy lifecycle. The native
     // SURFACE_SLOT handoff is consume-once (take_blocking removes it), and surfaceCreated only
@@ -117,6 +114,16 @@ class MainActivity : Activity() {
         // the foreground. (PR #21 "Remaining" item, folded into the live-pipeline ladder item.)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         nativeInit()
+        // Android 13+ gates posting notifications behind a runtime grant. The foreground service
+        // raises process priority regardless, but request it so the "RustScreen — streaming" status
+        // notification (with its Stop action) is actually shown. Fire-and-forget: the service runs
+        // whether or not it is granted.
+        if (Build.VERSION.SDK_INT >= 33 &&
+            checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) !=
+            android.content.pm.PackageManager.PERMISSION_GRANTED
+        ) {
+            requestPermissions(arrayOf(android.Manifest.permission.POST_NOTIFICATIONS), 0)
+        }
         val filter = IntentFilter(ACTION_USB_PERMISSION)
         // Android 13+ requires an explicit export flag for runtime-registered receivers.
         if (Build.VERSION.SDK_INT >= 33) {
@@ -164,7 +171,7 @@ class MainActivity : Activity() {
     // USB_ACCESSORY_ATTACHED intent filter is per-install and resets on reinstall, so we
     // must be able to request it explicitly (otherwise openAccessory silently returns null).
     private fun maybeHandleAccessory() {
-        if (sessionActive.get()) return // cheap early-out; openAndRun does the authoritative claim
+        if (SessionService.active.get()) return // cheap early-out; openAndRun does the authoritative claim
         val accessory: UsbAccessory? =
             intent.getParcelableExtra(UsbManager.EXTRA_ACCESSORY) ?: pickOurAccessory()
         if (accessory == null) {
@@ -195,75 +202,48 @@ class MainActivity : Activity() {
         return list.firstOrNull { it.manufacturer == EXPECTED_MANUFACTURER } ?: list.firstOrNull()
     }
 
-    // Glue only (D0): open the accessory, detach the fd, hand it to Rust. The blocking echo
-    // loop MUST run off the UI thread (else the app ANRs and the echo dies), so spawn a
-    // dedicated thread; the fd's sole ownership moves into native code there.
+    // Glue only: open the accessory HERE (the working path — opening a parcelled UsbAccessory inside
+    // the service returned null on reconnect and spun the poll), detach its fd, and hand the fd to the
+    // foreground [SessionService], which runs the blocking decode session on its own thread. Running
+    // the session in a foreground service (not a plain Activity thread) is what stops Android from
+    // freezing/killing the process when the user switches to another app — see [SessionService] for
+    // the on-device root cause. The render surface stays owned by this Activity and reaches the
+    // service's decode thread through the process-global native channels.
     private fun openAndRun(accessory: UsbAccessory) {
-        // BL-01: claim the session atomically and exactly once, BEFORE any side effect.
-        if (!sessionActive.compareAndSet(false, true)) return
+        // BL-01: claim the session atomically and exactly once, BEFORE any side effect. The service
+        // releases the latch when the session ends.
+        if (!SessionService.active.compareAndSet(false, true)) return
         val pfd: ParcelFileDescriptor = usb.openAccessory(accessory) ?: run {
             Log.w(TAG, "openAccessory returned null even though permission is granted")
-            sessionActive.set(false) // release so a later attach can retry
+            SessionService.active.set(false) // release so a later attach can retry
             return
         }
         val fd = pfd.detachFd()
-        // Defense-in-depth: never hand a negative fd to native code — File::from_raw_fd(-1)
-        // is undefined behavior. detachFd() on this freshly-opened descriptor returns a valid
-        // fd (it throws IllegalStateException only if already closed, which can't happen right
-        // after openAccessory), so this guard is belt-and-suspenders against a platform-
-        // specific deviation; on a hit, release the latch so a later attach can retry. (BL-04)
+        // Defense-in-depth: File::from_raw_fd(-1) on the Rust side is UB. detachFd() on a freshly
+        // opened descriptor returns a valid fd, so this only guards a platform-specific deviation.
         if (fd < 0) {
             Log.e(TAG, "detachFd() returned invalid fd $fd; aborting")
-            sessionActive.set(false)
+            SessionService.active.set(false)
             return
         }
-        Log.i(TAG, "accessory opened — handing fd $fd to native decode session (background thread)")
         // Re-deposit the surface for THIS session. The native handoff is consume-once, so without
-        // this a re-attach (surface already created, slot drained by a previous session) would
-        // time out waiting for a surface that surfaceCreated will never re-announce. If the surface
-        // isn't up yet (cold launch-by-plug), this is null and surfaceCreated deposits it later.
+        // this a re-attach (surface already created, slot drained by a previous session) would time
+        // out waiting for a surface that surfaceCreated will never re-announce. If the surface isn't
+        // up yet (cold launch-by-plug), this is null and surfaceCreated deposits it later.
         currentSurface?.let { surface ->
             Log.i(TAG, "re-depositing existing surface for new decode session")
             nativeOnSurface(surface)
         }
-        // BL-02: once detachFd() returns, the raw fd is owned by nobody until nativeOnUsbFd
-        // wraps it. If starting the thread throws, reclaim and close the fd (and release the
-        // latch) so it isn't leaked.
+        Log.i(TAG, "accessory opened (fd $fd) — starting foreground session service")
         try {
-            Thread({
-                val endedByHostStop = try {
-                    // Blocks running the live decode session (rendezvous with the surface, then
-                    // run_session) until the host disconnects (EOF/error) or sends Control::Bye.
-                    // Returns true ONLY when the host deliberately stopped (Bye → `rustscreen stop`).
-                    nativeOnUsbFd(fd)
-                } finally {
-                    // ALWAYS release the latch — even if the thread body throws or is interrupted —
-                    // so a subsequent attach can re-attempt. A missed release latches sessionActive
-                    // forever and blocks every future reconnect. (The Rust side wraps its body in
-                    // catch_unwind so nativeOnUsbFd shouldn't throw, but the finally keeps the
-                    // invariant regardless of future changes — see the device-side handoff race in
-                    // HARDWARE-FINDINGS.md.)
-                    Log.i(TAG, "session ended; releasing latch for re-attach")
-                    sessionActive.set(false)
-                }
-                if (endedByHostStop) {
-                    // The host sent Control::Bye (`rustscreen stop`) over the live USB connection.
-                    // Close the app entirely: stop holding the screen awake + polling (battery), and
-                    // guarantee the next `rustscreen start` gets a clean COLD process — a warm
-                    // process can fail to re-claim the re-enumerated accessory. A plain
-                    // EOF/disconnect (replug) returns false, so the app stays up to auto-reconnect.
-                    Log.i(TAG, "host stopped the session (Bye) — closing the app")
-                    runOnUiThread {
-                        finishAndRemoveTask()
-                        // Kill the process so the next launch is genuinely cold (fresh native state).
-                        android.os.Process.killProcess(android.os.Process.myPid())
-                    }
-                }
-            }, "usb-session").start()
+            SessionService.start(this, fd)
         } catch (t: Throwable) {
+            // startForegroundService is only disallowed from the background; the accessory poll runs
+            // only while we are foreground, so this should not fire — but reclaim the fd + release the
+            // latch if it does so a later attach can retry.
             runCatching { ParcelFileDescriptor.adoptFd(fd).close() }
-            sessionActive.set(false)
-            Log.e(TAG, "failed to start session thread; reclaimed accessory fd", t)
+            SessionService.active.set(false)
+            Log.e(TAG, "failed to start session service; reclaimed accessory fd", t)
         }
     }
 

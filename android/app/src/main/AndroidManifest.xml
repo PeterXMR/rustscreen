@@ -10,6 +10,14 @@
         android:name="android.hardware.usb.accessory"
         android:required="true" />
 
+    <!-- The decode session runs in a foreground service so the OS does not freeze/kill the cached
+         process when the user switches to another app (which stalled the USB read → host reconnect
+         storm). connectedDevice is the type for an ongoing USB-accessory link. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
+    <!-- Android 13+ gates the status notification (with its Stop action) behind a runtime grant. -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
     <application
         android:label="RustScreen"
         android:theme="@android:style/Theme.NoTitleBar.Fullscreen">
@@ -39,6 +47,14 @@
                 android:name="android.hardware.usb.action.USB_ACCESSORY_ATTACHED"
                 android:resource="@xml/accessory_filter" />
         </activity>
+
+        <!-- Owns the live USB decode session (started from MainActivity once the accessory is
+             claimed). foregroundServiceType=connectedDevice keeps the process at foreground
+             priority so it is never frozen or low-memory-killed while backgrounded. -->
+        <service
+            android:name=".SessionService"
+            android:exported="false"
+            android:foregroundServiceType="connectedDevice" />
 
     </application>
 
