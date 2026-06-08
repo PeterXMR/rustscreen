@@ -70,6 +70,20 @@ impl InputPacer {
             Admission::Feed
         }
     }
+
+    /// Force drop-to-keyframe mode: drop every frame until the next keyframe resyncs the stream.
+    ///
+    /// Used after a render-surface swap (app background → foreground). `AMediaCodec_setOutputSurface`
+    /// re-points the live codec onto the freshly recreated surface, but the in-flight P-frames that
+    /// arrive right after the swap render as mid-GOP garbage on it — the visible "glitch for a few
+    /// seconds" until the periodic/requested IDR lands. Gating to the next keyframe keeps the new
+    /// surface blank for a beat and then paints a clean keyframe, instead of showing the garbage.
+    /// This is the phone-side analog of the host's consumer-side `seen_keyframe` reconnect guard.
+    /// The caller is responsible for asking the host for an out-of-band IDR (`RequestKeyframe`) so
+    /// the gate clears within ~1 RTT rather than waiting out the periodic GOP.
+    pub fn resync_to_keyframe(&mut self) {
+        self.dropping = true;
+    }
 }
 
 #[cfg(test)]
@@ -127,6 +141,21 @@ mod tests {
         assert_eq!(p.admit(false, 1), Admission::Drop); // still dropping
         assert_eq!(p.admit(true, 1), Admission::Feed); // keyframe → resync
         assert_eq!(p.admit(false, 0), Admission::Feed); // depth 0 → feed
+    }
+
+    #[test]
+    fn resync_to_keyframe_drops_until_next_keyframe() {
+        // After a surface swap the pacer is forced into drop mode even though depth is under cap:
+        // every delta is dropped (rendered as nothing) until the keyframe paints the new surface
+        // clean. The forced drop is NOT a fresh episode, so it must not re-request a keyframe
+        // (the swap handler already sent one) — later drops are plain Drop.
+        let mut p = InputPacer::new(2);
+        assert_eq!(p.admit(false, 0), Admission::Feed); // steady state, under cap
+        p.resync_to_keyframe();
+        assert_eq!(p.admit(false, 0), Admission::Drop); // under cap, but gated → drop, no re-request
+        assert_eq!(p.admit(false, 1), Admission::Drop); // still gated
+        assert_eq!(p.admit(true, 1), Admission::Feed); // keyframe clears the gate, paints clean
+        assert_eq!(p.admit(false, 0), Admission::Feed); // back to normal admission
     }
 
     #[test]
