@@ -10,6 +10,8 @@ import android.hardware.usb.UsbAccessory
 import android.hardware.usb.UsbManager
 import android.os.Build
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.os.ParcelFileDescriptor
 import android.util.Log
 import android.view.Surface
@@ -41,6 +43,34 @@ class MainActivity : Activity() {
     // cheap guard in case a future caller ever reads it off-thread.
     @Volatile
     private var currentSurface: Surface? = null
+
+    // Foreground accessory poll. The host (`rustscreen start`) brings this activity to the
+    // foreground via `adb am start`, then performs the AOA switch. When the phone re-enumerates in
+    // accessory mode, the ONLY built-in "accessory attached" signal is the USB_ACCESSORY_ATTACHED
+    // intent — which Android Auto intercepts on some devices (it grabs the handshake, sits on it
+    // ~10s, declines, and our app never receives the intent). So instead of depending on that
+    // intent, while we are foreground we poll the accessory list a few times a second and claim the
+    // accessory the instant it appears. This makes auto-start deterministic regardless of Android
+    // Auto, with no fixed sleeps to tune. Polling runs ONLY while foreground (started in onResume,
+    // stopped in onPause), so a backgrounded/closed app never claims an accessory — which is what
+    // keeps Android Auto working normally when RustScreen isn't in use. maybeHandleAccessory() is
+    // idempotent (guarded by sessionActive), so each tick is a cheap no-op once a session is live.
+    private val accessoryPoller = Handler(Looper.getMainLooper())
+    private val pollForAccessory = object : Runnable {
+        override fun run() {
+            maybeHandleAccessory()
+            accessoryPoller.postDelayed(this, ACCESSORY_POLL_MS)
+        }
+    }
+
+    // One-shot guard so the 250 ms accessory poll requests USB permission at most once per
+    // accessory attach — without it the poll would re-fire requestPermission() (and re-pop the
+    // "Allow?" dialog) ~4×/second while the user is still deciding. Reset when no accessory is
+    // present (poll observes this every tick), so a fresh request is made when one (re)appears; we
+    // deliberately do NOT reset on grant (a session starts) or deny (avoids an instant re-prompt
+    // storm — replug or relaunch to retry). UI-thread only (poll, lifecycle, and the permission
+    // receiver all run on the main thread), so a plain var is sufficient.
+    private var permissionRequested = false
 
     // Receives the result of UsbManager.requestPermission() (the "Allow?" dialog).
     private val permissionReceiver = object : BroadcastReceiver() {
@@ -100,6 +130,7 @@ class MainActivity : Activity() {
 
     override fun onDestroy() {
         super.onDestroy()
+        accessoryPoller.removeCallbacks(pollForAccessory)
         runCatching { unregisterReceiver(permissionReceiver) }
     }
 
@@ -114,6 +145,17 @@ class MainActivity : Activity() {
     override fun onResume() {
         super.onResume()
         maybeHandleAccessory()
+        // Start the foreground accessory poll (see the field comment). removeCallbacks first so a
+        // resume after a transient pause never stacks two poll loops.
+        accessoryPoller.removeCallbacks(pollForAccessory)
+        accessoryPoller.postDelayed(pollForAccessory, ACCESSORY_POLL_MS)
+    }
+
+    override fun onPause() {
+        super.onPause()
+        // Leaving the foreground: stop polling so a backgrounded app never claims the accessory.
+        // This is what lets Android Auto behave exactly as before whenever RustScreen isn't in use.
+        accessoryPoller.removeCallbacks(pollForAccessory)
     }
 
     // Find the accessory (from the launch intent, or the live accessory list) and either
@@ -123,13 +165,18 @@ class MainActivity : Activity() {
     // must be able to request it explicitly (otherwise openAccessory silently returns null).
     private fun maybeHandleAccessory() {
         if (sessionActive.get()) return // cheap early-out; openAndRun does the authoritative claim
-        val accessory: UsbAccessory =
-            intent.getParcelableExtra(UsbManager.EXTRA_ACCESSORY)
-                ?: usb.accessoryList?.firstOrNull()
-                ?: return
+        val accessory: UsbAccessory? =
+            intent.getParcelableExtra(UsbManager.EXTRA_ACCESSORY) ?: pickOurAccessory()
+        if (accessory == null) {
+            // No accessory present (idle, waiting for the host). Clear the one-shot request guard so
+            // a fresh "Allow?" request is made when one (re)appears after the next AOA switch.
+            permissionRequested = false
+            return
+        }
         if (usb.hasPermission(accessory)) {
             openAndRun(accessory)
-        } else {
+        } else if (!permissionRequested) {
+            permissionRequested = true
             Log.i(TAG, "no accessory permission yet — requesting (shows the Allow dialog)")
             val flags = if (Build.VERSION.SDK_INT >= 31) PendingIntent.FLAG_MUTABLE else 0
             val pi = PendingIntent.getBroadcast(
@@ -137,6 +184,15 @@ class MainActivity : Activity() {
             )
             usb.requestPermission(accessory, pi)
         }
+    }
+
+    // Prefer the accessory whose identity matches our AOA host, so the foreground poll never claims
+    // an unrelated accessory (e.g. a car head unit). Falls back to the first accessory to preserve
+    // the prior behavior on any device that reports a different/empty manufacturer string — i.e. this
+    // can only ever be MORE selective than before, never less likely to find our host.
+    private fun pickOurAccessory(): UsbAccessory? {
+        val list = usb.accessoryList ?: return null
+        return list.firstOrNull { it.manufacturer == EXPECTED_MANUFACTURER } ?: list.firstOrNull()
     }
 
     // Glue only (D0): open the accessory, detach the fd, hand it to Rust. The blocking echo
@@ -200,6 +256,15 @@ class MainActivity : Activity() {
     companion object {
         private const val TAG = "RustScreen"
         private const val ACTION_USB_PERMISSION = "com.rustscreen.client.USB_PERMISSION"
+
+        // Foreground accessory-poll cadence. ~4 Hz: claims the accessory within ~250 ms of the AOA
+        // switch (a one-time connect cost, not on the glass-to-glass hot path) while costing only a
+        // cheap atomic load per tick once a session is live.
+        private const val ACCESSORY_POLL_MS = 250L
+
+        // Must equal AOA control-request-52 identity string 0 (manufacturer) in
+        // crates/macos-host/src/aoa.rs and res/xml/accessory_filter.xml.
+        private const val EXPECTED_MANUFACTURER = "RustScreen"
 
         init {
             System.loadLibrary("android_client")
