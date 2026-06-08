@@ -112,7 +112,7 @@ mod android {
         _env: JNIEnv,
         _class: JClass,
         fd: jni::sys::jint,
-    ) {
+    ) -> jni::sys::jboolean {
         use std::os::fd::RawFd;
         // Defensively reject a negative fd before the unsafe wrap below: `File::from_raw_fd`
         // is undefined behavior on an invalid fd (the `FromRawFd` contract requires a valid,
@@ -120,7 +120,7 @@ mod android {
         // already screened it; detachFd() on a live descriptor returns a valid fd.) (BL-04)
         if fd < 0 {
             log::error!("nativeOnUsbFd: refusing invalid accessory fd {fd} (detachFd failed?)");
-            return;
+            return jni::sys::JNI_FALSE;
         }
         // BL-03: never let a Rust `panic!` unwind across the `extern "system"` FFI boundary.
         // Catch it (and any session/echo error), log it, and return cleanly. `AssertUnwindSafe`
@@ -128,9 +128,22 @@ mod android {
         // drops it, closing the fd exactly once.
         let result =
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_usb_fd(fd as RawFd)));
+        // Returns `true` to Kotlin ONLY on a clean host stop (`Control::Bye` → `rustscreen stop`),
+        // so the app closes itself. EOF/disconnect (replug), session errors, and panics return
+        // `false` → the app stays alive and keeps polling to reconnect.
         match result {
-            Ok(Ok(n)) => log::info!("nativeOnUsbFd: session ended cleanly ({n} frames)"),
-            Ok(Err(e)) => log::error!("nativeOnUsbFd: session error: {e}"),
+            Ok(Ok(ended_by_host_bye)) => {
+                log::info!("nativeOnUsbFd: session ended cleanly (host_stop={ended_by_host_bye})");
+                if ended_by_host_bye {
+                    jni::sys::JNI_TRUE
+                } else {
+                    jni::sys::JNI_FALSE
+                }
+            }
+            Ok(Err(e)) => {
+                log::error!("nativeOnUsbFd: session error: {e}");
+                jni::sys::JNI_FALSE
+            }
             Err(panic) => {
                 let msg = panic
                     .downcast_ref::<&str>()
@@ -138,6 +151,7 @@ mod android {
                     .or_else(|| panic.downcast_ref::<String>().cloned())
                     .unwrap_or_else(|| "unknown panic payload".to_string());
                 log::error!("nativeOnUsbFd: caught panic, not unwinding across FFI: {msg}");
+                jni::sys::JNI_FALSE
             }
         }
     }
@@ -165,7 +179,7 @@ mod android {
     /// [`crate::session::run_session`] decoding to that surface until the host disconnects
     /// (EOF) or errors.
     #[cfg(feature = "live-decode")]
-    fn run_usb_fd(fd: std::os::fd::RawFd) -> Result<u64, Box<dyn std::error::Error>> {
+    fn run_usb_fd(fd: std::os::fd::RawFd) -> Result<bool, Box<dyn std::error::Error>> {
         use crate::decode::DecodeSession;
         use crate::mediacodec::MediaCodecDecoder;
         use crate::session::run_session;
@@ -206,19 +220,24 @@ mod android {
             summary.keyframe_count,
             summary.input_frames_dropped
         );
-        Ok(summary.frames_received)
+        // `true` only when the host sent Control::Bye (`rustscreen stop`) → Kotlin closes the app.
+        Ok(summary.ended_by_host_bye)
     }
 
     /// P1 fallback (no `live-decode`): echo each framed message back until EOF, so a bare
     /// `cargo build -p android-client` (without the decode stack) still links this JNI entry.
     #[cfg(not(feature = "live-decode"))]
-    fn run_usb_fd(fd: std::os::fd::RawFd) -> Result<u64, Box<dyn std::error::Error>> {
+    fn run_usb_fd(fd: std::os::fd::RawFd) -> Result<bool, Box<dyn std::error::Error>> {
         log::info!(
             "nativeOnUsbFd: received accessory fd {fd}, starting echo loop (no live-decode)"
         );
         let mut transport = open_with_hello(fd)?;
         log::info!("nativeOnUsbFd: sent connect hello, entering echo loop");
-        Ok(crate::transport::echo_loop(&mut transport)?)
+        let bytes = crate::transport::echo_loop(&mut transport)?;
+        log::info!("nativeOnUsbFd: echo loop ended ({bytes} bytes)");
+        // The echo fallback has no Bye-vs-disconnect distinction (it ends only on EOF), so never
+        // signal a host stop — the live-decode build is the one that closes the app.
+        Ok(false)
     }
 
     /// The render surface, deposited by `nativeOnSurface` and consumed by the USB decode

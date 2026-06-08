@@ -231,9 +231,10 @@ class MainActivity : Activity() {
         // latch) so it isn't leaked.
         try {
             Thread({
-                try {
+                val endedByHostStop = try {
                     // Blocks running the live decode session (rendezvous with the surface, then
-                    // run_session) until the host disconnects (EOF) or errors.
+                    // run_session) until the host disconnects (EOF/error) or sends Control::Bye.
+                    // Returns true ONLY when the host deliberately stopped (Bye → `rustscreen stop`).
                     nativeOnUsbFd(fd)
                 } finally {
                     // ALWAYS release the latch — even if the thread body throws or is interrupted —
@@ -244,6 +245,19 @@ class MainActivity : Activity() {
                     // HARDWARE-FINDINGS.md.)
                     Log.i(TAG, "session ended; releasing latch for re-attach")
                     sessionActive.set(false)
+                }
+                if (endedByHostStop) {
+                    // The host sent Control::Bye (`rustscreen stop`) over the live USB connection.
+                    // Close the app entirely: stop holding the screen awake + polling (battery), and
+                    // guarantee the next `rustscreen start` gets a clean COLD process — a warm
+                    // process can fail to re-claim the re-enumerated accessory. A plain
+                    // EOF/disconnect (replug) returns false, so the app stays up to auto-reconnect.
+                    Log.i(TAG, "host stopped the session (Bye) — closing the app")
+                    runOnUiThread {
+                        finishAndRemoveTask()
+                        // Kill the process so the next launch is genuinely cold (fresh native state).
+                        android.os.Process.killProcess(android.os.Process.myPid())
+                    }
                 }
             }, "usb-session").start()
         } catch (t: Throwable) {
@@ -273,8 +287,10 @@ class MainActivity : Activity() {
         @JvmStatic
         external fun nativeInit()
 
+        // Returns true iff the session ended because the host sent Control::Bye (`rustscreen stop`),
+        // so the caller closes the app. EOF/disconnect (replug) and errors return false → stay alive.
         @JvmStatic
-        external fun nativeOnUsbFd(fd: Int)
+        external fun nativeOnUsbFd(fd: Int): Boolean
 
         // P4 Wave B (DEC-01): hand the SurfaceView's Surface to the native AMediaCodec
         // decode-to-surface adapter (ANativeWindow_fromSurface), and signal teardown when
