@@ -16,7 +16,6 @@ updates:
       cargo-deps:
         patterns:
           - "*"
-        exclude-patterns: []
         update-types:
           - "minor"
           - "patch"
