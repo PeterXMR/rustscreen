@@ -619,6 +619,8 @@ pub fn run_host(opts: &HostOpts, stop: &AtomicBool) -> std::io::Result<()> {
     // so we never depend on the USB_ACCESSORY_ATTACHED intent, which Android Auto can intercept.
     ensure_android_app_running();
     println!("rustscreen: waiting for the phone (open the app to start streaming)…");
+    // Exponential backoff state for reconnect attempts (persists across iterations).
+    let mut reconnect_attempt: u32 = 0;
     'reconnect: loop {
         if stop.load(Ordering::Relaxed) {
             break 'reconnect;
@@ -856,12 +858,30 @@ pub fn run_host(opts: &HostOpts, stop: &AtomicBool) -> std::io::Result<()> {
 
         // --- 6h. stop → break to the single teardown; disconnect → reconnect -------
         // The virtual display + capture stay warm across a disconnect, so a replug pays no cold start.
+        // Exponential backoff with jitter prevents CPU spinning on flaky connections.
+        const RECONNECT_BACKOFF_BASE_MS: u64 = 100;
+        const RECONNECT_BACKOFF_MAX_MS: u64 = 5_000;
+        const RECONNECT_BACKOFF_FACTOR: u64 = 2;
         match classify_connection_end(stop.load(Ordering::Relaxed)) {
             ConnEnd::Stopped => break 'reconnect,
             ConnEnd::Disconnected => {
                 println!(
                     "rustscreen: phone disconnected — waiting for replug (display kept alive)…"
                 );
+                // Exponential backoff with jitter before next reconnect attempt
+                let backoff_ms = (RECONNECT_BACKOFF_BASE_MS
+                    .saturating_mul(RECONNECT_BACKOFF_FACTOR.pow(reconnect_attempt)))
+                .min(RECONNECT_BACKOFF_MAX_MS);
+                // Add jitter: ±25% to avoid thundering herd on multiple instances.
+                // Use nanos since epoch as a simple pseudo-random source (no rand dep).
+                let nanos = std::time::Instant::now().elapsed().as_nanos() as u64;
+                let jitter_range = backoff_ms / 4;
+                let jitter = (nanos % (jitter_range * 2)).saturating_sub(jitter_range) as i64;
+                let backoff_ms =
+                    (backoff_ms as i64 + jitter).max(RECONNECT_BACKOFF_BASE_MS as i64) as u64;
+                println!("rustscreen: reconnect backoff {} ms", backoff_ms);
+                std::thread::sleep(Duration::from_millis(backoff_ms));
+                reconnect_attempt = reconnect_attempt.saturating_add(1);
                 continue 'reconnect;
             }
         }

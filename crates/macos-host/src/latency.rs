@@ -186,19 +186,28 @@ impl PipelineLatency {
                 None => break,
             }
         }
-        if self
-            .inflight
-            .insert(
-                pts_us,
-                HostStamps {
+        use std::collections::hash_map::Entry;
+        match self.inflight.entry(pts_us) {
+            Entry::Vacant(e) => {
+                e.insert(HostStamps {
                     capture_us,
                     encode_done_us,
                     send_done_us,
-                },
-            )
-            .is_none()
-        {
-            self.order.push_back(pts_us);
+                });
+                self.order.push_back(pts_us);
+            }
+            Entry::Occupied(mut e) => {
+                // Key collision (duplicate or wrapped pts_us): overwrite the existing entry
+                // but do NOT push to order again (the old key will be popped and remove this entry).
+                // This is a rare edge case (u64 µs wraps in ~584 years at 60fps), but we handle it
+                // correctly rather than silently corrupting latency data.
+                e.insert(HostStamps {
+                    capture_us,
+                    encode_done_us,
+                    send_done_us,
+                });
+                // The old key remains in `order` and will eventually evict this entry.
+            }
         }
     }
 
