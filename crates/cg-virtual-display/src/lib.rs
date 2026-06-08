@@ -265,9 +265,7 @@ impl VirtualDisplay {
             //    anchor). (`primary_physical_display` already excludes our own id, so anchor is always
             //    a different display — no self-pin guard needed.)
             if cg::CGConfigureDisplayOrigin(token, anchor, 0, 0) != 0 {
-                eprintln!(
-                    "cg-virtual-display: arrange: pin-main failed; leaving default position"
-                );
+                eprintln!("cg-virtual-display: arrange: pin-main failed; leaving default position");
                 let _ = cg::CGCancelDisplayConfiguration(token);
                 return;
             }
