@@ -977,6 +977,11 @@ fn report_and_log(
 /// `USB_ACCESSORY_ATTACHED` intent (which Android Auto can intercept). Android Auto is never touched.
 fn ensure_android_app_running() {
     const ACTIVITY: &str = "com.rustscreen.client/.MainActivity";
+    // The app closes itself on `rustscreen stop` (it receives `Control::Bye` over the live USB
+    // connection and kills its process — see android `MainActivity`/`run_session`), so by the next
+    // `rustscreen start` it is gone and this `am start` is a clean COLD launch. No `adb force-stop`
+    // is needed here — the close is driven by the in-band message, which (unlike adb) is reachable
+    // while the phone is in accessory mode.
     match std::process::Command::new("adb")
         .args(["shell", "am", "start", "-W", "-n", ACTIVITY])
         .output()
@@ -1005,6 +1010,17 @@ const HELLO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 /// Per-poll read timeout while waiting for the hello — short so the wait notices `stop` (and a real
 /// disconnect) promptly without re-enumerating the phone.
 const HELLO_POLL: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Read timeout for the pre-split handshake + clock-sync reads (between [`bring_up_aoa`] and the
+/// transport `split`). Generous on purpose: the phone does its render-surface rendezvous BEFORE it
+/// replies to the handshake, so on a COLD launch (the app closed itself on the previous `rustscreen
+/// stop`, so `start` relaunches it fresh) the reply can lag the connect-hello by a few seconds. It
+/// must exceed the phone's 10s surface wait so the host doesn't give up first, and it must NOT be a
+/// short poll like `HELLO_POLL`:
+/// a timeout that fires mid-frame leaves `read_exact` partway through a frame and desyncs the framing
+/// ("Hit the end of buffer, expected more data"), which fails the handshake and triggers reconnect
+/// churn. One generous read is correct; the streaming read-half gets its own 250 ms poll after split.
+const HANDSHAKE_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// Bring up the live AOA transport and read the device's connect-hello.
 ///
@@ -1045,7 +1061,14 @@ fn bring_up_aoa(stop: &std::sync::atomic::AtomicBool) -> std::io::Result<crate::
             ));
         }
         match recv_frame(&mut transport) {
-            Ok((_tag, _hello)) => return Ok(transport),
+            Ok((_tag, _hello)) => {
+                // Hello received. Restore a generous read timeout before returning: the caller runs
+                // the handshake + clock-sync on this transport BEFORE splitting it, and inheriting
+                // the 1s HELLO_POLL would make those reads time out mid-frame on a slow cold-launched
+                // phone — desyncing the framing and failing the handshake. (See HANDSHAKE_READ_TIMEOUT.)
+                transport.set_read_timeout(HANDSHAKE_READ_TIMEOUT);
+                return Ok(transport);
+            }
             Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
                 if Instant::now() >= deadline {
                     eprintln!(
