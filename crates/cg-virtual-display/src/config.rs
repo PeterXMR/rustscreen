@@ -121,13 +121,19 @@ pub fn hidpi_modes(width: u32, height: u32, refresh: f64, hidpi: bool) -> Vec<Mo
 }
 
 /// Compute the global-space top-left origin for the virtual display so it sits on the
-/// given `side` of the main display. `vdisp_size` is the virtual display's pixel size.
-/// The result is passed to `CGConfigureDisplayOrigin`.
+/// given `side` of the main display. `vdisp_size` is the virtual display's size in the SAME
+/// global-space units as `main` (points, as `CGDisplayBounds` reports) — required so the
+/// bottom-alignment below lines up. The result is passed to `CGConfigureDisplayOrigin`.
 pub fn arrangement_origin(main: DisplayBounds, vdisp_size: (i32, i32), side: Side) -> (i32, i32) {
     let (vw, vh) = vdisp_size;
+    // Side-by-side (Left/Right): BOTTOM-align the virtual display with the main display's bottom
+    // edge (oy = main bottom − vh), not top-align it. A shorter external then sits at the lower
+    // edge — the common laptop+monitor layout where the cursor crosses near the bottom — instead
+    // of floating at the top. (Equal-height displays make this identical to top-aligning.)
+    let bottom_aligned_y = main.y + main.height - vh;
     match side {
-        Side::Right => (main.x + main.width, main.y),
-        Side::Left => (main.x - vw, main.y),
+        Side::Right => (main.x + main.width, bottom_aligned_y),
+        Side::Left => (main.x - vw, bottom_aligned_y),
         Side::Above => (main.x, main.y - vh),
         Side::Below => (main.x, main.y + main.height),
     }
@@ -248,5 +254,21 @@ mod tests {
     fn respects_nonzero_main_origin() {
         let o = arrangement_origin(main_at(100, 50, 1920, 1080), (2400, 1080), Side::Right);
         assert_eq!(o, (2020, 50));
+    }
+
+    #[test]
+    fn right_bottom_aligns_a_shorter_display() {
+        // Realistic HiDPI case: built-in 1512×982 pt, virtual presented at 1200×540 pt (shorter).
+        // The virtual display sits past the right edge with its BOTTOM level with the main's
+        // bottom: oy = main.y + main.height - vh = 0 + 982 - 540 = 442 (not 0 / top-aligned).
+        let o = arrangement_origin(main_at(0, 0, 1512, 982), (1200, 540), Side::Right);
+        assert_eq!(o, (1512, 442));
+    }
+
+    #[test]
+    fn left_bottom_aligns_a_shorter_display() {
+        // Same bottom-alignment on the left: ox = main.x - vw, oy bottom-aligned.
+        let o = arrangement_origin(main_at(0, 0, 1512, 982), (1200, 540), Side::Left);
+        assert_eq!(o, (-1200, 442));
     }
 }
