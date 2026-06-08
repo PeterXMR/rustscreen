@@ -260,9 +260,7 @@ impl VirtualDisplay {
             }
             // 1. Pin the physical display to (0,0) → it becomes / stays the main display. Skipped if
             //    the anchor somehow IS this virtual display (only-virtual case is handled above).
-            if anchor != self.display_id
-                && cg::CGConfigureDisplayOrigin(token, anchor, 0, 0) != 0
-            {
+            if anchor != self.display_id && cg::CGConfigureDisplayOrigin(token, anchor, 0, 0) != 0 {
                 eprintln!(
                     "cg-virtual-display: arrange: pin-main failed; still placing the virtual display"
                 );
@@ -292,7 +290,9 @@ impl VirtualDisplay {
 ///
 /// # Safety
 /// Calls the CoreGraphics display-list FFI; valid to call from any thread.
-unsafe fn primary_physical_display(virtual_id: cg::CGDirectDisplayID) -> Option<cg::CGDirectDisplayID> {
+unsafe fn primary_physical_display(
+    virtual_id: cg::CGDirectDisplayID,
+) -> Option<cg::CGDirectDisplayID> {
     let mut ids = [0u32; 16];
     let mut count: u32 = 0;
     if cg::CGGetActiveDisplayList(ids.len() as u32, ids.as_mut_ptr(), &mut count) != 0 {
