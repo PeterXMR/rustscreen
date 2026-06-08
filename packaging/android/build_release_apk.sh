@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 #
 # build_release_apk.sh — build the release Android client end-to-end:
-#   1. cross-compile the Rust cdylib into jniLibs via cargo-ndk (release profile)
+#   1. cross-compile the Rust cdylib into jniLibs via cargo-ndk (the `dist` profile — the
+#      size-optimized shipped profile; see the `--profile dist` call below)
 #   2. assemble the release APK via Gradle (signed per android/app/build.gradle.kts)
 #
-# P8 packaging scaffold. Mirrors the debug flow in the README but uses the release
-# profile and the release signing config. If no release keystore is configured the
+# P8 packaging scaffold. Mirrors the debug flow in the README but uses the shipped `dist`
+# Rust profile and the release signing config. If no release keystore is configured the
 # Gradle step falls back to the debug key with a warning (see build.gradle.kts) — fine
 # for a smoke test, NOT for distribution.
 #

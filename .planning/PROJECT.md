@@ -19,15 +19,15 @@ A user plugs a Pixel 6a into an M1 MacBook with one USB-C cable, launches the ho
 - ✓ **P2** Virtual display from Rust via private `CGVirtualDisplay` (keystone risk R1 retired); arrangeable HiDPI external display.
 - ✓ **P3** Capture virtual display + VideoToolbox H.264 encode (RealTime, no B-frames, ~10 ms/frame).
 - ✓ **P4** Decode-to-surface on the Pixel via `AMediaCodec` → `ANativeWindow`.
-- ✓ **P5** Live end-to-end pipeline — the Mac's extended desktop renders on the phone; glass-to-glass instrumented (SNTP clock-sync) + tuned to **~80 ms p50 best** on device.
+- ✓ **P5** Live end-to-end pipeline — the Mac's extended desktop renders on the phone; glass-to-glass instrumented (SNTP clock-sync) + tuned to **~34 ms p50 (PR #27)** on device, under the < 50 ms target.
 
 ### Active — the three user-set priorities (2026-06-05)
 
 <!-- Current scope, in priority order. `ROADMAP.md` → "Active Priorities" is the single source of truth for sub-tasks. -->
 
-- [ ] **1. `rustscreen` terminal app** — installable release binary; `rustscreen start` runs the host + auto-streams when the phone app opens; `rustscreen stop` kills it.
-- [ ] **2. Automatic reconnect** — `start` is a supervisor loop that re-handshakes on phone-app close/reopen, host restart, or cable replug.
-- [ ] **3. Native-feel latency** — drive glass-to-glass < 50 ms (next lever: non-blocking USB writes, ~18 ms).
+- [x] **1. `rustscreen` terminal app** ✅ (PR #25) — installable release binary; `rustscreen start` runs the host + auto-streams when the phone app opens; `rustscreen stop` kills it.
+- [x] **2. Automatic reconnect** ✅ (PR #26) — `start` is a supervisor loop that re-handshakes on phone-app close/reopen, host restart, or cable replug.
+- [x] **3. Native-feel latency** ✅ (PR #27) — glass-to-glass p50 ~34 ms, under the < 50 ms target. Remaining latency work is the p95 tail / behaviour under sustained load.
 
 ### Deferred (behind the three priorities)
 
@@ -53,7 +53,7 @@ A user plugs a Pixel 6a into an M1 MacBook with one USB-C cable, launches the ho
 - **Architecture is de-risk-first:** P1–P4 are spikes (de-risking experiments with acceptance criteria, expanded into detailed TDD plans only after each spike succeeds). P0 and P5–P8 are build phases. Pure-Rust pieces (protocol framing, coordinate mapping) use TDD.
 - **Three unavoidable FFI boundaries (honest scope, §0):** (1) Android `NativeActivity` — `android_main()` in Rust + `AndroidManifest.xml` config; (2) macOS virtual display — hand-written bindings to the private `CGVirtualDisplay` ObjC class; (3) Android USB accessory FD — a few `jni` calls to `UsbManager.openAccessory()` returning an `fd` read via `std::fs`.
 - **Rust purity is a living metric:** MVP target (end P6) ~85% Rust source (Kotlin shell + ObjC++ shim + Swift bridge are the deltas); stretch (end P8) ~99% (only `AndroidManifest.xml` + in-OS NativeActivity glue remain).
-- **Latency budget (measured in P5):** glass-to-glass **best ~80 ms p50** on device (Pixel 6a + M1, 2400×1080@60); target **< 50 ms**, practical floor **~43 ms** (one 60 Hz vsync ~16.7 ms + Tensor decode ~12 ms are immovable on this hardware). Phone input-queue bufferbloat solved; host encoder pacing + VideoToolbox low-latency mode shipped. Remaining levers ranked in ROADMAP Priority 3 (non-blocking USB writes first, ~18 ms).
+- **Latency budget (measured in P5, tuned through PR #27):** glass-to-glass **~34 ms p50** on device (Pixel 6a + M1, 2400×1080@60) — under the **< 50 ms** target, at the practical floor **~43 ms** (one 60 Hz vsync ~16.7 ms + Tensor decode ~12 ms are immovable on this hardware). Phone input-queue bufferbloat solved; host encoder pacing + VideoToolbox low-latency mode + the phone decode-drain fix (PR #27) shipped. (Note: non-blocking USB writes were tried and **reverted** — they regressed to ~100 ms; the decode-drain fix was the real win.) Remaining work is the p95 tail / behaviour under load.
 
 ## Constraints
 

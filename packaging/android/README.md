@@ -24,8 +24,10 @@ packaging/android/build_release_apk.sh
 # → android/app/build/outputs/apk/release/app-release.apk
 ```
 
-The Gradle release build uses the release Rust profile (`[profile.release]` in the
-workspace `Cargo.toml`: size-optimized, LTO, stripped) for the `.so`.
+The Gradle release build uses the `dist` Rust profile (`[profile.dist]` in the workspace
+`Cargo.toml`: size-optimized — `opt-level = "z"`, full LTO, stripped) for the `.so`. (The
+`[profile.release]` profile is the speed-tuned dev/benchmark profile — `opt-level = 3`, thin LTO,
+not stripped — not the shipped one.)
 
 ## Release signing
 

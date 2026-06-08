@@ -78,8 +78,16 @@ struct FrameSinkIvars {
     /// VideoToolbox in-flight encode depth = frames submitted minus frames emitted. The capture
     /// delegate bounds this (latency TODO #2) so `capture→encode` cannot bufferbloat.
     in_flight: Arc<AtomicUsize>,
-    /// Count of capture frames shed pre-encode because `in_flight` was at the cap (diagnostic).
+    /// Count of capture frames shed PRE-encode because `in_flight` was at the cap. These are
+    /// SAFE: VideoToolbox never sees the shed frame, so the H.264 reference chain stays valid and
+    /// no resync is needed. Kept separate from `shed_post_encode` so the connection-end log can
+    /// distinguish harmless pacing drops from reference-chain-breaking ones (diagnostic).
     dropped: Arc<AtomicUsize>,
+    /// Count of fully-ENCODED frames dropped POST-encode (bounded channel `Full`). Each one breaks
+    /// the reference chain and forces the next frame to an IDR (see `needs_keyframe`), so a nonzero
+    /// value means resyncs fired. Tracked apart from `dropped` because the two have opposite
+    /// latency-correctness meaning (diagnostic).
+    shed_post_encode: Arc<AtomicUsize>,
     /// Forces the NEXT submitted frame to an IDR. The capture delegate consumes the flag at
     /// VT-submit time. Set from two places:
     /// - the encode handler, when a fully-ENCODED frame is dropped post-encode (channel `Full`):
@@ -148,7 +156,7 @@ objc2::define_class!(
             // is this one frame's encode latency.
             let submit_t = std::time::Instant::now();
             let in_flight_h = Arc::clone(&in_flight);
-            let dropped_h = Arc::clone(&self.ivars().dropped);
+            let shed_post_encode_h = Arc::clone(&self.ivars().shed_post_encode);
             let needs_keyframe_h = Arc::clone(&self.ivars().needs_keyframe);
             let handler = block2::RcBlock::new(
                 move |status: i32,
@@ -204,7 +212,7 @@ objc2::define_class!(
                     // pacing production to the consumer and keeping latency flat. `Disconnected`
                     // means the consumer (phone) is gone; the main thread handles teardown.
                     if let Err(mpsc::TrySendError::Full(_)) = tx.try_send(frame) {
-                        dropped_h.fetch_add(1, Ordering::Relaxed);
+                        shed_post_encode_h.fetch_add(1, Ordering::Relaxed);
                         // This frame was already ENCODED, so VideoToolbox advanced its reference
                         // state past an access unit the phone never received. Force the next
                         // submitted frame to an IDR so the decoder resyncs across the gap instead
@@ -268,6 +276,7 @@ impl FrameSink {
             pts_idx: AtomicI64::new(0),
             in_flight: Arc::new(AtomicUsize::new(0)),
             dropped: Arc::new(AtomicUsize::new(0)),
+            shed_post_encode: Arc::new(AtomicUsize::new(0)),
             needs_keyframe: Arc::new(AtomicBool::new(false)),
         });
         unsafe { objc2::msg_send![super(this), init] }
@@ -779,18 +788,23 @@ pub fn run_host(opts: &HostOpts, stop: &AtomicBool) -> std::io::Result<()> {
             stop, // external stop (rustscreen stop → SIGTERM) breaks the stream into teardown
         );
 
-        // `dropped`/`in_flight` live in the warm FrameSink and are NOT reset per reconnect, so
-        // these are cumulative across every connection since the host started — labelled as such
-        // so a climbing "shed" count across replugs doesn't read as a per-connection anomaly.
+        // These counters live in the warm FrameSink and are NOT reset per reconnect, so they are
+        // cumulative across every connection since the host started — labelled as such so a
+        // climbing count across replugs doesn't read as a per-connection anomaly. Pre- and
+        // post-encode shed are reported separately: pre-encode is SAFE pacing (no resync), while
+        // post-encode each forced an IDR resync — a high post-encode count means the link is
+        // under-provisioned for the bitrate.
         println!(
-            "rustscreen: encoder pacing — shed {} frames cumulative since host start (in-flight cap \
-             + channel backpressure); current in-flight depth {}.",
+            "rustscreen: encoder pacing — shed {} pre-encode (safe, in-flight cap) + {} post-encode \
+             (forced IDR resync, channel backpressure) frames cumulative since host start; current \
+             in-flight depth {}.",
             sink.ivars().dropped.load(Ordering::Relaxed),
+            sink.ivars().shed_post_encode.load(Ordering::Relaxed),
             sink.ivars().in_flight.load(Ordering::Relaxed),
         );
 
         // This connection's final latency report (also appended to the CSV log if enabled).
-        report_and_log(&pipeline.report(), offset, now_us());
+        report_and_log(pipeline.report(), offset, now_us());
         match &result {
             Ok(summary) => println!(
                 "rustscreen: connection ended cleanly — {} frames, {} bytes sent; encode mean {:.2} ms.",
@@ -935,6 +949,31 @@ fn report_and_log(
     }
 }
 
+/// Bring up the live AOA transport and read the device's connect-hello.
+///
+/// Mirrors `p1_echo`: enumerate → device-level AOA handshake (req 51/52/53) → re-enumerate in
+/// accessory mode → claim the accessory interface → read the one-frame hello the phone sends the
+/// instant it owns the accessory fd (so its reader is live before we write the handshake).
+fn bring_up_aoa() -> std::io::Result<crate::aoa::AoaTransport> {
+    use crate::aoa;
+    use crate::transport::recv_frame;
+    use nusb::MaybeFuture;
+    use std::time::Duration;
+
+    let candidate = aoa::find_candidate()?;
+    let dev = candidate
+        .open()
+        .wait()
+        .map_err(|e| std::io::Error::other(format!("open candidate: {e}")))?;
+    aoa::handshake(&dev)?;
+    drop(dev);
+    let acc = aoa::reacquire(Duration::from_secs(5))?;
+    let mut transport = aoa::open_transport(&acc)?;
+    let (_tag, hello) = recv_frame(&mut transport)?;
+    let _ = hello;
+    Ok(transport)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -959,29 +998,4 @@ mod tests {
             "disconnected sender drains to zero too"
         );
     }
-}
-
-/// Bring up the live AOA transport and read the device's connect-hello.
-///
-/// Mirrors `p1_echo`: enumerate → device-level AOA handshake (req 51/52/53) → re-enumerate in
-/// accessory mode → claim the accessory interface → read the one-frame hello the phone sends the
-/// instant it owns the accessory fd (so its reader is live before we write the handshake).
-fn bring_up_aoa() -> std::io::Result<crate::aoa::AoaTransport> {
-    use crate::aoa;
-    use crate::transport::recv_frame;
-    use nusb::MaybeFuture;
-    use std::time::Duration;
-
-    let candidate = aoa::find_candidate()?;
-    let dev = candidate
-        .open()
-        .wait()
-        .map_err(|e| std::io::Error::other(format!("open candidate: {e}")))?;
-    aoa::handshake(&dev)?;
-    drop(dev);
-    let acc = aoa::reacquire(Duration::from_secs(5))?;
-    let mut transport = aoa::open_transport(&acc)?;
-    let (_tag, hello) = recv_frame(&mut transport)?;
-    let _ = hello;
-    Ok(transport)
 }

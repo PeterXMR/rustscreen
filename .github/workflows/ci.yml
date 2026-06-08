@@ -17,6 +17,9 @@ jobs:
         with:
           components: clippy, rustfmt
 
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+
       - name: cargo build --workspace
         run: cargo build --workspace
 
@@ -25,6 +28,14 @@ jobs:
 
       - name: cargo clippy --workspace --all-targets
         run: cargo clippy --workspace --all-targets -- -D warnings
+
+      # The jobs above build feature-free, which SKIPS every `required-features`-gated live host
+      # binary (p5_stream, rustscreen, p3_*, p6_inject) and the whole `serve`/`session` live
+      # pipeline — the latency-critical code. Compile + clippy it here so a type error or lint
+      # failure in the live host path can't merge green. (It only COMPILES in CI; running it needs
+      # Mac screen-recording permission + the Pixel, so there is no `cargo test` with these features.)
+      - name: cargo clippy -p macos-host (live features)
+        run: cargo clippy -p macos-host --all-targets --features live-capture,live-usb,live-inject -- -D warnings
 
       - name: cargo fmt --check
         run: cargo fmt --all -- --check
@@ -43,6 +54,9 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-linux-android
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
 
       - name: Set up Android NDK r25c
         id: setup-ndk
@@ -80,6 +94,15 @@ jobs:
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+
+      # Prove the SHIPPED profile (`dist`: opt-level=z + full LTO) of the real featured host binary
+      # builds — full LTO can surface codegen/link errors thin-LTO `release` does not, and
+      # make_app.sh builds `--profile dist` with no features (only the stub `macos-host` bin).
+      - name: cargo build --profile dist (live host binary)
+        run: cargo build --profile dist -p macos-host --bin rustscreen --features live-capture,live-usb
 
       - name: Assemble unsigned RustScreen.app (release)
         run: packaging/macos/make_app.sh

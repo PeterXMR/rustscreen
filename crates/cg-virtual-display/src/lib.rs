@@ -62,14 +62,17 @@ fn private_class(name: &str) -> Option<&'static AnyClass> {
 
 /// A live macOS virtual display. The display is removed when this value is dropped.
 ///
-/// We hold only the retained `CGVirtualDisplay` object (`_display`); dropping it releases
-/// the object, which tears the on-screen display down. The dispatch queue and termination
-/// handler are *not* stored here: the private API retains them internally when they are set
-/// on the descriptor (the `queue` property is `strong`, the `terminationHandler` is `copy`),
-/// so our local handles in `new_inner` can be dropped after creation without a
-/// use-after-free.
+/// We retain the `CGVirtualDisplay` object (`_display`) plus the descriptor (`_desc`) and its
+/// dispatch queue (`_queue`). Rather than *assume* the private API takes ownership of the queue
+/// and descriptor (an undocumented retain contract — if it is `assign`/`weak` instead of
+/// `strong`, dropping our local handles after creation would free a queue CoreGraphics still
+/// fires its termination handler onto, a use-after-free on teardown), we keep them alive for the
+/// display's lifetime ourselves. Field order is the drop order: `_display` is released first (it
+/// may reference the descriptor), then `_desc` (which references the queue), then `_queue`.
 pub struct VirtualDisplay {
     _display: Retained<AnyObject>,
+    _desc: Retained<AnyObject>,
+    _queue: dispatch2::DispatchRetained<dispatch2::DispatchQueue>,
     display_id: u32,
 }
 
@@ -85,6 +88,11 @@ impl VirtualDisplay {
     /// scaled modes, and optional default-side arrangement).
     pub fn with_config(cfg: &DisplayConfig) -> Result<Self, VirtualDisplayError> {
         if cfg.width == 0 || cfg.height == 0 {
+            return Err(VirtualDisplayError::CreationFailed);
+        }
+        // Reject a non-finite or non-positive refresh up front rather than handing 0/NaN to the
+        // private `initWithWidth:height:refreshRate:` (a config error, not a runtime surprise).
+        if !cfg.refresh.is_finite() || cfg.refresh <= 0.0 {
             return Err(VirtualDisplayError::CreationFailed);
         }
         // SAFETY: every msg-send below targets a private CoreGraphics class resolved by name;
@@ -115,8 +123,13 @@ impl VirtualDisplay {
 
         let name = NSString::from_str(&cfg.name);
         let _: () = msg_send![&*desc, setName: &*name];
-        let _: () = msg_send![&*desc, setMaxPixelsWide: cfg.width];
-        let _: () = msg_send![&*desc, setMaxPixelsHigh: cfg.height];
+        // `maxPixelsWide`/`maxPixelsHigh` are `NSUInteger` (64-bit on arm64/x86_64). Pass `usize`,
+        // not `u32`: a sub-word `u32` argument leaves the upper 32 bits of the register undefined
+        // under the arm64 calling convention, which CoreGraphics could read as a garbage dimension.
+        // Widening is safe either way — if the real selector is `uint32_t` the callee just reads
+        // the correct low 32 bits.
+        let _: () = msg_send![&*desc, setMaxPixelsWide: cfg.width as usize];
+        let _: () = msg_send![&*desc, setMaxPixelsHigh: cfg.height as usize];
         // Physical size at ~110 ppi (1 px ≈ 0.231 mm). Only affects reported DPI, not creation.
         let size = CGSize::new(cfg.width as f64 * 0.231, cfg.height as f64 * 0.231);
         let _: () = msg_send![&*desc, setSizeInMillimeters: size];
@@ -178,13 +191,13 @@ impl VirtualDisplay {
 
         let display_id: u32 = msg_send![&*disp, displayID];
 
-        // The dispatch queue is retained by the descriptor/display internally, so we may drop
-        // our local handle; `desc`, the mode objects, and `settings` are likewise retained as
-        // needed. Only the display itself must outlive this function to keep it alive.
-        drop(queue);
-
+        // Keep the descriptor and its dispatch queue alive for the display's lifetime (see the
+        // `VirtualDisplay` struct doc) instead of relying on the private API's undocumented retain
+        // semantics. The mode objects and `settings` are not referenced after `applySettings:`.
         let display = Self {
             _display: disp,
+            _desc: desc,
+            _queue: queue,
             display_id,
         };
         // Place on the requested side (non-fatal on CG error — see `arrange`).

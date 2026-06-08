@@ -39,10 +39,19 @@ extern "C" fn on_term(_sig: libc::c_int) {
 }
 
 fn install_signal_handlers() {
+    let handler = on_term as *const () as libc::sighandler_t;
     // SAFETY: the handler is async-signal-safe (an atomic store only).
-    unsafe {
-        libc::signal(libc::SIGTERM, on_term as *const () as libc::sighandler_t);
-        libc::signal(libc::SIGINT, on_term as *const () as libc::sighandler_t);
+    for sig in [libc::SIGTERM, libc::SIGINT] {
+        // `signal()` returns SIG_ERR on failure; a silently-failed install would leave the worker
+        // ignoring `rustscreen stop` so only the SIGKILL backstop could stop it (3s slower, with a
+        // teardown-skipped warning). Surface it instead of dropping it. (NOTE: BSD `signal()` sets
+        // SA_RESTART, so SIGTERM does not interrupt the blocking USB flush — the worker observes the
+        // stop flag only when that syscall returns. Switching to `sigaction` without SA_RESTART for
+        // a prompt clean teardown is a behavioral change deferred for on-device verification.)
+        let prev = unsafe { libc::signal(sig, handler) };
+        if prev == libc::SIG_ERR {
+            eprintln!("rustscreen[serve]: warning — failed to install handler for signal {sig}");
+        }
     }
 }
 
@@ -101,12 +110,29 @@ fn cmd_start() {
             std::process::exit(1);
         }
     };
-    let exe = std::env::current_exe().expect("current_exe");
+    // Resolve our own path and duplicate the log handle with clean error-exits rather than
+    // `.expect()`: every other failure in `cmd_start` prints `rustscreen: …` and exits(1), and a
+    // panic+backtrace is poor CLI UX (current_exe can fail if the binary moved; try_clone can fail
+    // on fd exhaustion).
+    let exe = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("rustscreen: cannot determine own executable path: {e}");
+            std::process::exit(1);
+        }
+    };
+    let stdout_log = match log.try_clone() {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("rustscreen: cannot duplicate log file handle: {e}");
+            std::process::exit(1);
+        }
+    };
     use std::os::unix::process::CommandExt;
     let child = match Command::new(exe)
         .arg("__serve")
         .stdin(Stdio::null())
-        .stdout(log.try_clone().expect("clone log"))
+        .stdout(stdout_log)
         .stderr(log)
         .process_group(0) // detach from the terminal's process group (no SIGHUP on close)
         .spawn()
@@ -132,8 +158,12 @@ fn cmd_stop() {
     let pid_path = daemon::pid_path(home());
     match daemon::read_pid(&pid_path) {
         Some(pid) if process_alive(pid) => {
-            // SAFETY: sending SIGTERM to our own daemon pid for graceful teardown.
-            unsafe { libc::kill(pid, libc::SIGTERM) };
+            // Signal the worker's whole process GROUP (`-pid`), not just the leader: `cmd_start`
+            // spawns it with `process_group(0)`, so its pgid == pid. Targeting the group also
+            // reaps any helper the worker might spawn later instead of orphaning it; with no
+            // children today it is equivalent to signalling the single worker.
+            // SAFETY: our own daemon's process group, for graceful teardown.
+            unsafe { libc::kill(-pid, libc::SIGTERM) };
             // Grace period (~3s) for clean teardown (display drop + USB close).
             // On macOS `libc::signal` uses BSD/SA_RESTART semantics, so SIGTERM does
             // NOT interrupt a blocking USB write/flush — the worker may not observe the
@@ -149,8 +179,9 @@ fn cmd_stop() {
                 // skipped, but the CGVirtualDisplay is owned by the process and is removed
                 // on exit, so the desktop still reflows — safe.
                 println!("rustscreen: worker {pid} didn't exit on SIGTERM; sending SIGKILL.");
-                // SAFETY: sending SIGKILL to our own daemon pid to force exit.
-                unsafe { libc::kill(pid, libc::SIGKILL) };
+                // SAFETY: SIGKILL to our own daemon's process group (`-pid`, see the SIGTERM note)
+                // to force exit.
+                unsafe { libc::kill(-pid, libc::SIGKILL) };
                 for _ in 0..10 {
                     if !process_alive(pid) {
                         break;

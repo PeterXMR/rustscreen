@@ -8,6 +8,14 @@
 
 **Tech Stack:** Rust 1.85+ · `objc2` family · `videotoolbox` · `nusb` · `android-activity` (NativeActivity) · `ndk` / `ndk-sys` (MediaCodec) · `wgpu` (optional overlay path) · `postcard` (control messages) · H.264 (MVP) / HEVC (later).
 
+> **As-built note (updated 2026-06-07):** this is the original design doc; a few specifics shifted
+> in implementation. The workspace shipped with **four** crates — the three above plus
+> `cg-virtual-display` (the private-API virtual-display wrapper). MSRV is **Rust 1.80**, not 1.85
+> (see `rust-toolchain.toml` and each crate's `rust-version`). The capture + encode adapter shipped
+> as **pure `objc2`** (`objc2-screen-capture-kit` + `objc2-video-toolbox`) — there is **no Swift
+> bridge and no ObjC++ `.mm` shim**; the standalone `videotoolbox` crate was evaluated and rejected
+> in favour of the all-`objc2` stack (see `.planning/STATE.md`).
+
 ---
 
 ## 0. Honest Scope: What "100% Rust" Means Here

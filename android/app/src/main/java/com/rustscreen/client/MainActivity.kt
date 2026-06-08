@@ -175,14 +175,20 @@ class MainActivity : Activity() {
         // latch) so it isn't leaked.
         try {
             Thread({
-                // Blocks running the live decode session (rendezvous with the surface, then
-                // run_session) until the host disconnects (EOF) or errors.
-                nativeOnUsbFd(fd)
-                // Session ended: release the latch so a subsequent attach can re-attempt.
-                // (Prevents a permanent latch from sticking on a stale/half-registered
-                // accessory — see the device-side handoff race in HARDWARE-FINDINGS.md.)
-                Log.i(TAG, "session ended; releasing latch for re-attach")
-                sessionActive.set(false)
+                try {
+                    // Blocks running the live decode session (rendezvous with the surface, then
+                    // run_session) until the host disconnects (EOF) or errors.
+                    nativeOnUsbFd(fd)
+                } finally {
+                    // ALWAYS release the latch — even if the thread body throws or is interrupted —
+                    // so a subsequent attach can re-attempt. A missed release latches sessionActive
+                    // forever and blocks every future reconnect. (The Rust side wraps its body in
+                    // catch_unwind so nativeOnUsbFd shouldn't throw, but the finally keeps the
+                    // invariant regardless of future changes — see the device-side handoff race in
+                    // HARDWARE-FINDINGS.md.)
+                    Log.i(TAG, "session ended; releasing latch for re-attach")
+                    sessionActive.set(false)
+                }
             }, "usb-session").start()
         } catch (t: Throwable) {
             runCatching { ParcelFileDescriptor.adoptFd(fd).close() }
