@@ -12,6 +12,7 @@
 //! [`WindowSlot`] is generic over the window type so it is host-testable with a stand-in;
 //! the Android JNI layer instantiates it as `WindowSlot<NativeWindow>`. No FFI here.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -79,6 +80,111 @@ impl<T> WindowSlot<T> {
 }
 
 impl<T> Default for WindowSlot<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// A pending render-surface change for a *running* decode session, polled once per receive-loop
+/// iteration so the session can re-point the decoder onto a recreated surface (app foregrounded)
+/// or stop rendering onto a destroyed one (app backgrounded) WITHOUT tearing the session down.
+///
+/// This is the mid-session counterpart to [`WindowSlot`]: `WindowSlot` is the consume-once
+/// rendezvous that hands a *fresh* session its initial surface; [`SurfaceMailbox`] is a live
+/// channel the *same* session keeps reading for the rest of its life. A `SurfaceView`'s surface
+/// is destroyed and recreated on every background/foreground transition, so a decoder bound once
+/// at startup would otherwise keep rendering into the destroyed surface's abandoned `BufferQueue`
+/// (error spam → input-queue stall → a costly full reconnect). See `mediacodec::SURFACE_MAILBOX`.
+pub enum SurfaceChange<T> {
+    /// A new render surface arrived (foreground / surface re-create): swap the decoder onto it.
+    Swap(T),
+    /// The render surface was destroyed (backgrounded): stop rendering until one returns.
+    Lost,
+    /// Nothing changed since the last poll.
+    None,
+}
+
+/// Single-producer (UI/JNI thread) / single-consumer (decode-session thread) mailbox for the
+/// live surface lifecycle. Generic over the window type so it is host-testable with a stand-in;
+/// the Android layer instantiates it as `SurfaceMailbox<NativeWindow>`. No FFI here.
+pub struct SurfaceMailbox<T> {
+    /// Cheap hot-path gate the decode loop checks every iteration. `Relaxed` per the project's
+    /// hot-path flag convention — it is a standalone "something changed" hint with no companion
+    /// memory of its own; the `Mutex` below publishes the actual `inner` data with proper
+    /// acquire/release, so a momentarily-stale `dirty` only ever costs one extra (no-op) poll and
+    /// never strands a change (the next `deposit`/`mark_lost` re-raises it).
+    dirty: AtomicBool,
+    inner: Mutex<MailboxInner<T>>,
+}
+
+struct MailboxInner<T> {
+    /// Newest deposited surface not yet taken by the session loop.
+    pending: Option<T>,
+    /// The surface was destroyed with no replacement yet — render must pause.
+    lost: bool,
+}
+
+impl<T> SurfaceMailbox<T> {
+    /// An empty mailbox. `const` so it can back a `static`.
+    pub const fn new() -> Self {
+        Self {
+            dirty: AtomicBool::new(false),
+            inner: Mutex::new(MailboxInner {
+                pending: None,
+                lost: false,
+            }),
+        }
+    }
+
+    /// `surfaceCreated`: a new render surface is available. Supersedes any prior un-taken surface
+    /// (freshest wins) and clears `lost` — the new surface replaces the destroyed one.
+    pub fn deposit(&self, window: T) {
+        {
+            let mut g = self.inner.lock().unwrap();
+            g.pending = Some(window);
+            g.lost = false;
+        }
+        self.dirty.store(true, Ordering::Relaxed);
+    }
+
+    /// `surfaceDestroyed`: the current render surface is gone. Drops any not-yet-taken pending
+    /// surface too (it is the very surface being destroyed) and records the lost edge so the
+    /// next poll pauses rendering.
+    pub fn mark_lost(&self) {
+        {
+            let mut g = self.inner.lock().unwrap();
+            g.pending = None;
+            g.lost = true;
+        }
+        self.dirty.store(true, Ordering::Relaxed);
+    }
+
+    /// Cheap per-iteration gate — `true` if a change is waiting. Lets the steady-state loop skip
+    /// the mutex entirely on the overwhelmingly common "nothing changed" path.
+    pub fn is_dirty(&self) -> bool {
+        self.dirty.load(Ordering::Relaxed)
+    }
+
+    /// Consume the pending change and clear the gate. A pending surface takes precedence over a
+    /// prior loss (if a surface arrived after the loss we want to swap onto it, not report the
+    /// now-stale loss). Returns [`SurfaceChange::None`] when nothing is pending.
+    pub fn take(&self) -> SurfaceChange<T> {
+        let mut g = self.inner.lock().unwrap();
+        // Clear under the lock so a concurrent producer that re-raises `dirty` after us is not
+        // lost: its write happens-after this store, leaving `dirty` true for the next poll.
+        self.dirty.store(false, Ordering::Relaxed);
+        if let Some(window) = g.pending.take() {
+            g.lost = false;
+            SurfaceChange::Swap(window)
+        } else if std::mem::replace(&mut g.lost, false) {
+            SurfaceChange::Lost
+        } else {
+            SurfaceChange::None
+        }
+    }
+}
+
+impl<T> Default for SurfaceMailbox<T> {
     fn default() -> Self {
         Self::new()
     }
@@ -172,5 +278,90 @@ mod tests {
             elapsed < Duration::from_millis(400),
             "take_blocking ignored its deadline under a wakeup storm (waited {elapsed:?})"
         );
+    }
+
+    // --- SurfaceMailbox (mid-session background/foreground swap channel) ------------------
+
+    /// Match helper: `SurfaceChange` has no `PartialEq` (its `T` need not), so assert by arm.
+    fn swapped<T>(c: SurfaceChange<T>) -> Option<T> {
+        match c {
+            SurfaceChange::Swap(w) => Some(w),
+            _ => None,
+        }
+    }
+    fn is_lost<T>(c: &SurfaceChange<T>) -> bool {
+        matches!(c, SurfaceChange::Lost)
+    }
+    fn is_none<T>(c: &SurfaceChange<T>) -> bool {
+        matches!(c, SurfaceChange::None)
+    }
+
+    #[test]
+    fn mailbox_starts_clean() {
+        let mb: SurfaceMailbox<&str> = SurfaceMailbox::new();
+        assert!(!mb.is_dirty(), "a fresh mailbox has nothing to apply");
+        assert!(is_none(&mb.take()));
+    }
+
+    #[test]
+    fn deposit_yields_one_swap_then_goes_clean() {
+        // App foregrounded: a new surface arrives and the loop swaps onto it exactly once.
+        let mb: SurfaceMailbox<&str> = SurfaceMailbox::new();
+        mb.deposit("surface-2");
+        assert!(mb.is_dirty(), "a deposit must raise the poll gate");
+        assert_eq!(swapped(mb.take()), Some("surface-2"));
+        assert!(!mb.is_dirty(), "take clears the gate");
+        assert!(is_none(&mb.take()), "a second poll sees no change");
+    }
+
+    #[test]
+    fn mark_lost_yields_one_lost_then_goes_clean() {
+        // App backgrounded: the surface is destroyed; the loop pauses rendering exactly once.
+        let mb: SurfaceMailbox<&str> = SurfaceMailbox::new();
+        mb.mark_lost();
+        assert!(mb.is_dirty());
+        assert!(is_lost(&mb.take()));
+        assert!(!mb.is_dirty());
+        assert!(is_none(&mb.take()));
+    }
+
+    #[test]
+    fn deposit_then_lost_reports_lost_and_drops_the_destroyed_surface() {
+        // A surface arrived and was destroyed before the loop polled: the loss supersedes it and
+        // the (now-dead) surface is dropped, never handed to the decoder.
+        let mb: SurfaceMailbox<&str> = SurfaceMailbox::new();
+        mb.deposit("doomed-surface");
+        mb.mark_lost();
+        assert!(
+            is_lost(&mb.take()),
+            "destroy after deposit must win → pause render"
+        );
+        assert!(is_none(&mb.take()));
+    }
+
+    #[test]
+    fn lost_then_deposit_reports_swap_freshest_wins() {
+        // Background then foreground before the loop polled: the newest surface wins over the loss.
+        let mb: SurfaceMailbox<&str> = SurfaceMailbox::new();
+        mb.mark_lost();
+        mb.deposit("surface-new");
+        assert_eq!(swapped(mb.take()), Some("surface-new"));
+        assert!(
+            is_none(&mb.take()),
+            "the loss was superseded, not also reported"
+        );
+    }
+
+    #[test]
+    fn newest_deposit_supersedes_an_untaken_one() {
+        let mb: SurfaceMailbox<i32> = SurfaceMailbox::new();
+        mb.deposit(1);
+        mb.deposit(2);
+        assert_eq!(
+            swapped(mb.take()),
+            Some(2),
+            "only the freshest surface is handed out"
+        );
+        assert!(is_none(&mb.take()));
     }
 }

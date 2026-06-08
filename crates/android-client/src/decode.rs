@@ -90,6 +90,18 @@ pub trait VideoDecoder {
     fn pump(&mut self) -> Result<Vec<PresentedFrame>, DecodeError> {
         Ok(Vec::new())
     }
+
+    /// Apply any pending render-surface change (app background/foreground) before the next access
+    /// unit. The live decoder re-points itself onto a recreated surface (`AMediaCodec_setOutputSurface`)
+    /// or pauses rendering onto a destroyed one — keeping the session and its H.264 reference chain
+    /// alive across the transition rather than tearing down and reconnecting.
+    ///
+    /// Returns `true` IFF the decoder just swapped onto a *new* surface, so the caller can ask the
+    /// host for an out-of-band keyframe (the new surface has no prior frame; an IDR paints it clean
+    /// within ~1 RTT). Defaults to `Ok(false)` for adapters/fakes with no surface lifecycle.
+    fn poll_surface(&mut self) -> Result<bool, DecodeError> {
+        Ok(false)
+    }
 }
 
 /// Why driving the decoder failed.
