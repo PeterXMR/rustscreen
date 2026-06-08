@@ -414,7 +414,24 @@ impl Frame {
                     nal: nal.to_vec(),
                 })
             }
-            tag::TOUCH => Ok(Frame::Touch(decode_canonical(payload)?)),
+            tag::TOUCH => {
+                let touch = decode_canonical::<TouchEvent>(payload)?;
+                // Validate coordinates: reject NaN and infinities, clamp to [0.0, 1.0].
+                // A malicious or buggy peer could send out-of-range values that would
+                // cause undefined behavior in CGEvent injection on the host.
+                if touch.nx.is_nan() || touch.ny.is_nan() || !touch.nx.is_finite() || !touch.ny.is_finite() {
+                    return Err(MessageError::Decode(
+                        <postcard::Error as serde::de::Error>::custom("touch coordinates must be finite"),
+                    ));
+                }
+                let validated = TouchEvent {
+                    pointer_id: touch.pointer_id,
+                    phase: touch.phase,
+                    nx: touch.nx.clamp(0.0, 1.0),
+                    ny: touch.ny.clamp(0.0, 1.0),
+                };
+                Ok(Frame::Touch(validated))
+            }
             tag::CONTROL => Ok(Frame::Control(decode_canonical(payload)?)),
             tag::CLOCK_PING => Ok(Frame::ClockPing {
                 t0_us: decode_canonical(payload)?,
@@ -628,6 +645,82 @@ mod tests {
             ny: 0.25,
         });
         assert_eq!(roundtrip(&frame), frame);
+    }
+
+    #[test]
+    fn touch_decode_rejects_nan() {
+        // Build a TouchEvent with NaN coordinates using postcard directly
+        let mut payload = postcard::to_allocvec(&TouchEvent {
+            pointer_id: 1,
+            phase: TouchPhase::Move,
+            nx: f32::NAN,
+            ny: 0.5,
+        })
+        .unwrap();
+        match Frame::decode(tag::TOUCH, &payload) {
+            Err(MessageError::Decode(_)) => {}
+            other => panic!("expected Decode error for NaN nx, got {other:?}"),
+        }
+
+        // Also test ny NaN
+        payload = postcard::to_allocvec(&TouchEvent {
+            pointer_id: 1,
+            phase: TouchPhase::Move,
+            nx: 0.5,
+            ny: f32::NAN,
+        })
+        .unwrap();
+        match Frame::decode(tag::TOUCH, &payload) {
+            Err(MessageError::Decode(_)) => {}
+            other => panic!("expected Decode error for NaN ny, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn touch_decode_rejects_infinity() {
+        let mut payload = postcard::to_allocvec(&TouchEvent {
+            pointer_id: 1,
+            phase: TouchPhase::Move,
+            nx: f32::INFINITY,
+            ny: 0.5,
+        })
+        .unwrap();
+        match Frame::decode(tag::TOUCH, &payload) {
+            Err(MessageError::Decode(_)) => {}
+            other => panic!("expected Decode error for INFINITY nx, got {other:?}"),
+        }
+
+        payload = postcard::to_allocvec(&TouchEvent {
+            pointer_id: 1,
+            phase: TouchPhase::Move,
+            nx: 0.5,
+            ny: f32::NEG_INFINITY,
+        })
+        .unwrap();
+        match Frame::decode(tag::TOUCH, &payload) {
+            Err(MessageError::Decode(_)) => {}
+            other => panic!("expected Decode error for NEG_INFINITY ny, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn touch_decode_clamps_out_of_range() {
+        // Values outside [0,1] should be clamped during decode
+        let payload = postcard::to_allocvec(&TouchEvent {
+            pointer_id: 1,
+            phase: TouchPhase::Move,
+            nx: -0.5,
+            ny: 1.5,
+        })
+        .unwrap();
+        let frame = Frame::decode(tag::TOUCH, &payload).unwrap();
+        match frame {
+            Frame::Touch(t) => {
+                assert_eq!(t.nx, 0.0, "negative nx clamped to 0");
+                assert_eq!(t.ny, 1.0, "ny > 1 clamped to 1");
+            }
+            other => panic!("expected Touch, got {other:?}"),
+        }
     }
 
     #[test]

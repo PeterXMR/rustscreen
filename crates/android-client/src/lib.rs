@@ -104,9 +104,22 @@ mod android {
     /// still links. This entry is only the fd→Rust seam; the session/echo logic lives in the
     /// platform-agnostic core.
     ///
-    /// The call BLOCKS for the whole session (Kotlin runs it on a dedicated thread and
-    /// releases its "session active" latch when this returns), so the session must run inline
-    /// here rather than on a spawned thread.
+    /// # Threading Requirement (Critical)
+    ///
+    /// **This function BLOCKS for the entire session duration** (potentially hours). The caller
+    /// **MUST** invoke it from a dedicated background thread — NEVER from the Android UI/main
+    /// thread. Calling this on the main thread will cause an ANR (Application Not Responding)
+    /// and the system will kill the process.
+    ///
+    /// The Kotlin side (`MainActivity`) is responsible for spawning a dedicated thread (e.g. via
+    /// `Thread` or `ExecutorService`) before calling this JNI method, and for releasing its
+    /// "session active" latch only when this function returns. This design keeps the Rust session
+    /// logic synchronous and simple while pushing the threading policy to the Kotlin caller,
+    /// which has access to Android threading primitives.
+    ///
+    /// If you need async/non-blocking behavior, the architecture would need to change:
+    /// the session would need to run on a spawned Rust thread and this JNI entry would return
+    /// immediately with a handle/callback for teardown. That is a future API change.
     #[no_mangle]
     pub extern "system" fn Java_com_rustscreen_client_MainActivity_nativeOnUsbFd(
         _env: JNIEnv,
