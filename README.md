@@ -189,14 +189,16 @@ checklist — the usual culprits are the **Screen Recording permission** (host) 
   capture spikes from (any terminal app). See [macOS capture spikes](#macos-capture-spikes--requires-the-screen--system-audio-recording-permission).
 
 **Android native library only:**
-- Android NDK r25 (component `25.2.9519653`)
+- Android NDK r25c (component `25.2.9519653`)
 - `cargo-ndk`: `cargo install cargo-ndk`
 - Add the Android target: `rustup target add aarch64-linux-android`
 
 **Android APK (Gradle) only:**
-- JDK 17–21 (AGP 8.5.2 requires this range; JDK 22+ causes Gradle to fail)
-- If your system JDK is newer (e.g. Java 25), point Gradle at a 17–21 JDK without touching the
-  committed repo files. Add this to your personal `~/.gradle/gradle.properties`:
+- JDK 17–25 (AGP 9.2.1 on Gradle 9.5.1 supports this range — including the Java 25 that is the
+  current macOS default, so no separate JDK install is needed)
+- If your system JDK is ever newer than the Gradle-supported ceiling (a future Java 26+), point
+  Gradle at a supported JDK without touching the committed repo files. Add this to your personal
+  `~/.gradle/gradle.properties`:
   ```
   org.gradle.java.home=/path/to/your/jdk-21
   ```

@@ -1,13 +1,17 @@
 import java.util.Properties
+import org.jetbrains.kotlin.gradle.dsl.JvmTarget
 
 plugins {
+    // AGP 9.0+ provides Kotlin built-in; the standalone `org.jetbrains.kotlin.android`
+    // plugin must NOT be applied (doing so fails the build). Kotlin compiler options move to
+    // the top-level `kotlin { compilerOptions { … } }` block below — the old
+    // `android { kotlinOptions { … } }` DSL came from the now-removed plugin and is gone.
     id("com.android.application")
-    id("org.jetbrains.kotlin.android")
 }
 
 android {
     namespace = "com.rustscreen.client"
-    compileSdk = 34
+    compileSdk = 36
 
     defaultConfig {
         applicationId = "com.rustscreen.client"
@@ -24,15 +28,13 @@ android {
     ndkVersion = "25.2.9519653"
 
     compileOptions {
-        sourceCompatibility = JavaVersion.VERSION_1_8
-        targetCompatibility = JavaVersion.VERSION_1_8
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
     }
 
-    kotlinOptions {
-        jvmTarget = "1.8"
-    }
-
-    sourceSets["main"].jniLibs.srcDirs("src/main/jniLibs")
+    // jniLibs already defaults to src/main/jniLibs (where cargo-ndk drops libandroid_client.so),
+    // so no explicit sourceSets override is needed — the old `jniLibs.srcDirs(...)` call set the
+    // default redundantly and is deprecated in AGP 9.
 
     // Release signing scaffold (P8). No keystore or password is committed — the
     // config reads them from the environment (preferred for CI) or from a personal,
@@ -79,6 +81,16 @@ android {
                 signingConfigs.getByName("debug")
             }
         }
+    }
+}
+
+// AGP 9's built-in Kotlin exposes the standard Kotlin Gradle DSL via the top-level `kotlin {}`
+// extension (NOT `android { kotlinOptions { … } }`, which the removed plugin provided). Pin the
+// Kotlin JVM bytecode target to 17 to match the Java `compileOptions` above — AGP fails the build
+// on a Kotlin/Java target mismatch.
+kotlin {
+    compilerOptions {
+        jvmTarget.set(JvmTarget.JVM_17)
     }
 }
 

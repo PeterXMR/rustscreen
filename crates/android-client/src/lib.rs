@@ -63,7 +63,11 @@ pub mod mediacodec;
 #[cfg(target_os = "android")]
 mod android {
     use jni::objects::JClass;
-    use jni::JNIEnv;
+    // jni 0.22 split the old `JNIEnv` alias into `Env` (full API, not FFI-safe) and
+    // `EnvUnowned` (the FFI-safe type for capturing the raw `*JNIEnv` in native methods).
+    // These two entry points never touch the env (it's `_env`), so we take the FFI-safe
+    // `EnvUnowned` exactly as jni 0.22 prescribes for `extern "system"` native methods.
+    use jni::EnvUnowned;
 
     /// Run a JNI entry-point body under `catch_unwind` so a Rust `panic!` can never unwind across
     /// the `extern "system"` FFI boundary (BL-03) — that is undefined behavior and aborts the host
@@ -84,7 +88,7 @@ mod android {
     /// Called once from Kotlin `MainActivity` at startup. P0: just proves the JNI bridge works.
     #[no_mangle]
     pub extern "system" fn Java_com_rustscreen_client_MainActivity_nativeInit(
-        _env: JNIEnv,
+        _env: EnvUnowned,
         _class: JClass,
     ) {
         jni_guard("nativeInit", || {
@@ -123,7 +127,7 @@ mod android {
     /// immediately with a handle/callback for teardown. That is a future API change.
     #[no_mangle]
     pub extern "system" fn Java_com_rustscreen_client_MainActivity_nativeOnUsbFd(
-        _env: JNIEnv,
+        _env: EnvUnowned,
         _class: JClass,
         fd: jni::sys::jint,
     ) -> jni::sys::jboolean {

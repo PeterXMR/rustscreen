@@ -23,8 +23,8 @@ protocol = { path = "../protocol" }
 log = "0.4"
 
 [target.'cfg(target_os = "android")'.dependencies]
-jni = "0.21"
-android_logger = "0.14"
+jni = "0.22"
+android_logger = "0.15"
 # `ndk-sys` is the thin FFI the Wave-B `AMediaCodec` decode-to-surface adapter binds
 # against; optional + only pulled in by the `live-decode` feature so the default build
 # stays dependency-free (the Wave-A port/session need none of it).

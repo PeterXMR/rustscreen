@@ -56,7 +56,7 @@ protocol = { path = "../protocol" }
 log = "0.4"
 nusb = { version = "0.2", optional = true }
 libc = { version = "0.2", optional = true }
-core-graphics = { version = "0.24", optional = true }
+core-graphics = { version = "0.25", optional = true }
 objc2 = { version = "0.6", optional = true }
 objc2-foundation = { version = "0.3", optional = true }
 block2 = { version = "0.6", optional = true }
