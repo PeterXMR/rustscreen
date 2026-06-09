@@ -1,3 +1,8 @@
+# `cargo xtask <cmd>` runs the project's build/release automation (the Rust replacement for the
+# packaging/**.sh scripts). `--` forwards the rest of the args to the xtask binary. See xtask/.
+[alias]
+xtask = "run --quiet --package xtask --"
+
 # macOS host: target the Apple M1 microarchitecture. The host only ever runs on the
 # user's M1 MacBook, so we can let the compiler use the full M1 ISA (e.g. wider SIMD,
 # cheaper atomics) rather than the conservative baseline aarch64 — a free win on the

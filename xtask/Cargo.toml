@@ -1,0 +1,21 @@
+# xtask — the project's build/release automation, written in Rust instead of bash.
+#
+# This crate consolidates the four `packaging/**.sh` scripts into one typed,
+# cross-platform, unit-tested binary invoked via the `cargo xtask` alias
+# (see .cargo/config.toml). It is build TOOLING only — it never runs on device
+# and is NOT on the glass-to-glass latency path. The hot pipeline lives in
+# `crates/*`; this just orchestrates `cargo`, `gradlew`, `codesign`, `hdiutil`,
+# and friends, replacing the bash glue with compiler-checked Rust.
+#
+# Deliberately ZERO external dependencies (std only): keeps Cargo.lock stable,
+# CI fast, and the supply chain empty for a tool that mostly shells out to
+# already-installed binaries. All parsing/templating is hand-rolled and tested.
+[package]
+name = "xtask"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "xtask"
+path = "src/main.rs"

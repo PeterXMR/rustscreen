@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/protocol", "crates/macos-host", "crates/cg-virtual-display", "crates/android-client"]
+members = ["crates/protocol", "crates/macos-host", "crates/cg-virtual-display", "crates/android-client", "xtask"]
 
 # Release profile — tuned for SPEED (development, benchmarking, latency work).
 #
@@ -30,9 +30,9 @@ strip = false
 
 # Distribution profile — tuned for SIZE (the shipped, notarized `.app`/DMG and
 # the Android `.so`). Inherits everything from `release` and overrides only the
-# size knobs. The packaging scripts (packaging/macos/make_app.sh,
-# packaging/android/build_release_apk.sh) and the CI `package-macos` job build
-# the shipped artifact with `cargo build --profile dist`.
+# size knobs. `cargo xtask make-app` / `cargo xtask build-apk` (and the legacy
+# packaging/*.sh scripts + the CI `package-macos` job) build the shipped artifact
+# with `cargo build --profile dist`.
 #
 #   opt-level = "z"  — optimize for size; the host is latency-bound on the GPU/USB
 #                      path, not scalar CPU work, so a smaller shipped binary is a
@@ -48,9 +48,9 @@ opt-level = "z"
 lto = true
 strip = true
 
-# Shared package metadata consumed by the packaging scripts (packaging/) so the
-# app name / bundle id / version live in ONE place. Plain TOML the scripts read;
-# Cargo itself ignores [workspace.metadata.*].
+# Shared package metadata consumed by `cargo xtask` (xtask/src/logic.rs) and the
+# legacy packaging/*.sh scripts so the app name / bundle id / version live in ONE
+# place. Plain TOML these tools read; Cargo itself ignores [workspace.metadata.*].
 [workspace.metadata.rustscreen]
 app-name = "RustScreen"
 bundle-id = "com.rustscreen.host"
