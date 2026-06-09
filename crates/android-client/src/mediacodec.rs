@@ -9,9 +9,10 @@
 //! Wave-A host tests in [`crate::decode`] stay device-free.
 //!
 //! ## Lifecycle
-//! 1. The Kotlin `SurfaceView`'s `SurfaceHolder.Callback` hands a `Surface` to
-//!    `nativeOnSurface` (see [`crate::lib`]), which turns it into an `ANativeWindow` via
-//!    `ANativeWindow_fromSurface` and constructs a [`MediaCodecDecoder`] around it.
+//! 1. The Rust `android_main` event loop (android-activity, see [`crate::lib`]) turns each
+//!    `InitWindow` event's `ANativeWindow` into a [`NativeWindow`] via
+//!    `NativeWindow::from_ptr_acquire` and deposits it for the session, which constructs a
+//!    [`MediaCodecDecoder`] around it.
 //! 2. `DecodeSession` calls [`VideoDecoder::configure`] with the codec + SPS/PPS once the
 //!    first `VideoConfig` (or in-band keyframe) is seen — we build an `AMediaFormat`
 //!    (`mime = video/avc`, `csd-0` = SPS+PPS Annex-B), `AMediaCodec_configure` it onto the
@@ -29,8 +30,8 @@
 //! ## Safety / FFI discipline
 //! All `unsafe` calls are local and checked: pointers are null-guarded, `media_status_t`
 //! is mapped to [`DecodeError::Adapter`] rather than panicking, and the codec / format /
-//! window handles are freed in `Drop`. This module never panics across the JNI boundary —
-//! `nativeOnSurface` wraps it in a `catch_unwind` (mirroring `nativeOnUsbFd`).
+//! window handles are freed in `Drop`. The decode work runs on the USB session thread, whose
+//! `nativeOnUsbFd` JNI entry wraps it in a `catch_unwind` so a panic never crosses FFI.
 
 use std::cell::Cell;
 use std::ffi::CStr;
@@ -73,41 +74,24 @@ const DEQUEUE_TIMEOUT_US: i64 = 10_000;
 /// budget — input slots normally free up within a frame or two of draining output.
 const MAX_INPUT_DEQUEUE_ATTEMPTS: u32 = 100;
 
-/// Owns the native window handed in from the Kotlin `Surface` (decode-to-surface target).
+/// Owns the native window from the NativeActivity surface (decode-to-surface target).
 ///
-/// Released with `ANativeWindow_release` on `Drop`. Constructed on the JNI thread in
-/// `nativeOnSurface`; moved into the [`MediaCodecDecoder`] on `configure`.
+/// Released with `ANativeWindow_release` on `Drop`. Constructed in the `android_main` event
+/// loop via [`NativeWindow::from_ptr_acquire`]; moved into the [`MediaCodecDecoder`] on `configure`.
 pub struct NativeWindow {
     ptr: NonNull<sys::ANativeWindow>,
 }
 
 impl NativeWindow {
-    /// Acquire an `ANativeWindow` from a Java `Surface`.
-    ///
-    /// # Safety
-    /// `env` must be a valid JNI environment pointer for the current thread and `surface`
-    /// a valid local/global reference to a non-recycled `android.view.Surface` (both true
-    /// for the args JNI passes to `nativeOnSurface`). `ANativeWindow_fromSurface` adds a
-    /// reference we own and release in `Drop`.
-    pub unsafe fn from_surface(
-        env: *mut jni::sys::JNIEnv,
-        surface: jni::sys::jobject,
-    ) -> Option<Self> {
-        // ndk-sys and the jni crate both ultimately use `jni_sys`, so these pointer types
-        // are layout-identical; cast to the exact types `ANativeWindow_fromSurface` wants.
-        let raw = sys::ANativeWindow_fromSurface(env.cast(), surface.cast());
-        NonNull::new(raw).map(|ptr| NativeWindow { ptr })
-    }
-
     fn as_ptr(&self) -> *mut sys::ANativeWindow {
         self.ptr.as_ptr()
     }
 
-    /// Acquire a second owned handle to the same `ANativeWindow` (refcount++). The one surface
-    /// from `surfaceCreated` is handed to two independent consumers — the consume-once
-    /// [`crate::rendezvous::WindowSlot`] (a fresh session's initial take) and the live
-    /// [`SURFACE_MAILBOX`] (a running session's mid-session swap) — so each needs its own
-    /// reference to release on `Drop`.
+    /// Acquire a second owned handle to the same `ANativeWindow` (refcount++). The one window
+    /// from an `InitWindow` event is handed to several independent holders — the consume-once
+    /// [`crate::rendezvous::WindowSlot`] (a fresh session's initial take), the live
+    /// [`SURFACE_MAILBOX`] (a running session's mid-session swap), and the retained
+    /// `CURRENT_WINDOW` (reconnect re-seed) — so each needs its own reference to release on `Drop`.
     ///
     /// `ANativeWindow_acquire`/`_release` are the documented refcount pair, so the underlying
     /// window stays alive until BOTH handles drop.
@@ -117,10 +101,27 @@ impl NativeWindow {
         unsafe { sys::ANativeWindow_acquire(self.ptr.as_ptr()) };
         NativeWindow { ptr: self.ptr }
     }
+
+    /// Acquire an owned `ANativeWindow` from a raw pointer — the window android-activity
+    /// surfaces via `AndroidApp::native_window()` in the `android_main` event loop (the
+    /// NativeActivity path that replaces the Kotlin `SurfaceView` + `from_surface`). Adds our
+    /// own reference with `ANativeWindow_acquire`, so android-activity's handle stays
+    /// independently owned and this one is released exactly once on `Drop`. `None` for null.
+    ///
+    /// # Safety
+    /// `ptr` must be null or a valid, live `ANativeWindow` — true for the pointer android-activity
+    /// exposes while a window is current (between `InitWindow` and `TerminateWindow`).
+    pub unsafe fn from_ptr_acquire(ptr: *mut sys::ANativeWindow) -> Option<Self> {
+        let ptr = NonNull::new(ptr)?;
+        // SAFETY: `ptr` is a live `ANativeWindow` (caller contract); `acquire` bumps its
+        // refcount and the returned handle releases exactly that reference on `Drop`.
+        sys::ANativeWindow_acquire(ptr.as_ptr());
+        Some(NativeWindow { ptr })
+    }
 }
 
-/// Live render-surface channel for the running decode session. `nativeOnSurface` deposits each
-/// recreated surface (app foregrounded) and `nativeOnSurfaceDestroyed` marks it lost (app
+/// Live render-surface channel for the running decode session. `android_main`'s `InitWindow`
+/// deposits each recreated surface (app foregrounded) and `TerminateWindow` marks it lost (app
 /// backgrounded); the session loop drains this via [`VideoDecoder::poll_surface`] every iteration
 /// and re-points the codec with `AMediaCodec_setOutputSurface` — keeping ONE session + codec (and
 /// thus the intact H.264 reference chain) alive across the transition instead of tearing down and
@@ -479,8 +480,8 @@ impl MediaCodecDecoder {
             .as_mut()
             .ok_or_else(|| DecodeError::Adapter("set_output_surface before configure".into()))?;
         // SAFETY: `codec.ptr` is a started decoder; `window` is a live `ANativeWindow` we own
-        // (acquired in `nativeOnSurface`). `setOutputSurface` rebinds the output; on success the
-        // codec renders into the new window from the next released buffer on.
+        // (acquired in `android_main` via `from_ptr_acquire`). `setOutputSurface` rebinds the
+        // output; on success the codec renders into the new window from the next released buffer on.
         let status =
             unsafe { sys::AMediaCodec_setOutputSurface(codec.ptr.as_ptr(), window.as_ptr()) };
         check(status, "AMediaCodec_setOutputSurface")?;

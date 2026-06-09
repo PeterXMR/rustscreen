@@ -1,16 +1,16 @@
-//! One-way handoff of the render surface from the SurfaceView callback to the USB
-//! decode-session thread, re-deposited once per decode session (the slot is consume-once,
-//! so each new session re-`put`s the current surface — see `WindowSlot::put`).
+//! One-way handoff of the render surface from `android_main`'s window events to the USB
+//! decode-session thread, re-seeded once per decode session (the slot is consume-once, so each
+//! new session re-`put`s the current window from `CURRENT_WINDOW` — see `WindowSlot::put`).
 //!
 //! The two things a live decode session needs — the render **surface** and the USB
-//! **transport fd** — arrive on independent Android callbacks in an order that is not fixed:
-//! when the app is launched by plugging in (the `USB_ACCESSORY_ATTACHED` intent), the USB fd
-//! can arrive *before* the `SurfaceView`'s surface is created; when the app is already open,
-//! the surface exists first. The session thread owns the fd (it is the JNI argument), so it
-//! only needs to *receive* the surface — hence a one-way slot rather than a symmetric join.
+//! **transport fd** — arrive on independent Android paths in an order that is not fixed: when
+//! the app is launched by plugging in (the `USB_ACCESSORY_ATTACHED` intent), the USB fd can
+//! arrive *before* the NativeActivity window's `InitWindow` event; when the app is already
+//! open, the window exists first. The session thread owns the fd (it is the JNI argument), so
+//! it only needs to *receive* the surface — hence a one-way slot rather than a symmetric join.
 //!
 //! [`WindowSlot`] is generic over the window type so it is host-testable with a stand-in;
-//! the Android JNI layer instantiates it as `WindowSlot<NativeWindow>`. No FFI here.
+//! the Android layer instantiates it as `WindowSlot<NativeWindow>`. No FFI here.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Condvar, Mutex};
@@ -54,7 +54,7 @@ impl<T> WindowSlot<T> {
     }
 
     /// Block until a window is available or `timeout` elapses, then take it. Returns `None`
-    /// on timeout with no window (e.g. the app never showed its `SurfaceView`). Takes the
+    /// on timeout with no window (e.g. the NativeActivity window was never created). Takes the
     /// window out, so a second caller does not receive a stale handoff.
     pub fn take_blocking(&self, timeout: Duration) -> Option<T> {
         // Track an absolute deadline so spurious or `clear` wakeups don't re-arm the full
@@ -91,7 +91,7 @@ impl<T> Default for WindowSlot<T> {
 ///
 /// This is the mid-session counterpart to [`WindowSlot`]: `WindowSlot` is the consume-once
 /// rendezvous that hands a *fresh* session its initial surface; [`SurfaceMailbox`] is a live
-/// channel the *same* session keeps reading for the rest of its life. A `SurfaceView`'s surface
+/// channel the *same* session keeps reading for the rest of its life. The NativeActivity window
 /// is destroyed and recreated on every background/foreground transition, so a decoder bound once
 /// at startup would otherwise keep rendering into the destroyed surface's abandoned `BufferQueue`
 /// (error spam → input-queue stall → a costly full reconnect). See `mediacodec::SURFACE_MAILBOX`.
@@ -136,7 +136,7 @@ impl<T> SurfaceMailbox<T> {
         }
     }
 
-    /// `surfaceCreated`: a new render surface is available. Supersedes any prior un-taken surface
+    /// `InitWindow`: a new render surface is available. Supersedes any prior un-taken surface
     /// (freshest wins) and clears `lost` — the new surface replaces the destroyed one.
     pub fn deposit(&self, window: T) {
         {
@@ -147,7 +147,7 @@ impl<T> SurfaceMailbox<T> {
         self.dirty.store(true, Ordering::Relaxed);
     }
 
-    /// `surfaceDestroyed`: the current render surface is gone. Drops any not-yet-taken pending
+    /// `TerminateWindow`: the current render surface is gone. Drops any not-yet-taken pending
     /// surface too (it is the very surface being destroyed) and records the lost edge so the
     /// next poll pauses rendering.
     pub fn mark_lost(&self) {

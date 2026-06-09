@@ -12,7 +12,7 @@ crate-type = ["cdylib"]
 # `ndk`/`ndk-sys`, exactly like `macos-host`'s `live-usb`/`live-inject`. The Wave-A
 # host-tested `decode` port/session is always built (no feature needed). Enable with
 # `cargo ndk -t arm64-v8a build -p android-client --features live-decode`.
-live-decode = ["dep:ndk-sys"]
+live-decode = ["dep:ndk-sys", "dep:android-activity", "dep:ndk"]
 
 [dependencies]
 # Shared length-framing codec — reused verbatim by echo_loop (host-testable, not
@@ -29,3 +29,11 @@ android_logger = "0.14"
 # against; optional + only pulled in by the `live-decode` feature so the default build
 # stays dependency-free (the Wave-A port/session need none of it).
 ndk-sys = { version = "0.6", optional = true }
+# NativeActivity entry point + event loop (surface/lifecycle). The native-activity backend
+# pulls NO AndroidX (unlike the GameActivity backend), preserving the app's zero-AndroidX
+# profile. Optional + only via `live-decode`, exactly like ndk-sys, so the default host
+# workspace build stays dependency-free.
+android-activity = { version = "0.6", features = ["native-activity"], optional = true }
+# High-level `ndk` wrapper — used only to read the raw `ANativeWindow` pointer out of
+# android-activity's `AndroidApp::native_window()`. Same ndk-sys 0.6 ABI as above.
+ndk = { version = "0.9", optional = true }

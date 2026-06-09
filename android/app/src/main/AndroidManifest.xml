@@ -46,6 +46,14 @@
             <meta-data
                 android:name="android.hardware.usb.action.USB_ACCESSORY_ATTACHED"
                 android:resource="@xml/accessory_filter" />
+
+            <!-- NativeActivity loads this lib (libandroid_client.so) and calls its
+                 ANativeActivity_onCreate (provided by android-activity) → the Rust android_main
+                 event loop, which owns the render surface. Value is the lib name WITHOUT the
+                 lib prefix / .so suffix. Required because MainActivity extends NativeActivity. -->
+            <meta-data
+                android:name="android.app.lib_name"
+                android:value="android_client" />
         </activity>
 
         <!-- Owns the live USB decode session (started from MainActivity once the accessory is
