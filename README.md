@@ -21,6 +21,10 @@ link and are injected as mouse events on the Mac. Both the macOS host and the An
 client are written in Rust, organized as one Cargo workspace. The goal is a usable,
 touch-capable extended display with glass-to-glass latency under 50 ms.
 
+> **New here?** Jump to [Hardware requirements](#hardware-requirements) for the exact
+> kit you need, then [Quick start](#quick-start) for the shortest path from clone to a
+> second screen.
+
 High-level data flow:
 
 ```
@@ -110,6 +114,68 @@ which is why the Rust-purity figure is a *living metric* (~85% Rust source targe
 MVP, ~99% later) rather than a fixed claim. See §0 / §0.1 of the
 [architecture roadmap](docs/superpowers/plans/2026-06-02-rustscreen-architecture-roadmap.md)
 for the full rationale and seam table.
+
+---
+
+## Hardware requirements
+
+RustScreen is built and tuned against one specific hardware pair. Other Apple Silicon
+Macs and recent Pixels will likely work, but the latency floor, the `CGVirtualDisplay`
+mode, and the on-device decode path are only verified on this kit:
+
+| Component | Required | Why it matters |
+|---|---|---|
+| **Host** | Apple Silicon **M1 MacBook** (macOS 13 Ventura or newer) | Needs the `CGVirtualDisplay` private API + VideoToolbox HW H.264 encode. Intel Macs are untested. |
+| **Client** | **Google Pixel 6a** | Verified `AMediaCodec` HW decode-to-surface path; the ~43 ms floor is set by its 60 Hz panel. (The APK declares `minSdk 26` / Android 8.0, but only the Pixel 6a is tested.) |
+| **Link** | A single **USB-C ↔ USB-C** cable (a real **data** cable, not charge-only) | The entire stream + return touch channel runs over one cable via Android Open Accessory (AOA) bulk transfer. |
+
+> A charge-only USB-C cable will power the phone but never enumerate the accessory, so
+> the host will wait forever for a client. If `rustscreen start` never streams, suspect
+> the cable first.
+
+There is **no Wi-Fi / network path** in the live build — the link is the cable. (A
+NCM/TCP fallback is *documented* in the architecture roadmap but not the shipping path.)
+
+---
+
+## Quick start
+
+The shortest path from a fresh clone to a second screen. Each step links to its
+detailed section below.
+
+```bash
+# 0. Toolchain + targets (once)
+rustup target add aarch64-linux-android
+cargo install cargo-ndk
+export ANDROID_HOME="$HOME/Library/Android/sdk"
+export ANDROID_NDK_HOME="$ANDROID_HOME/ndk/25.2.9519653"
+
+# 1. Sanity-check the pure-Rust core (no Mac/phone needed) — builds all four crates
+cargo build --workspace && cargo test --workspace
+
+# 2. Host: install the rustscreen CLI (release; live capture + USB features)
+cargo install --path crates/macos-host --bin rustscreen --features live-capture,live-usb
+
+# 3. Phone: build the Rust .so into the Gradle project, then the APK, then install it
+cargo ndk -t arm64-v8a -o android/app/src/main/jniLibs build -p android-client --features live-decode
+( cd android && ./gradlew assembleDebug )
+adb install android/app/build/outputs/apk/debug/app-debug.apk
+
+# 4. Run it: start the host, plug in the Pixel, open the RustScreen app — streaming begins
+rustscreen start
+```
+
+Then move your mouse onto the right-hand display. To stop: `rustscreen stop`.
+
+If step 4 shows nothing, walk the [end-to-end pairing](#run-it-end-to-end-pairing-the-two-halves)
+checklist — the usual culprits are the **Screen Recording permission** (host) and a
+**charge-only cable** (link).
+
+> Per-crate note: `cargo build --workspace` (step 1) compiles all four crates
+> (`protocol`, `cg-virtual-display`, `macos-host`, `android-client`) with their default,
+> cross-platform feature set. The live hardware paths only come in via the `--features`
+> flags in steps 2–3. To build a single crate in isolation, use `cargo build -p <crate>`
+> (e.g. `cargo build -p protocol`).
 
 ---
 
@@ -246,6 +312,41 @@ default build stays cross-platform:
 
 Do not enable `live-inject` / `live-capture` in a `--all-features` build on a
 non-macOS host — the macOS-only crates won't compile there.
+
+### Run it end-to-end (pairing the two halves)
+
+Once the host CLI is installed (`rustscreen`, [above](#rustscreen--install-once-drive-it-from-the-terminal))
+and the APK is on the phone ([above](#android-apk)), there is **no manual pairing step** —
+the two halves discover each other over the cable. Bring them up in this order:
+
+1. **Grant the host permission (once).** macOS gates display capture behind
+   **System Settings → Privacy & Security → Screen & System Audio Recording** — grant it
+   to the terminal you launch from, then **⌘Q and reopen** that terminal so the grant
+   takes effect. (Full rationale in [capture spikes](#macos-capture-spikes--requires-the-screen--system-audio-recording-permission).)
+2. **Start the host:** `rustscreen start`. It returns your prompt immediately, checks the
+   permission, creates the virtual display, and waits for the phone. Logs (including the
+   per-stage + glass-to-glass latency report) stream to `~/.rustscreen/rustscreen.log`.
+3. **Connect the phone:** plug the Pixel 6a into the Mac with the USB-C data cable and
+   **open the RustScreen app**. Android shows a per-connection USB-accessory dialog the
+   first time — accept it (tick "use by default" to skip it on reconnect). The handshake
+   runs automatically and frames start flowing onto the phone's panel.
+4. **Use it:** move the mouse onto the right-hand display (the virtual one). The phone is
+   now an extended desktop; **touch on the phone injects as mouse input on the Mac**.
+5. **Stop:** `rustscreen stop` tears down the host and removes the virtual display (your
+   desktop reflows back). `rustscreen status` reports whether the host is running.
+
+**Reconnect is automatic** (PR #26): close/reopen the app, restart the host, or
+unplug/replug the cable and the link re-establishes itself with no manual restart, as
+long as both apps are running.
+
+**If nothing appears on the phone**, check in this order:
+
+| Symptom | Most likely cause | Fix |
+|---|---|---|
+| Host log says it's waiting; phone shows nothing | Charge-only cable, or app not opened | Use a USB-C **data** cable; open the RustScreen app |
+| Host exits with a TCC / permission error | Screen Recording permission missing or not reloaded | Grant it, then **⌘Q + reopen** the terminal |
+| App crashes on launch (`UnsatisfiedLinkError`) | `.so` built without `--features live-decode` | Rebuild the native lib with `live-decode` (see [Android native library](#android-native-library-so)) |
+| Phone is a black screen but connected | Cursor is on the built-in display | Move the mouse to the **right** to cross onto the virtual display |
 
 ---
 
