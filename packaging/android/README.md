@@ -20,7 +20,7 @@ export ANDROID_HOME="$HOME/Library/Android/sdk"
 export ANDROID_NDK_HOME="$ANDROID_HOME/ndk/25.2.9519653"
 
 # Build (cross-compile the release .so, then assemble the release APK):
-packaging/android/build_release_apk.sh
+cargo xtask build-apk
 # → android/app/build/outputs/apk/release/app-release.apk
 ```
 

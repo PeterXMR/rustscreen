@@ -84,7 +84,7 @@ jobs:
   # P8 packaging smoke: build the release host binary and assemble the UNSIGNED .app
   # bundle so the packaging path stays buildable. Additive and non-gating — it does
   # not run live-* features (no Mac permissions / hardware in CI) and does not sign or
-  # notarize (no secrets in CI). It only proves make_app.sh produces a bundle.
+  # notarize (no secrets in CI). It only proves `cargo xtask make-app` produces a bundle.
   package-macos:
     name: Package (unsigned .app smoke)
     runs-on: macos-latest
@@ -100,12 +100,12 @@ jobs:
 
       # Prove the SHIPPED profile (`dist`: opt-level=z + full LTO) of the real featured host binary
       # builds — full LTO can surface codegen/link errors thin-LTO `release` does not, and
-      # make_app.sh builds `--profile dist` with no features (only the stub `macos-host` bin).
+      # `cargo xtask make-app` builds `--profile dist` with no features (only the stub `macos-host` bin).
       - name: cargo build --profile dist (live host binary)
         run: cargo build --profile dist -p macos-host --bin rustscreen --features live-capture,live-usb
 
       - name: Assemble unsigned RustScreen.app (release)
-        run: packaging/macos/make_app.sh
+        run: cargo xtask make-app
 
       - name: Upload .app artifact
         uses: actions/upload-artifact@v7

@@ -355,22 +355,23 @@ long as both apps are running.
 > **Scaffold only.** The packaging path is wired and lint-clean, but it is **not yet
 > validated end-to-end** (no Apple Developer signing identity / Android release
 > keystore has been run through it), and because the live pipeline isn't finished, a
-> packaged app launches but does **not** yet produce a second screen. The scripts
-> exist so distribution is ready the moment the pipeline lands.
+> packaged app launches but does **not** yet produce a second screen. The `cargo
+> xtask` build tooling exists so distribution is ready the moment the pipeline lands.
 
 A release build uses a size-optimized, LTO'd, stripped profile
 (`[profile.release]` in the workspace [`Cargo.toml`](Cargo.toml)).
 
 ### macOS — `.app` bundle + notarized DMG
 
-Scripts live in [`packaging/macos/`](packaging/macos/) (see its
+Driven by `cargo xtask` (the data files — `Info.plist`, `entitlements.plist` — live
+in [`packaging/macos/`](packaging/macos/); see its
 [README](packaging/macos/README.md) for the full flow and credentials setup):
 
 ```bash
-packaging/macos/make_app.sh --features live-capture,live-usb,live-inject  # → dist/RustScreen.app
+cargo xtask make-app --features live-capture,live-usb,live-inject  # → dist/RustScreen.app
 SIGN_IDENTITY="Developer ID Application: … (TEAMID)" NOTARY_PROFILE="rustscreen-notary" \
-  packaging/macos/sign_and_notarize.sh                                     # sign (hardened runtime) + notarize + staple
-packaging/macos/make_dmg.sh                                                # → dist/RustScreen-<version>.dmg
+  cargo xtask sign-notarize                                        # sign (hardened runtime) + notarize + staple
+cargo xtask make-dmg                                               # → dist/RustScreen-<version>.dmg
 ```
 
 No secrets are committed — the signing identity and notary credentials are supplied
@@ -388,11 +389,12 @@ at run time via env vars / a keychain profile.
 
 ### Android — release APK + signing
 
-Scripts live in [`packaging/android/`](packaging/android/) (see its
+Driven by `cargo xtask` (the signing config + keystore example live in
+[`packaging/android/`](packaging/android/); see its
 [README](packaging/android/README.md)):
 
 ```bash
-packaging/android/build_release_apk.sh   # release .so via cargo-ndk → assembleRelease
+cargo xtask build-apk   # release .so via cargo-ndk → assembleRelease
 ```
 
 Release signing reads credentials from environment variables (CI) or a git-ignored
