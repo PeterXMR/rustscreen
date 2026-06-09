@@ -432,6 +432,6 @@ COMMANDS:
                                     Requires SIGN_IDENTITY and NOTARY_PROFILE.
     help                            Show this help.
 
-The shell scripts under packaging/ remain as a reference and are equivalent."
+Supersedes the former packaging/**.sh scripts (now removed)."
     );
 }

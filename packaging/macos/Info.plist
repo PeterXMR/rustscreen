@@ -2,7 +2,7 @@
 <!--
   Info.plist template for RustScreen.app (P8 packaging scaffold).
 
-  __VERSION__ is substituted by packaging/macos/make_app.sh from the workspace
+  __VERSION__ is substituted by `cargo xtask make-app` from the workspace
   metadata. This is a CONFIG file (not code) — the same kind of irreducible
   platform descriptor as AndroidManifest.xml.
 
