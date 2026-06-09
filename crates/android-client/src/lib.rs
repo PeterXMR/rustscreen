@@ -1,6 +1,7 @@
-//! RustScreen Android client (cdylib). JNI entry points called by the thin Kotlin shell (D7).
-//! All app logic lives here in Rust; the Kotlin shell is glue only and will be replaced by
-//! NativeActivity in a later phase.
+//! RustScreen Android client (cdylib). The render surface + activity lifecycle run here as a
+//! NativeActivity event loop (`android_main`, android-activity); the remaining thin Kotlin shell
+//! (a `NativeActivity` subclass) does only the USB-accessory permission flow — which has no NDK
+//! equivalent — and hands the accessory fd to `nativeOnUsbFd`. All pipeline logic is Rust.
 
 use std::sync::OnceLock;
 use std::time::Instant;
@@ -203,10 +204,33 @@ mod android {
         let mut transport = open_with_hello(fd)?;
         log::info!("nativeOnUsbFd: sent connect hello; waiting for the render surface…");
 
-        // Rendezvous: the surface arrives on a separate callback, possibly after the fd.
+        // Re-seed the consume-once slot from the retained live window so a reconnect (a new
+        // session with the surface already created and the slot long since drained) binds
+        // immediately — mirrors the old Kotlin shell's per-session re-deposit. A cold
+        // launch-by-plug (fd before the first InitWindow) finds CURRENT_WINDOW empty here and
+        // instead waits below for android_main to put() the window once the OS creates it.
+        //
+        // Hold CURRENT_WINDOW across the put so a concurrent TerminateWindow/Destroy on the
+        // android_main thread (retract_window, which clears the slot under THIS SAME lock) cannot
+        // wedge between our read of CURRENT_WINDOW and the put. Without that, a retract could clear
+        // the slot and null CURRENT_WINDOW after we cloned but before we put, re-depositing a
+        // just-destroyed window into the freshly-cleared slot for take_blocking to hand the decoder
+        // — configuring MediaCodec onto an abandoned BufferQueue. CURRENT_WINDOW is always the
+        // outer lock (the slot/mailbox code never reaches back for it), so this nesting cannot
+        // deadlock; the FFI release of any window the put replaces is a bare refcount decrement
+        // that takes no Rust lock, so running it under the guard is safe. The lock is released
+        // before the blocking take below; a poisoned guard is recovered rather than panicked on
+        // (the android_main thread shares this lock).
+        {
+            let cur = CURRENT_WINDOW.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(w) = cur.as_ref() {
+                SURFACE_SLOT.put(w.clone_acquire());
+            }
+        }
+        // Rendezvous: the window arrives from android_main's InitWindow, possibly after the fd.
         let window = SURFACE_SLOT
             .take_blocking(Duration::from_secs(10))
-            .ok_or("no render surface within 10s (SurfaceView never created?)")?;
+            .ok_or("no render surface within 10s (NativeActivity window never created?)")?;
         log::info!("nativeOnUsbFd: surface acquired; decoding to surface");
 
         let mut decoder = MediaCodecDecoder::new(window);
@@ -253,75 +277,173 @@ mod android {
         Ok(false)
     }
 
-    /// The render surface, deposited by `nativeOnSurface` and consumed by the USB decode
-    /// session thread ([`run_usb_fd`]). A one-way handoff so the session starts regardless of
-    /// whether the surface or the USB fd arrived first (when the app is launched by plugging
-    /// in, the fd can arrive before the `SurfaceView`'s surface is created).
+    /// The render surface, deposited by `android_main`'s `InitWindow` and consumed by the USB
+    /// decode session thread ([`run_usb_fd`]). A one-way handoff so the session starts regardless
+    /// of whether the surface or the USB fd arrived first (when the app is launched by plugging
+    /// in, the fd can arrive before the NativeActivity window is created).
     #[cfg(feature = "live-decode")]
     static SURFACE_SLOT: crate::rendezvous::WindowSlot<crate::mediacodec::NativeWindow> =
         crate::rendezvous::WindowSlot::new();
 
-    /// Called from Kotlin `SurfaceHolder.Callback.surfaceCreated` with the `SurfaceView`'s
-    /// `Surface`. Turns it into an `ANativeWindow` (`ANativeWindow_fromSurface`) and deposits
-    /// it in [`SURFACE_SLOT`] for the USB decode session to claim. Returns immediately so the
-    /// UI thread never blocks — the blocking decode runs on the USB thread in [`run_usb_fd`].
+    /// The latest live render window, retained by [`android_main`] across its lifetime (set on
+    /// `InitWindow`, cleared on `TerminateWindow`). `SURFACE_SLOT` is consume-once, so a *new*
+    /// session that starts while the window already exists (a USB reconnect — replug/EOF — with
+    /// the process and surface still alive) would find the slot drained and time out. `run_usb_fd`
+    /// re-seeds the slot from this before blocking, exactly mirroring the old Kotlin shell's
+    /// per-session `currentSurface` re-deposit. A cold launch-by-plug (fd before the first
+    /// `InitWindow`) finds this empty and instead waits for `InitWindow` to `put()`.
+    #[cfg(feature = "live-decode")]
+    static CURRENT_WINDOW: std::sync::Mutex<Option<crate::mediacodec::NativeWindow>> =
+        std::sync::Mutex::new(None);
+
+    /// NativeActivity entry point (android-activity, native-activity backend). Replaces the
+    /// Kotlin `SurfaceView` + the `nativeOnSurface`/`nativeOnSurfaceDestroyed` JNI calls: the OS
+    /// surface lifecycle now arrives here as `InitWindow`/`TerminateWindow` events, and we feed
+    /// the SAME two channels the decode session already consumes — so every downstream behavior
+    /// (cold-launch rendezvous via `SURFACE_SLOT`, and the live background→foreground swap via
+    /// `SURFACE_MAILBOX`, PR #36) is preserved unchanged. The USB fd handoff stays in Kotlin
+    /// (`nativeOnUsbFd`) because `UsbManager` has no NDK equivalent.
     ///
-    /// FFI discipline: the `ANativeWindow` is acquired here on the JNI thread (the
-    /// `JNIEnv`/`Surface` ref are thread-local and must not escape); `NativeWindow` then owns
-    /// its own `ANativeWindow` reference and is `Send`, so the slot can hand it to the session
-    /// thread.
+    /// Runs on android-activity's dedicated main thread for the activity's lifetime; the blocking
+    /// decode runs on the separate USB thread the Kotlin shell spawns.
     #[cfg(feature = "live-decode")]
     #[no_mangle]
-    pub extern "system" fn Java_com_rustscreen_client_MainActivity_nativeOnSurface(
-        env: JNIEnv,
-        _class: JClass,
-        surface: jni::sys::jobject,
-    ) {
-        use crate::mediacodec::NativeWindow;
+    fn android_main(app: android_activity::AndroidApp) {
+        use std::time::Duration;
 
-        jni_guard("nativeOnSurface", || {
-            // SAFETY: `env` is the live JNI env for this thread; `surface` is the non-null Surface
-            // JNI passed us (Kotlin only calls this with a valid created surface).
-            let window = match unsafe { NativeWindow::from_surface(env.get_raw(), surface) } {
-                Some(w) => w,
-                None => {
-                    log::error!("nativeOnSurface: ANativeWindow_fromSurface returned null");
-                    return;
+        // Idempotent: the logger is also init'd by nativeInit from Kotlin onCreate; init here too
+        // so events logged from this thread are captured regardless of thread start ordering.
+        android_logger::init_once(
+            android_logger::Config::default().with_max_level(log::LevelFilter::Info),
+        );
+        log::info!("android_main: NativeActivity event loop started");
+
+        let mut running = true;
+        while running {
+            app.poll_events(Some(Duration::from_millis(250)), |event| {
+                // BL-03 discipline: `android_main` is an FFI entry (android-activity's C glue calls
+                // it), so a panic must NEVER unwind across that boundary — catch it here exactly
+                // like `nativeOnUsbFd`. A caught panic is logged and the loop continues. The window
+                // statics are shared with the panic-capable decode thread, so each lock below also
+                // recovers a poisoned guard via `into_inner` rather than `unwrap`-panicking, so one
+                // thread's panic can't brick the window channel for the rest of the process.
+                let exit = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    handle_main_event(&app, event)
+                }));
+                match exit {
+                    Ok(should_exit) => running = !should_exit && running,
+                    Err(_) => {
+                        log::error!("android_main: caught panic in event handler, not unwinding");
+                    }
                 }
-            };
-            log::info!("nativeOnSurface: surface ready — depositing for the USB decode session");
-            // Feed BOTH channels: the live mailbox lets a *running* session swap onto this surface
-            // mid-flight (app foregrounded / surface re-create) without reconnecting; the
-            // consume-once SURFACE_SLOT still drives a *fresh* session's initial bind (cold launch
-            // / genuine reconnect). They are independent consumers, so acquire a second
-            // `ANativeWindow` reference for the mailbox — each releases its own on drop.
-            crate::mediacodec::SURFACE_MAILBOX.deposit(window.clone_acquire());
-            SURFACE_SLOT.put(window);
-        });
+            });
+        }
     }
 
-    /// Called from `SurfaceHolder.Callback.surfaceDestroyed`. Retracts any window still sitting
-    /// in [`SURFACE_SLOT`] so a session that has not yet claimed it cannot configure the decoder
-    /// onto a now-dead surface (the destroy-before-take race on the launch-by-plug path), and so
-    /// a surface deposited but never consumed does not leak its `ANativeWindow` reference.
-    ///
-    /// A surface lost *after* a session already claimed it (app backgrounded mid-stream) is now
-    /// handled live via [`crate::mediacodec::SURFACE_MAILBOX`]: this marks it lost so the running
-    /// decoder pauses rendering, and the next `nativeOnSurface` deposits the recreated surface for
-    /// the session to swap onto — no teardown, no reconnect.
+    /// Handle one android-activity event, returning `true` iff the loop should exit (`Destroy`).
+    /// Split out of [`android_main`] so the whole body runs under one `catch_unwind` (the FFI
+    /// boundary) without nesting the match. Feeds the same surface channels the old surface JNI did.
     #[cfg(feature = "live-decode")]
-    #[no_mangle]
-    pub extern "system" fn Java_com_rustscreen_client_MainActivity_nativeOnSurfaceDestroyed(
-        _env: JNIEnv,
-        _class: JClass,
-    ) {
-        jni_guard("nativeOnSurfaceDestroyed", || {
-            log::info!("nativeOnSurfaceDestroyed: surface gone — retracting any unclaimed window");
-            SURFACE_SLOT.clear();
-            // Tell a *running* session its render surface is gone so it pauses rendering (releases
-            // decoded buffers without present) instead of spamming the now-abandoned BufferQueue
-            // and stalling. The session resumes on the next `nativeOnSurface` swap.
-            crate::mediacodec::SURFACE_MAILBOX.mark_lost();
-        });
+    fn handle_main_event(
+        app: &android_activity::AndroidApp,
+        event: android_activity::PollEvent<'_>,
+    ) -> bool {
+        use crate::mediacodec::{NativeWindow, SURFACE_MAILBOX};
+        use android_activity::{MainEvent, PollEvent};
+
+        let PollEvent::Main(main) = event else {
+            return false;
+        };
+        match main {
+            // Surface available (app start, or foreground after a real destroy).
+            MainEvent::InitWindow { .. } => {
+                let Some(ndk_win) = app.native_window() else {
+                    log::error!("android_main: InitWindow but native_window() is None");
+                    return false;
+                };
+                // SAFETY: the pointer is a live ANativeWindow for this InitWindow..TerminateWindow
+                // span; from_ptr_acquire adds our own ref so the handle stays valid once retained.
+                let Some(window) =
+                    (unsafe { NativeWindow::from_ptr_acquire(ndk_win.ptr().as_ptr()) })
+                else {
+                    log::error!("android_main: native window pointer was null");
+                    return false;
+                };
+                log::info!("android_main: InitWindow — depositing render window");
+                // Mirror the old nativeOnSurface: feed BOTH the live swap mailbox (a running
+                // session re-points onto it) and the consume-once slot (a fresh session's initial
+                // bind), and retain it for the reconnect re-seed. The slot put is held under
+                // CURRENT_WINDOW so the retained window and the consume-once slot stay consistent
+                // against a concurrent run_usb_fd re-seed (which puts under the same lock); this
+                // arm runs on the android_main thread, the same thread as retract_window, so the
+                // two of them never race each other. The mailbox is an independent channel, fed
+                // outside the lock.
+                SURFACE_MAILBOX.deposit(window.clone_acquire());
+                {
+                    let mut cur = CURRENT_WINDOW.lock().unwrap_or_else(|e| e.into_inner());
+                    *cur = Some(window.clone_acquire());
+                    SURFACE_SLOT.put(window);
+                }
+                false
+            }
+            // Surface destroyed (app backgrounded). Mirror nativeOnSurfaceDestroyed.
+            MainEvent::TerminateWindow { .. } => {
+                log::info!("android_main: TerminateWindow — retracting render window");
+                retract_window();
+                false
+            }
+            // Input (touch) is available. NativeActivity routes input to native code, and the OS
+            // input dispatcher ANRs the app ("Waited 5001ms for MotionEvent") if buffered events
+            // are not consumed — and android-activity delivers only ONE `InputAvailable` between
+            // drains, so ignoring it strands ALL later input, not just one event. This app is a
+            // read-only monitor (touch is not wired), so we just drain the queue, marking every
+            // event `Unhandled` (which still finishes it so the queue can't back up; the system
+            // applies its normal fallback, e.g. back/volume keys keep working).
+            MainEvent::InputAvailable => {
+                drain_input(app);
+                false
+            }
+            // Activity going away: retract the window (in case Destroy arrives without a preceding
+            // TerminateWindow, so no window is left leaked in the slot / stale in the mailbox) and
+            // exit the loop.
+            MainEvent::Destroy => {
+                log::info!("android_main: Destroy — exiting event loop");
+                retract_window();
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Drain all buffered input events, consuming each as `Unhandled` (touch is not wired). This
+    /// MUST run on the `android_main` thread (it does — `handle_main_event` is called from the
+    /// `poll_events` callback). Not draining stalls the OS input dispatcher → ANR; see the
+    /// `MainEvent::InputAvailable` arm.
+    #[cfg(feature = "live-decode")]
+    fn drain_input(app: &android_activity::AndroidApp) {
+        use android_activity::InputStatus;
+        match app.input_events_iter() {
+            // `next` returns false once the buffer is empty; loop until then so every event is
+            // finished in this single response to `InputAvailable`.
+            Ok(mut iter) => while iter.next(|_event| InputStatus::Unhandled) {},
+            Err(err) => log::error!("android_main: input_events_iter failed: {err:?}"),
+        }
+    }
+
+    /// Retract the current render window from all three holders — the consume-once slot, the live
+    /// mailbox, and the retained `CURRENT_WINDOW` — so no stale/dead surface is handed to a session
+    /// and no `ANativeWindow` reference is leaked. Shared by `TerminateWindow` and `Destroy`.
+    #[cfg(feature = "live-decode")]
+    fn retract_window() {
+        // Clear the slot under CURRENT_WINDOW so it is mutually exclusive with run_usb_fd's
+        // re-seed put (which holds the same lock): otherwise a clear here could land between that
+        // re-seed's read of CURRENT_WINDOW and its put, leaving a dead window in the slot. Holding
+        // the guard across the clear + null makes a racing re-seed see either the live window
+        // (before) or None (after), never a torn state. The mailbox uses its own lock, so the
+        // mark_lost ordering relative to the slot does not matter.
+        let mut cur = CURRENT_WINDOW.lock().unwrap_or_else(|e| e.into_inner());
+        SURFACE_SLOT.clear();
+        crate::mediacodec::SURFACE_MAILBOX.mark_lost();
+        *cur = None;
     }
 }

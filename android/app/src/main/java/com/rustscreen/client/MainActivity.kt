@@ -1,6 +1,6 @@
 package com.rustscreen.client
 
-import android.app.Activity
+import android.app.NativeActivity
 import android.app.PendingIntent
 import android.content.BroadcastReceiver
 import android.content.Context
@@ -14,12 +14,9 @@ import android.os.Handler
 import android.os.Looper
 import android.os.ParcelFileDescriptor
 import android.util.Log
-import android.view.Surface
-import android.view.SurfaceHolder
-import android.view.SurfaceView
 import android.view.WindowManager
 
-class MainActivity : Activity() {
+class MainActivity : NativeActivity() {
 
     private val usb by lazy { getSystemService(Context.USB_SERVICE) as UsbManager }
 
@@ -31,16 +28,6 @@ class MainActivity : Activity() {
     // / double-start the service. Not a permanent one-shot: it is released so a later attach (replug,
     // stale/half-registered accessory) can re-attempt.
 
-    // The current render surface, tracked across its create/destroy lifecycle. The native
-    // SURFACE_SLOT handoff is consume-once (take_blocking removes it), and surfaceCreated only
-    // fires once per surface lifetime — so a re-attach (a new decode session while the surface
-    // already exists, same process) would find an empty slot and time out ("no render surface
-    // within 10s"). Keeping the surface here lets openAndRun re-deposit it for each session.
-    // Touched only on the UI thread today (surface callbacks + openAndRun); @Volatile is a
-    // cheap guard in case a future caller ever reads it off-thread.
-    @Volatile
-    private var currentSurface: Surface? = null
-
     // Foreground accessory poll. The host (`rustscreen start`) brings this activity to the
     // foreground via `adb am start`, then performs the AOA switch. When the phone re-enumerates in
     // accessory mode, the ONLY built-in "accessory attached" signal is the USB_ACCESSORY_ATTACHED
@@ -51,7 +38,7 @@ class MainActivity : Activity() {
     // Auto, with no fixed sleeps to tune. Polling runs ONLY while foreground (started in onResume,
     // stopped in onPause), so a backgrounded/closed app never claims an accessory — which is what
     // keeps Android Auto working normally when RustScreen isn't in use. maybeHandleAccessory() is
-    // idempotent (guarded by sessionActive), so each tick is a cheap no-op once a session is live.
+    // idempotent (guarded by SessionService.active), so each tick is a cheap no-op once a session is live.
     private val accessoryPoller = Handler(Looper.getMainLooper())
     private val pollForAccessory = object : Runnable {
         override fun run() {
@@ -81,34 +68,13 @@ class MainActivity : Activity() {
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
+        // NativeActivity.onCreate loads libandroid_client (via the android.app.lib_name meta-data)
+        // and calls its ANativeActivity_onCreate → the Rust `android_main` event loop, which OWNS
+        // the render surface (decode-to-surface target, P4 Wave B, D3) and feeds the process-global
+        // native channels the decode session consumes. This Activity adds ONLY the USB-accessory
+        // glue on top — UsbManager has no NDK equivalent, so it stays in Kotlin. No SurfaceView /
+        // setContentView: NativeActivity owns the window.
         super.onCreate(savedInstanceState)
-        // The SurfaceView is the decode-to-surface target (P4 Wave B, D3). Its
-        // SurfaceHolder.Callback hands the Surface to native code the moment it is created;
-        // ANativeWindow_fromSurface in Rust turns it into the AMediaCodec render target.
-        // Glue only — all decode logic lives in the Rust cdylib.
-        val surfaceView = SurfaceView(this)
-        surfaceView.holder.addCallback(object : SurfaceHolder.Callback {
-            override fun surfaceCreated(holder: SurfaceHolder) {
-                Log.i(TAG, "surface created — handing to native decode-to-surface")
-                currentSurface = holder.surface
-                nativeOnSurface(holder.surface)
-            }
-
-            override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
-                // No-op: the decoder reads dimensions from the H.264 SPS (csd-0); the surface
-                // scales to fit. A resolution change is a Wave-2 (live reconfig) concern.
-            }
-
-            override fun surfaceDestroyed(holder: SurfaceHolder) {
-                // The Surface is going away; tell native code so it can stop rendering into a
-                // dead window. The Rust side releases its ANativeWindow reference and ends the
-                // decode loop.
-                Log.i(TAG, "surface destroyed — notifying native")
-                currentSurface = null
-                nativeOnSurfaceDestroyed()
-            }
-        })
-        setContentView(surfaceView)
         // Keep the phone awake for the whole session — a second screen that sleeps after the
         // display timeout is useless. Tied to this window, so it clears when the app leaves
         // the foreground. (PR #21 "Remaining" item, folded into the live-pipeline ladder item.)
@@ -207,8 +173,8 @@ class MainActivity : Activity() {
     // foreground [SessionService], which runs the blocking decode session on its own thread. Running
     // the session in a foreground service (not a plain Activity thread) is what stops Android from
     // freezing/killing the process when the user switches to another app — see [SessionService] for
-    // the on-device root cause. The render surface stays owned by this Activity and reaches the
-    // service's decode thread through the process-global native channels.
+    // the on-device root cause. The render surface stays owned by the Rust `android_main` event loop
+    // and reaches the service's decode thread through the process-global native channels.
     private fun openAndRun(accessory: UsbAccessory) {
         // BL-01: claim the session atomically and exactly once, BEFORE any side effect. The service
         // releases the latch when the session ends.
@@ -225,14 +191,6 @@ class MainActivity : Activity() {
             Log.e(TAG, "detachFd() returned invalid fd $fd; aborting")
             SessionService.active.set(false)
             return
-        }
-        // Re-deposit the surface for THIS session. The native handoff is consume-once, so without
-        // this a re-attach (surface already created, slot drained by a previous session) would time
-        // out waiting for a surface that surfaceCreated will never re-announce. If the surface isn't
-        // up yet (cold launch-by-plug), this is null and surfaceCreated deposits it later.
-        currentSurface?.let { surface ->
-            Log.i(TAG, "re-depositing existing surface for new decode session")
-            nativeOnSurface(surface)
         }
         Log.i(TAG, "accessory opened (fd $fd) — starting foreground session service")
         try {
@@ -261,6 +219,11 @@ class MainActivity : Activity() {
         private const val EXPECTED_MANUFACTURER = "RustScreen"
 
         init {
+            // NativeActivity also loads this lib via the android.app.lib_name meta-data, but
+            // System.loadLibrary is idempotent (the loader no-ops a second load of the same .so).
+            // Keep it so the lib is guaranteed loaded whenever this companion is first touched —
+            // including from SessionService's background thread calling nativeOnUsbFd below, which
+            // can run when no fresh Activity load has happened.
             System.loadLibrary("android_client")
         }
 
@@ -269,16 +232,8 @@ class MainActivity : Activity() {
 
         // Returns true iff the session ended because the host sent Control::Bye (`rustscreen stop`),
         // so the caller closes the app. EOF/disconnect (replug) and errors return false → stay alive.
+        // Called from SessionService's session thread.
         @JvmStatic
         external fun nativeOnUsbFd(fd: Int): Boolean
-
-        // P4 Wave B (DEC-01): hand the SurfaceView's Surface to the native AMediaCodec
-        // decode-to-surface adapter (ANativeWindow_fromSurface), and signal teardown when
-        // the surface is destroyed.
-        @JvmStatic
-        external fun nativeOnSurface(surface: Surface)
-
-        @JvmStatic
-        external fun nativeOnSurfaceDestroyed()
     }
 }
