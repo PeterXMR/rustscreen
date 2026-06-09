@@ -79,6 +79,21 @@ class MainActivity : NativeActivity() {
         // display timeout is useless. Tied to this window, so it clears when the app leaves
         // the foreground. (PR #21 "Remaining" item, folded into the live-pipeline ladder item.)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        // Use the WHOLE panel, including the strip beside the Pixel 6a's punch-hole camera. In
+        // landscape the default cutout policy (LAYOUT_IN_DISPLAY_CUTOUT_MODE_DEFAULT) forbids
+        // content in the cutout region, so the OS reserves a ~1 cm black bar across that edge.
+        // SHORT_EDGES renders into short-edge cutouts (the top-center punch-hole is one) in both
+        // landscape orientations, so the decoded Mac frame fills the full surface — the camera
+        // just floats over a thin sliver of content. Pure window policy: it only changes the
+        // ANativeWindow size android_main hands MediaCodec; no per-frame hot-path cost, so it is
+        // glass-to-glass-latency-neutral. Guarded for the API 28 (P) constant since minSdk is 26
+        // (the Pixel 6a is API 33+, so this always applies on the real device).
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            window.attributes = window.attributes.apply {
+                layoutInDisplayCutoutMode =
+                    WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+            }
+        }
         nativeInit()
         // Android 13+ gates posting notifications behind a runtime grant. The foreground service
         // raises process priority regardless, but request it so the "RustScreen — streaming" status
