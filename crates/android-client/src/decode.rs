@@ -69,13 +69,21 @@ pub trait VideoDecoder {
     /// Called once before the first access unit, and again if the config changes.
     fn configure(&mut self, codec: VideoCodec, config: &CodecConfig) -> Result<(), DecodeError>;
 
-    /// Submit one decoder-ready access unit for decode (decode-to-surface in Wave B) and
-    /// return any frames that became decoded-and-presented as a result.
+    /// Submit one decoder-ready access unit for decode (decode-to-surface in Wave B),
+    /// appending any frames that became decoded-and-presented as a result to `presented`.
     ///
     /// A hardware decoder pipelines: queuing one input may release 0..N ready output
-    /// buffers. Each released (rendered) buffer yields one [`PresentedFrame`] stamped with
+    /// buffers. Each released (rendered) buffer appends one [`PresentedFrame`] stamped with
     /// the phone clock, so the caller can report per-frame latency `Stats` to the host.
-    fn decode(&mut self, input: &DecoderInput) -> Result<Vec<PresentedFrame>, DecodeError>;
+    ///
+    /// `presented` is a caller-owned out-parameter (the session loop reuses ONE `Vec`
+    /// across frames, clearing it between them) so the steady-state per-frame decode path
+    /// allocates nothing; implementations only append, never clear.
+    fn decode(
+        &mut self,
+        input: &DecoderInput,
+        presented: &mut Vec<PresentedFrame>,
+    ) -> Result<(), DecodeError>;
 
     /// Current in-flight input depth: access units submitted but not yet emitted as output.
     /// The pacer reads this to bound the codec's input queue (latency item A). Defaults to 0
@@ -84,11 +92,12 @@ pub trait VideoDecoder {
         0
     }
 
-    /// Drain any ready decoded output WITHOUT submitting new input, returning the frames that
-    /// presented. Used when the pacer drops an incoming frame but the codec should keep
-    /// draining (so its output queue and the surface stay current). Defaults to a no-op.
-    fn pump(&mut self) -> Result<Vec<PresentedFrame>, DecodeError> {
-        Ok(Vec::new())
+    /// Drain any ready decoded output WITHOUT submitting new input, appending the frames
+    /// that presented to `presented` (same out-parameter contract as [`decode`](Self::decode)).
+    /// Used when the pacer drops an incoming frame but the codec should keep draining (so
+    /// its output queue and the surface stay current). Defaults to a no-op.
+    fn pump(&mut self, _presented: &mut Vec<PresentedFrame>) -> Result<(), DecodeError> {
+        Ok(())
     }
 
     /// Apply any pending render-surface change (app background/foreground) before the next access
@@ -219,16 +228,19 @@ impl DecodeSession {
 
     /// Feed one protocol [`Frame`] to the session, driving `decoder` as needed.
     ///
-    /// Returns the [`PresentedFrame`]s the decoder produced as a result (only a `Video`
-    /// frame can decode-and-present; every other variant returns an empty `Vec`), or a
+    /// Appends the [`PresentedFrame`]s the decoder produced to `presented` (only a `Video`
+    /// frame can decode-and-present; every other variant appends nothing), or returns a
     /// [`DecodeError`] when a `Video` cannot be decoded (no config, empty payload, or an
-    /// adapter error). The session layer uses the returned frames to emit per-frame
-    /// latency `Stats` to the host (Task 7).
+    /// adapter error). The session layer uses the appended frames to emit per-frame
+    /// latency `Stats` to the host (Task 7). `presented` is the caller-owned reusable
+    /// out-buffer from [`VideoDecoder::decode`] — passed through so the per-frame path
+    /// stays allocation-free.
     pub fn feed(
         &mut self,
         frame: &Frame,
         decoder: &mut dyn VideoDecoder,
-    ) -> Result<Vec<PresentedFrame>, DecodeError> {
+        presented: &mut Vec<PresentedFrame>,
+    ) -> Result<(), DecodeError> {
         match frame {
             Frame::VideoConfig { codec, sps_pps } => {
                 if let Some(config) = nal::extract_codec_config(sps_pps) {
@@ -249,13 +261,13 @@ impl DecodeSession {
                 // A VideoConfig whose bytes carry no usable SPS+PPS is ignored: the next
                 // in-band keyframe can still establish the config. (Defensive — the host
                 // always sends a valid pair.)
-                Ok(Vec::new())
+                Ok(())
             }
             Frame::Video {
                 pts_us,
                 keyframe,
                 nal,
-            } => self.feed_video(*pts_us, *keyframe, nal, decoder),
+            } => self.feed_video(*pts_us, *keyframe, nal, decoder, presented),
             // Not part of the decode path; the session layer routes these elsewhere.
             Frame::Handshake(_)
             | Frame::Touch(_)
@@ -263,7 +275,7 @@ impl DecodeSession {
             | Frame::ClockPing { .. }
             | Frame::ClockPong { .. }
             | Frame::Stats { .. }
-            | Frame::Scroll { .. } => Ok(Vec::new()),
+            | Frame::Scroll { .. } => Ok(()),
         }
     }
 
@@ -273,7 +285,8 @@ impl DecodeSession {
         keyframe: bool,
         nal: &[u8],
         decoder: &mut dyn VideoDecoder,
-    ) -> Result<Vec<PresentedFrame>, DecodeError> {
+        presented: &mut Vec<PresentedFrame>,
+    ) -> Result<(), DecodeError> {
         // The `keyframe` flag is trusted from the protocol (the host is authoritative);
         // it is not cross-checked against nal::is_keyframe(nal).
         // A keyframe carrying its own in-band SPS/PPS can configure the decoder even if no
@@ -296,12 +309,12 @@ impl DecodeSession {
             keyframe,
             annex_b,
         };
-        let presented = decoder.decode(&input)?;
+        decoder.decode(&input, presented)?;
         self.decoded += 1;
         if keyframe {
             self.keyframes += 1;
         }
-        Ok(presented)
+        Ok(())
     }
 }
 
@@ -337,7 +350,11 @@ mod tests {
             Ok(())
         }
 
-        fn decode(&mut self, input: &DecoderInput) -> Result<Vec<PresentedFrame>, DecodeError> {
+        fn decode(
+            &mut self,
+            input: &DecoderInput,
+            presented: &mut Vec<PresentedFrame>,
+        ) -> Result<(), DecodeError> {
             let idx = self.decode_index;
             self.decode_index += 1;
             if self.fail_on_decode_index == Some(idx) {
@@ -346,11 +363,12 @@ mod tests {
             self.calls.push(Call::Decode(input.clone()));
             // Synthetic present: one frame echoing the input pts, with deterministic
             // decode/present stamps so the orchestration above is provable without a device.
-            Ok(vec![PresentedFrame {
+            presented.push(PresentedFrame {
                 pts_us: input.pts_us,
                 decode_us: input.pts_us + 1,
                 present_us: input.pts_us + 2,
-            }])
+            });
+            Ok(())
         }
     }
 
@@ -410,7 +428,9 @@ mod tests {
         let mut session = DecodeSession::new();
         assert!(!session.configured());
 
-        session.feed(&video_config_frame(), &mut dec).unwrap();
+        session
+            .feed(&video_config_frame(), &mut dec, &mut Vec::new())
+            .unwrap();
 
         assert!(session.configured());
         assert_eq!(
@@ -425,7 +445,7 @@ mod tests {
         let mut session = DecodeSession::new();
 
         // A delta frame with no prior config and no in-band SPS/PPS cannot be decoded.
-        match session.feed(&delta_frame(0), &mut dec) {
+        match session.feed(&delta_frame(0), &mut dec, &mut Vec::new()) {
             Err(DecodeError::NoConfig) => {}
             other => panic!("expected NoConfig, got {other:?}"),
         }
@@ -438,8 +458,12 @@ mod tests {
         let mut dec = RecordingDecoder::default();
         let mut session = DecodeSession::new();
 
-        session.feed(&video_config_frame(), &mut dec).unwrap();
-        session.feed(&bare_keyframe(1000), &mut dec).unwrap();
+        session
+            .feed(&video_config_frame(), &mut dec, &mut Vec::new())
+            .unwrap();
+        session
+            .feed(&bare_keyframe(1000), &mut dec, &mut Vec::new())
+            .unwrap();
 
         assert_eq!(session.decoded_count(), 1);
         assert_eq!(session.keyframe_count(), 1);
@@ -476,7 +500,7 @@ mod tests {
 
         let mut dec = RecordingDecoder::default();
         let mut session = DecodeSession::new();
-        session.feed(&frame, &mut dec).unwrap();
+        session.feed(&frame, &mut dec, &mut Vec::new()).unwrap();
 
         assert!(session.configured());
         assert_eq!(session.decoded_count(), 1);
@@ -506,9 +530,15 @@ mod tests {
         let mut dec = RecordingDecoder::default();
         let mut session = DecodeSession::new();
 
-        session.feed(&video_config_frame(), &mut dec).unwrap();
-        session.feed(&bare_keyframe(0), &mut dec).unwrap();
-        session.feed(&delta_frame(16_666), &mut dec).unwrap();
+        session
+            .feed(&video_config_frame(), &mut dec, &mut Vec::new())
+            .unwrap();
+        session
+            .feed(&bare_keyframe(0), &mut dec, &mut Vec::new())
+            .unwrap();
+        session
+            .feed(&delta_frame(16_666), &mut dec, &mut Vec::new())
+            .unwrap();
 
         assert_eq!(session.decoded_count(), 2);
         assert_eq!(session.keyframe_count(), 1);
@@ -533,14 +563,16 @@ mod tests {
     fn empty_video_payload_surfaces_access_unit_error() {
         let mut dec = RecordingDecoder::default();
         let mut session = DecodeSession::new();
-        session.feed(&video_config_frame(), &mut dec).unwrap();
+        session
+            .feed(&video_config_frame(), &mut dec, &mut Vec::new())
+            .unwrap();
 
         let empty = Frame::Video {
             pts_us: 0,
             keyframe: false,
             nal: vec![],
         };
-        match session.feed(&empty, &mut dec) {
+        match session.feed(&empty, &mut dec, &mut Vec::new()) {
             Err(DecodeError::AccessUnit(AccessUnitError::EmptyPayload)) => {}
             other => panic!("expected AccessUnit(EmptyPayload), got {other:?}"),
         }
@@ -554,9 +586,11 @@ mod tests {
             ..Default::default()
         };
         let mut session = DecodeSession::new();
-        session.feed(&video_config_frame(), &mut dec).unwrap();
+        session
+            .feed(&video_config_frame(), &mut dec, &mut Vec::new())
+            .unwrap();
 
-        match session.feed(&bare_keyframe(0), &mut dec) {
+        match session.feed(&bare_keyframe(0), &mut dec, &mut Vec::new()) {
             Err(DecodeError::Adapter(_)) => {}
             other => panic!("expected Adapter error, got {other:?}"),
         }
@@ -571,7 +605,11 @@ mod tests {
         let mut session = DecodeSession::new();
 
         session
-            .feed(&Frame::Control(Control::RequestKeyframe), &mut dec)
+            .feed(
+                &Frame::Control(Control::RequestKeyframe),
+                &mut dec,
+                &mut Vec::new(),
+            )
             .unwrap();
         assert!(dec.calls.is_empty());
         assert!(!session.configured());
@@ -583,7 +621,9 @@ mod tests {
         // A mid-stream resolution change re-sends VideoConfig; the session reconfigures.
         let mut dec = RecordingDecoder::default();
         let mut session = DecodeSession::new();
-        session.feed(&video_config_frame(), &mut dec).unwrap();
+        session
+            .feed(&video_config_frame(), &mut dec, &mut Vec::new())
+            .unwrap();
 
         let mut other = Vec::new();
         other.extend_from_slice(&SC4);
@@ -597,6 +637,7 @@ mod tests {
                     sps_pps: other,
                 },
                 &mut dec,
+                &mut Vec::new(),
             )
             .unwrap();
 
@@ -615,8 +656,12 @@ mod tests {
         // mid-stream reconfigure in the Wave-B adapter and kill the session.
         let mut dec = RecordingDecoder::default();
         let mut session = DecodeSession::new();
-        session.feed(&video_config_frame(), &mut dec).unwrap();
-        session.feed(&video_config_frame(), &mut dec).unwrap();
+        session
+            .feed(&video_config_frame(), &mut dec, &mut Vec::new())
+            .unwrap();
+        session
+            .feed(&video_config_frame(), &mut dec, &mut Vec::new())
+            .unwrap();
 
         let configures = dec
             .calls
@@ -638,7 +683,7 @@ mod tests {
             delta_frame(33_333),
             bare_keyframe(50_000),
         ] {
-            session.feed(&frame, &mut dec).unwrap();
+            session.feed(&frame, &mut dec, &mut Vec::new()).unwrap();
         }
         assert_eq!(session.decoded_count(), 4);
         assert_eq!(session.keyframe_count(), 2);
@@ -651,6 +696,8 @@ mod tests {
         // so non-overriding fakes (and any future simple adapter) behave inertly.
         let mut dec = RecordingDecoder::default();
         assert_eq!(VideoDecoder::in_flight(&dec), 0);
-        assert_eq!(dec.pump().unwrap(), Vec::new());
+        let mut presented = Vec::new();
+        dec.pump(&mut presented).unwrap();
+        assert!(presented.is_empty());
     }
 }

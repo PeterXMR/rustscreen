@@ -162,6 +162,12 @@ pub struct MediaCodecDecoder {
     /// input-queue stall) but nothing is presented until a surface returns. Re-enabled by
     /// `set_output_surface` on foreground. Single decode-thread access, so `Cell`.
     render_enabled: Cell<bool>,
+    /// Reusable scratch for `drain_output`'s ready-buffer collection
+    /// (`(out_index, pts_us, decode_us)` per dequeued output), cleared per call — in steady
+    /// state it holds exactly one element, so reusing it keeps the per-frame drain
+    /// allocation-free. Single decode-thread access (same as the `Cell`s); `RefCell` only
+    /// because a `Vec` needs a mutable borrow through `&self`.
+    ready_scratch: std::cell::RefCell<Vec<(usize, u64, u64)>>,
 }
 
 impl MediaCodecDecoder {
@@ -174,6 +180,7 @@ impl MediaCodecDecoder {
             queued: Cell::new(0),
             dequeued: Cell::new(0),
             render_enabled: Cell::new(true),
+            ready_scratch: std::cell::RefCell::new(Vec::new()),
         }
     }
 }
@@ -337,7 +344,11 @@ impl VideoDecoder for MediaCodecDecoder {
         Ok(())
     }
 
-    fn decode(&mut self, input: &DecoderInput) -> Result<Vec<PresentedFrame>, DecodeError> {
+    fn decode(
+        &mut self,
+        input: &DecoderInput,
+        presented: &mut Vec<PresentedFrame>,
+    ) -> Result<(), DecodeError> {
         let codec = self
             .codec
             .as_ref()
@@ -345,10 +356,10 @@ impl VideoDecoder for MediaCodecDecoder {
             .ptr
             .as_ptr();
 
-        // Accumulates every frame released-with-render during this call (both while
-        // draining to free an input slot below and in the final drain), reported up so the
-        // session layer can emit per-frame latency `Stats` (Task 7).
-        let mut presented: Vec<PresentedFrame> = Vec::new();
+        // `presented` (the caller's reusable out-buffer) accumulates every frame
+        // released-with-render during this call (both while draining to free an input slot
+        // below and in the final drain), reported up so the session layer can emit
+        // per-frame latency `Stats` (Task 7).
 
         // Acquire an input slot. `dequeueInputBuffer` returning < 0 is INFO_TRY_AGAIN_LATER:
         // no slot is free *yet* because the codec is still working through queued frames —
@@ -364,7 +375,7 @@ impl VideoDecoder for MediaCodecDecoder {
                 }
                 // No input slot yet: drain ready output (renders frames + frees input slots),
                 // then retry — so the stall error below only fires after a drain attempt.
-                self.drain_output(codec, &mut presented)?;
+                self.drain_output(codec, presented)?;
                 attempts += 1;
                 if attempts >= MAX_INPUT_DEQUEUE_ATTEMPTS {
                     return Err(DecodeError::Adapter(
@@ -410,8 +421,8 @@ impl VideoDecoder for MediaCodecDecoder {
         // Drain whatever output is ready and render it onto the surface. We do not block
         // for output beyond a short timeout: at steady state one input yields ~one output,
         // and rendering is the point (decode-to-surface), so we render every ready frame.
-        self.drain_output(codec, &mut presented)?;
-        Ok(presented)
+        self.drain_output(codec, presented)?;
+        Ok(())
     }
 
     fn in_flight(&self) -> usize {
@@ -419,7 +430,7 @@ impl VideoDecoder for MediaCodecDecoder {
         self.queued.get().saturating_sub(self.dequeued.get()) as usize
     }
 
-    fn pump(&mut self) -> Result<Vec<PresentedFrame>, DecodeError> {
+    fn pump(&mut self, presented: &mut Vec<PresentedFrame>) -> Result<(), DecodeError> {
         // Drain ready output without submitting input — used when the session's pacer drops an
         // incoming frame but the codec should keep draining so the surface stays current.
         let codec = self
@@ -428,9 +439,7 @@ impl VideoDecoder for MediaCodecDecoder {
             .ok_or_else(|| DecodeError::Adapter("pump called before configure".into()))?
             .ptr
             .as_ptr();
-        let mut presented = Vec::new();
-        self.drain_output(codec, &mut presented)?;
-        Ok(presented)
+        self.drain_output(codec, presented)
     }
 
     fn poll_surface(&mut self) -> Result<bool, DecodeError> {
@@ -516,7 +525,11 @@ impl MediaCodecDecoder {
         // wins — rendering stale frames just to "show every frame" re-introduces exactly the
         // present-queue latency we are removing. With LOW_LATENCY the decoder rarely buffers ahead,
         // so in steady state this collects a single buffer and drops nothing.
-        let mut ready: Vec<(usize, u64, u64)> = Vec::new(); // (out_index, pts_us, decode_us)
+        // (out_index, pts_us, decode_us) per collected buffer. Borrowing the struct-level
+        // scratch (cleared, never shrunk) instead of allocating a fresh `Vec` per drain —
+        // this runs once per frame, and in steady state holds exactly one element.
+        let mut ready = self.ready_scratch.borrow_mut();
+        ready.clear();
         loop {
             let mut info = sys::AMediaCodecBufferInfo {
                 offset: 0,

@@ -10,6 +10,9 @@
 //!
 //! - [`avcc_to_annex_b`] — rewrite length-prefixed AVCC NAL units as start-code
 //!   (`00 00 00 01`) prefixed Annex-B NAL units.
+//! - [`avcc_has_idr`] — keyframe detection straight from the AVCC layout (the NAL
+//!   payload bytes are identical in both framings), so the encode hot path never has
+//!   to convert an access unit just to ask whether it is a keyframe.
 //! - [`to_annex_b_frame`] — convert one AVCC picture access unit and, on keyframes,
 //!   prepend the out-of-band SPS and PPS so the resulting stream is self-describing
 //!   (`protocol::nal::extract_codec_config` can recover them).
@@ -47,13 +50,22 @@ const START_CODE: [u8; 4] = [0, 0, 0, 1];
 /// zero-width prefix `i += nal_length_size` never advances and the `len == 0` skip would
 /// spin forever (a real release-build hang — a `debug_assert!` alone is compiled out).
 pub fn avcc_to_annex_b(avcc: &[u8], nal_length_size: usize) -> Vec<u8> {
-    if !(1..=4).contains(&nal_length_size) {
-        // Caller-contract violation. Returning empty (rather than panicking across a
-        // possible FFI boundary, or — for 0 — looping forever) is the safe library
-        // behavior; the contract is documented above.
-        return Vec::new();
-    }
     let mut out = Vec::with_capacity(avcc.len());
+    append_avcc_as_annex_b(&mut out, avcc, nal_length_size);
+    out
+}
+
+/// Walk the AVCC units in `avcc`, calling `f` with each NAL payload (no prefix). `f`
+/// returns `false` to stop early. The single home of the bounds-checked AVCC walk —
+/// the converter and the keyframe probe both ride it, so the truncation/zero-length/
+/// prefix-width subtleties (documented on [`avcc_to_annex_b`]) exist exactly once.
+fn for_each_avcc_nal(avcc: &[u8], nal_length_size: usize, mut f: impl FnMut(&[u8]) -> bool) {
+    if !(1..=4).contains(&nal_length_size) {
+        // Caller-contract violation. Walking nothing (rather than panicking across a
+        // possible FFI boundary, or — for 0 — looping forever) is the safe library
+        // behavior; the contract is documented on `avcc_to_annex_b`.
+        return;
+    }
     let mut i = 0usize;
     while i + nal_length_size <= avcc.len() {
         // Read the big-endian length prefix of `nal_length_size` bytes.
@@ -70,11 +82,40 @@ pub fn avcc_to_annex_b(avcc: &[u8], nal_length_size: usize) -> Vec<u8> {
         if i + len > avcc.len() {
             break;
         }
-        out.extend_from_slice(&START_CODE);
-        out.extend_from_slice(&avcc[i..i + len]);
+        if !f(&avcc[i..i + len]) {
+            return;
+        }
         i += len;
     }
-    out
+}
+
+/// Append the Annex-B rewrite of `avcc` directly onto `out` — the allocation-free
+/// (caller-owns-the-buffer) form of [`avcc_to_annex_b`], used by [`to_annex_b_frame`]
+/// so the encode hot path builds each frame in ONE buffer instead of converting into
+/// a temporary and copying it over.
+fn append_avcc_as_annex_b(out: &mut Vec<u8>, avcc: &[u8], nal_length_size: usize) {
+    for_each_avcc_nal(avcc, nal_length_size, |nal| {
+        out.extend_from_slice(&START_CODE);
+        out.extend_from_slice(nal);
+        true
+    });
+}
+
+/// Whether the AVCC access unit contains an IDR slice — keyframe detection WITHOUT
+/// converting to Annex-B first. The NAL payload bytes are identical in both framings
+/// (only the per-unit prefix differs), so the type bits can be read straight from the
+/// AVCC layout. The encode hot path needs the keyframe answer BEFORE conversion (it
+/// decides SPS/PPS injection in [`to_annex_b_frame`]); probing here removes the old
+/// convert-then-discard pass that cost a full frame-sized allocation+copy per frame.
+/// Same walk contract as [`avcc_to_annex_b`]: an out-of-contract `nal_length_size` or
+/// a truncated buffer yields `false` (no units walked ⇒ no IDR seen).
+pub fn avcc_has_idr(avcc: &[u8], nal_length_size: usize) -> bool {
+    let mut found = false;
+    for_each_avcc_nal(avcc, nal_length_size, |nal| {
+        found = protocol::nal::nal_unit_type(nal) == Some(protocol::nal::nal_type::IDR_SLICE);
+        !found // keep walking until the first IDR
+    });
+    found
 }
 
 /// Convert one AVCC picture access unit to Annex-B and, on keyframes, inject the
@@ -100,14 +141,22 @@ pub fn to_annex_b_frame(
     sps: &[u8],
     pps: &[u8],
 ) -> Vec<u8> {
-    let mut out = Vec::new();
+    // One allocation for the whole frame: the Annex-B body is the same size as the AVCC
+    // input when the prefix width is 4 (VideoToolbox's usual) and within ±3 bytes/unit
+    // otherwise, so reserving prefix + avcc.len() makes growth-reallocs rare, not load-bearing.
+    let prefix = if is_keyframe {
+        2 * START_CODE.len() + sps.len() + pps.len()
+    } else {
+        0
+    };
+    let mut out = Vec::with_capacity(prefix + avcc.len());
     if is_keyframe {
         out.extend_from_slice(&START_CODE);
         out.extend_from_slice(sps);
         out.extend_from_slice(&START_CODE);
         out.extend_from_slice(pps);
     }
-    out.extend_from_slice(&avcc_to_annex_b(avcc, nal_length_size));
+    append_avcc_as_annex_b(&mut out, avcc, nal_length_size);
     out
 }
 
@@ -246,6 +295,58 @@ mod tests {
         input.extend_from_slice(&avcc_unit(&[0xAA, 0xBB, 0xCC]));
         let out = avcc_to_annex_b(&input, 4);
         assert_eq!(out, vec![0, 0, 0, 1, 0xAA, 0xBB, 0xCC]);
+    }
+
+    // --- avcc_has_idr (hot-path keyframe probe, no conversion) -----------------
+
+    #[test]
+    fn has_idr_true_when_idr_present_among_units() {
+        let mut input = Vec::new();
+        input.extend_from_slice(&avcc_unit(&[0x67, 0x42, 0x1F])); // SPS
+        input.extend_from_slice(&avcc_unit(&[0x68, 0xCE])); // PPS
+        input.extend_from_slice(&avcc_unit(&[0x65, 0x88, 0x99])); // IDR
+        assert!(avcc_has_idr(&input, 4));
+    }
+
+    #[test]
+    fn has_idr_false_for_delta_only_unit() {
+        let input = avcc_unit(&[0x61, 0x88]); // non-IDR slice
+        assert!(!avcc_has_idr(&input, 4));
+    }
+
+    #[test]
+    fn has_idr_matches_is_keyframe_on_the_converted_stream() {
+        // The probe replaced serve.rs's convert-then-`nal::is_keyframe` pass; the two
+        // MUST agree on every shape the walk handles specially (multi-unit, zero-length
+        // unit, truncated tail, narrow prefix), or the keyframe flag silently flips.
+        let mut multi = Vec::new();
+        multi.extend_from_slice(&avcc_unit(&[0x67, 0x42, 0x1F]));
+        multi.extend_from_slice(&avcc_unit(&[0x65, 0x88]));
+        let mut zero_len_then_idr = vec![0, 0, 0, 0];
+        zero_len_then_idr.extend_from_slice(&avcc_unit(&[0x65, 0xAA]));
+        let mut truncated = avcc_unit(&[0x61, 0x01]);
+        truncated.extend_from_slice(&[0, 0, 0, 9, 0x65]); // IDR claimed but cut off
+        let narrow = [0x02, 0x65, 0xAA]; // 1-byte prefix framing an IDR
+        for (avcc, nal_len) in [
+            (&multi[..], 4),
+            (&zero_len_then_idr[..], 4),
+            (&truncated[..], 4),
+            (&narrow[..], 1),
+            (&[][..], 4),
+        ] {
+            assert_eq!(
+                avcc_has_idr(avcc, nal_len),
+                nal::is_keyframe(&avcc_to_annex_b(avcc, nal_len)),
+                "probe disagrees with convert-then-check for {avcc:02X?} (prefix {nal_len})"
+            );
+        }
+    }
+
+    #[test]
+    fn has_idr_invalid_length_size_is_false_without_hanging() {
+        // Same contract as the converter: 0 must terminate (not spin), 5+ walks nothing.
+        assert!(!avcc_has_idr(&[1, 2, 3, 4, 5], 0));
+        assert!(!avcc_has_idr(&[1, 2, 3, 4, 5], 5));
     }
 
     // --- to_annex_b_frame (in-band SPS/PPS injection) -------------------------

@@ -4,12 +4,13 @@ P8 packaging scaffold for the macOS host. This directory builds a `.app` bundle,
 signs + notarizes it under the hardened runtime, and wraps it in a distributable
 DMG.
 
-> **Status — scaffold, not yet validated end-to-end.** The `cargo xtask` packaging
-> path is wired, but it has **not** been run through a real Apple Developer
-> signing identity, and the host's live pipeline isn't finished — so a bundle built
-> today launches but does not yet produce a second screen. The signing/notarization
-> step in particular depends on the entitlement set, which is an **open question**
-> (see below).
+> **Status — bundles the real CLI, signing not yet validated.** `cargo xtask make-app`
+> now builds and bundles the live `rustscreen` CLI (features `live-capture,live-usb`
+> by default — previously it shipped a do-nothing version-printing stub). The packaging
+> path has **not** been run through a real Apple Developer signing identity, and the
+> bundle has no double-click launch behavior yet (`rustscreen` without arguments prints
+> usage; the Dock/menu-bar shape is roadmap P7). The signing/notarization step in
+> particular depends on the entitlement set, which is an **open question** (see below).
 
 ## Commands & files
 
@@ -18,7 +19,7 @@ data files they consume live in this directory.
 
 | Command / file | Purpose |
 |---|---|
-| `cargo xtask make-app` | Release-build `macos-host` and assemble `dist/RustScreen.app`. No signing. |
+| `cargo xtask make-app` | Release-build the `rustscreen` CLI (`live-capture,live-usb` by default) and assemble `dist/RustScreen.app`. No signing. |
 | `cargo xtask sign-notarize` | Codesign the bundle (hardened runtime) → submit to Apple notary → staple. |
 | `cargo xtask make-dmg` | Wrap the (signed) `.app` in `dist/RustScreen-<version>.dmg` with an `/Applications` drop-link. |
 | `Info.plist` | Bundle descriptor template (`__VERSION__` substituted at build time). |
@@ -27,7 +28,8 @@ data files they consume live in this directory.
 ## Quick start (once you have a Developer ID certificate)
 
 ```bash
-# 1. Assemble the bundle. For a real shippable app, enable the live-* features:
+# 1. Assemble the bundle (defaults to --features live-capture,live-usb — the live host;
+#    pass --features explicitly only to extend, e.g. adding live-inject):
 cargo xtask make-app --features live-capture,live-usb,live-inject
 
 # 2. Sign + notarize (needs a "Developer ID Application" cert + a notarytool profile).
@@ -79,4 +81,5 @@ confirmed minimal set and the macOS version it was tested on.
 - [ ] Confirm the private `CGVirtualDisplay` path works under the hardened runtime;
       finalize `entitlements.plist`.
 - [ ] Add `AppIcon.icns` (drop it in this directory; `cargo xtask make-app` picks it up).
-- [ ] Wire the live pipeline (P5) so a launched bundle actually drives a second screen.
+- [ ] Give the bundle a double-click launch behavior (menu-bar status item, roadmap P7) —
+      the bundled `rustscreen` CLI currently prints usage when run without arguments.

@@ -99,6 +99,12 @@ struct FrameSinkIvars {
     /// - the reconnect loop, on each (re)connect: a freshly reconnected MediaCodec can only start
     ///   from a keyframe, so the loop forces an IDR before streaming to the new phone decoder.
     needs_keyframe: Arc<AtomicBool>,
+    /// Grow-only scratch the encode handler copies each sample's AVCC bytes into
+    /// (`block_buffer_bytes_into`), replacing a fresh frame-sized `vec![0; len]`
+    /// (allocate + zero) per frame at 60 fps. VideoToolbox delivers a session's output
+    /// handlers serially (encode order), so the lock is never contended — it exists to
+    /// share the buffer soundly across the per-frame handler blocks, not for throughput.
+    avcc_scratch: Arc<Mutex<Vec<u8>>>,
 }
 
 objc2::define_class!(
@@ -158,6 +164,7 @@ objc2::define_class!(
             let in_flight_h = Arc::clone(&in_flight);
             let shed_post_encode_h = Arc::clone(&self.ivars().shed_post_encode);
             let needs_keyframe_h = Arc::clone(&self.ivars().needs_keyframe);
+            let avcc_scratch_h = Arc::clone(&self.ivars().avcc_scratch);
             let handler = block2::RcBlock::new(
                 move |status: i32,
                       _flags: objc2_video_toolbox::VTEncodeInfoFlags,
@@ -186,17 +193,22 @@ objc2::define_class!(
                     };
                     drop(guard);
 
-                    let Some(avcc) = (unsafe { block_buffer_bytes(sbuf) }) else {
+                    let mut scratch = avcc_scratch_h.lock().unwrap();
+                    let Some(avcc_len) = (unsafe { block_buffer_bytes_into(sbuf, &mut scratch) })
+                    else {
                         return;
                     };
-                    // Keyframe detection from the encoded bytes (reuses tested protocol::nal),
-                    // avoiding the CMSampleAttachments FFI. On keyframes, inject SPS/PPS in-band
-                    // so the stream self-describes AND run_stream_session can cache the config.
-                    let picture = macos_host_self::encode_vt::avcc_to_annex_b(&avcc, nal_len);
-                    let keyframe = protocol::nal::is_keyframe(&picture);
+                    let avcc = &scratch[..avcc_len];
+                    // Keyframe detection straight from the AVCC bytes (the NAL payloads are
+                    // identical in both framings), avoiding the CMSampleAttachments FFI AND the
+                    // old convert-then-discard Annex-B pass per frame. On keyframes, inject
+                    // SPS/PPS in-band so the stream self-describes AND run_stream_session can
+                    // cache the config. ONE conversion per frame, total.
+                    let keyframe = macos_host_self::encode_vt::avcc_has_idr(avcc, nal_len);
                     let annex_b = macos_host_self::encode_vt::to_annex_b_frame(
-                        &avcc, nal_len, keyframe, &sps, &pps,
+                        avcc, nal_len, keyframe, &sps, &pps,
                     );
+                    drop(scratch);
                     let frame = EncodedFrame {
                         pts_us,
                         capture_us,
@@ -278,6 +290,7 @@ impl FrameSink {
             dropped: Arc::new(AtomicUsize::new(0)),
             shed_post_encode: Arc::new(AtomicUsize::new(0)),
             needs_keyframe: Arc::new(AtomicBool::new(false)),
+            avcc_scratch: Arc::new(Mutex::new(Vec::new())),
         });
         unsafe { objc2::msg_send![super(this), init] }
     }
@@ -311,23 +324,31 @@ unsafe fn h264_params(
     Some((sps, pps, nal_len.max(1) as usize))
 }
 
-/// Copy the AVCC bytes out of a compressed sample's `CMBlockBuffer`.
+/// Copy the AVCC bytes out of a compressed sample's `CMBlockBuffer` into `buf`
+/// (a grow-only scratch), returning how many leading bytes of `buf` are this sample.
 ///
 /// Uses `CMBlockBufferCopyDataBytes`, which assembles the bytes regardless of how the
 /// buffer is segmented — VideoToolbox H.264 output is usually one contiguous block, but a
 /// segmented buffer must not be dropped (it could be a keyframe, freezing the stream until
 /// the next contiguous one) nor read past its first segment.
 ///
+/// `buf` only ever grows (it is never truncated), so after warm-up the per-frame cost is
+/// the copy alone — no allocation, and no `vec![0; len]` zeroing of bytes the copy is
+/// about to overwrite. Bytes past the returned length are stale garbage by design; the
+/// caller must slice to the returned length.
+///
 /// # Safety
 /// `sbuf` must be a valid compressed `CMSampleBuffer`.
-unsafe fn block_buffer_bytes(sbuf: &CMSampleBuffer) -> Option<Vec<u8>> {
+unsafe fn block_buffer_bytes_into(sbuf: &CMSampleBuffer, buf: &mut Vec<u8>) -> Option<usize> {
     use std::ffi::c_void;
     let bb = unsafe { sbuf.data_buffer() }?;
     let total_len = unsafe { bb.data_length() };
     if total_len == 0 {
         return None;
     }
-    let mut buf = vec![0u8; total_len];
+    if buf.len() < total_len {
+        buf.resize(total_len, 0);
+    }
     let dst = std::ptr::NonNull::new(buf.as_mut_ptr() as *mut c_void)?;
     let status = unsafe { bb.copy_data_bytes(0, total_len, dst) };
     if status != 0 {
@@ -336,7 +357,7 @@ unsafe fn block_buffer_bytes(sbuf: &CMSampleBuffer) -> Option<Vec<u8>> {
         );
         return None;
     }
-    Some(buf)
+    Some(total_len)
 }
 
 /// Why a single connection ended — drives the reconnect loop.
