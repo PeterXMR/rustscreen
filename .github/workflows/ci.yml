@@ -82,9 +82,10 @@ jobs:
           build -p android-client --features live-decode
 
   # P8 packaging smoke: build the release host binary and assemble the UNSIGNED .app
-  # bundle so the packaging path stays buildable. Additive and non-gating — it does
-  # not run live-* features (no Mac permissions / hardware in CI) and does not sign or
-  # notarize (no secrets in CI). It only proves `cargo xtask make-app` produces a bundle.
+  # bundle so the packaging path stays buildable. Additive and non-gating — it BUILDS
+  # the live-* features but never runs them (no Mac permissions / hardware in CI) and
+  # does not sign or notarize (no secrets in CI). It proves `cargo xtask make-app`
+  # produces a bundle wrapping the real `rustscreen` CLI.
   package-macos:
     name: Package (unsigned .app smoke)
     runs-on: macos-latest
@@ -99,8 +100,9 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       # Prove the SHIPPED profile (`dist`: opt-level=z + full LTO) of the real featured host binary
-      # builds — full LTO can surface codegen/link errors thin-LTO `release` does not, and
-      # `cargo xtask make-app` builds `--profile dist` with no features (only the stub `macos-host` bin).
+      # builds — full LTO can surface codegen/link errors thin-LTO `release` does not. This is the
+      # exact build `cargo xtask make-app` performs (it defaults to live-capture,live-usb and bundles
+      # the `rustscreen` bin), so the next step reuses this step's artifacts from the cargo cache.
       - name: cargo build --profile dist (live host binary)
         run: cargo build --profile dist -p macos-host --bin rustscreen --features live-capture,live-usb
 

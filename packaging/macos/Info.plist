@@ -1,18 +1,20 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!--
-  Info.plist template for RustScreen.app (P8 packaging scaffold).
+  Info.plist template for RustScreen.app.
 
   __VERSION__ is substituted by `cargo xtask make-app` from the workspace
   metadata. This is a CONFIG file (not code) — the same kind of irreducible
   platform descriptor as AndroidManifest.xml.
 
-  Notes / open questions to resolve empirically once the live pipeline is wired:
+  Notes:
+    * CFBundleExecutable is the real `rustscreen` CLI (built with
+      live-capture,live-usb by `cargo xtask make-app`), not the old `macos-host`
+      version-printing stub the P8 scaffold bundled.
     * NSScreenCaptureUsageDescription — required string shown when the app first
-      requests the Screen & System Audio Recording permission (ScreenCaptureKit).
-      Capture is not wired into the shipped binary yet, but the key is harmless to
-      ship early and avoids a re-notarization once capture lands.
-    * The app currently has no GUI; LSUIElement=true keeps it out of the Dock,
-      which matches the planned menu-bar status-item shape (roadmap D5, P7). Flip
+      requests the Screen & System Audio Recording permission (ScreenCaptureKit,
+      wired in the shipped binary since P5).
+    * The app has no GUI; LSUIElement=true keeps it out of the Dock, which
+      matches the planned menu-bar status-item shape (roadmap D5, P7). Flip
       to false if a windowed UI is ever added.
 -->
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -31,7 +33,7 @@
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleExecutable</key>
-    <string>macos-host</string>
+    <string>rustscreen</string>
     <key>CFBundleInfoDictionaryVersion</key>
     <string>6.0</string>
     <key>LSMinimumSystemVersion</key>

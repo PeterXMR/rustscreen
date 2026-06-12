@@ -13,8 +13,17 @@
 //! the Android layer instantiates it as `WindowSlot<NativeWindow>`. No FFI here.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Condvar, Mutex};
+use std::sync::{Condvar, Mutex, PoisonError};
 use std::time::{Duration, Instant};
+
+// Every lock here recovers from poisoning (`unwrap_or_else(PoisonError::into_inner)`)
+// rather than `.unwrap()`ing — the same convention as `CURRENT_WINDOW` in `lib.rs`, for
+// the same reason: these locks are shared between `android_main` and the USB session
+// thread, and the JNI boundary `catch_unwind`s, so the process OUTLIVES a panicking
+// thread. A bare unwrap would turn one survived panic into a poisoned slot that panics
+// every later `put`/`deposit` — bricking surface delivery for the process lifetime. The
+// protected state is a plain `Option`/flag swap with no multi-step invariant, so the
+// data is well-formed even when a holder died mid-critical-section.
 
 /// A single-slot, cross-thread handoff for the render window.
 ///
@@ -38,7 +47,7 @@ impl<T> WindowSlot<T> {
     /// Replaces any previously-deposited-but-unconsumed window (e.g. a surface re-create
     /// before a session claimed the old one) — the freshest surface wins.
     pub fn put(&self, window: T) {
-        let mut guard = self.slot.lock().unwrap();
+        let mut guard = self.slot.lock().unwrap_or_else(PoisonError::into_inner);
         *guard = Some(window);
         self.ready.notify_one();
     }
@@ -48,7 +57,7 @@ impl<T> WindowSlot<T> {
     /// cannot hand out a dead surface, and wakes any blocked taker so it re-evaluates
     /// against its deadline instead of waiting out a full timeout. A no-op when empty.
     pub fn clear(&self) {
-        let mut guard = self.slot.lock().unwrap();
+        let mut guard = self.slot.lock().unwrap_or_else(PoisonError::into_inner);
         *guard = None;
         self.ready.notify_one();
     }
@@ -60,7 +69,7 @@ impl<T> WindowSlot<T> {
         // Track an absolute deadline so spurious or `clear` wakeups don't re-arm the full
         // timeout — `timeout` is an upper bound on the total wait, not a per-wakeup budget.
         let deadline = Instant::now() + timeout;
-        let mut guard = self.slot.lock().unwrap();
+        let mut guard = self.slot.lock().unwrap_or_else(PoisonError::into_inner);
         loop {
             if let Some(window) = guard.take() {
                 return Some(window);
@@ -69,7 +78,10 @@ impl<T> WindowSlot<T> {
                 // Deadline reached (possibly via several short wakeups): give up.
                 return guard.take();
             };
-            let (next, res) = self.ready.wait_timeout(guard, remaining).unwrap();
+            let (next, res) = self
+                .ready
+                .wait_timeout(guard, remaining)
+                .unwrap_or_else(PoisonError::into_inner);
             guard = next;
             if res.timed_out() {
                 // One last look in case a `put` raced the timeout, then give up.
@@ -140,7 +152,7 @@ impl<T> SurfaceMailbox<T> {
     /// (freshest wins) and clears `lost` — the new surface replaces the destroyed one.
     pub fn deposit(&self, window: T) {
         {
-            let mut g = self.inner.lock().unwrap();
+            let mut g = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
             g.pending = Some(window);
             g.lost = false;
         }
@@ -152,7 +164,7 @@ impl<T> SurfaceMailbox<T> {
     /// next poll pauses rendering.
     pub fn mark_lost(&self) {
         {
-            let mut g = self.inner.lock().unwrap();
+            let mut g = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
             g.pending = None;
             g.lost = true;
         }
@@ -169,7 +181,7 @@ impl<T> SurfaceMailbox<T> {
     /// prior loss (if a surface arrived after the loss we want to swap onto it, not report the
     /// now-stale loss). Returns [`SurfaceChange::None`] when nothing is pending.
     pub fn take(&self) -> SurfaceChange<T> {
-        let mut g = self.inner.lock().unwrap();
+        let mut g = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
         // Clear under the lock so a concurrent producer that re-raises `dirty` after us is not
         // lost: its write happens-after this store, leaving `dirty` true for the next poll.
         self.dirty.store(false, Ordering::Relaxed);
@@ -280,6 +292,31 @@ mod tests {
         );
     }
 
+    #[test]
+    fn put_and_take_survive_a_poisoned_slot() {
+        // The JNI boundary `catch_unwind`s, so the process can outlive a thread that
+        // panicked while holding the slot lock. The slot must keep working afterwards
+        // (recover-the-data convention, as for `CURRENT_WINDOW`) — a bare `.unwrap()`
+        // here would brick surface delivery for the rest of the process lifetime.
+        let slot: Arc<WindowSlot<&str>> = Arc::new(WindowSlot::new());
+        let poisoner = {
+            let slot = Arc::clone(&slot);
+            std::thread::spawn(move || {
+                let _guard = slot.slot.lock().unwrap();
+                panic!("poison the slot lock deliberately");
+            })
+        };
+        assert!(poisoner.join().is_err(), "poisoner must have panicked");
+        assert!(slot.slot.is_poisoned(), "lock must actually be poisoned");
+
+        slot.put("post-poison-surface"); // must not panic
+        assert_eq!(
+            slot.take_blocking(Duration::from_secs(1)),
+            Some("post-poison-surface")
+        );
+        slot.clear(); // must not panic either
+    }
+
     // --- SurfaceMailbox (mid-session background/foreground swap channel) ------------------
 
     /// Match helper: `SurfaceChange` has no `PartialEq` (its `T` need not), so assert by arm.
@@ -350,6 +387,27 @@ mod tests {
             is_none(&mb.take()),
             "the loss was superseded, not also reported"
         );
+    }
+
+    #[test]
+    fn mailbox_survives_a_poisoned_inner_lock() {
+        // Same recover-don't-brick contract as the WindowSlot poison test above: after a
+        // surviving panic poisons `inner`, deposit/take must keep delivering surfaces.
+        let mb: Arc<SurfaceMailbox<&str>> = Arc::new(SurfaceMailbox::new());
+        let poisoner = {
+            let mb = Arc::clone(&mb);
+            std::thread::spawn(move || {
+                let _guard = mb.inner.lock().unwrap();
+                panic!("poison the mailbox lock deliberately");
+            })
+        };
+        assert!(poisoner.join().is_err(), "poisoner must have panicked");
+        assert!(mb.inner.is_poisoned(), "lock must actually be poisoned");
+
+        mb.deposit("post-poison-surface"); // must not panic
+        assert_eq!(swapped(mb.take()), Some("post-poison-surface"));
+        mb.mark_lost(); // must not panic either
+        assert!(is_lost(&mb.take()));
     }
 
     #[test]

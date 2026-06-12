@@ -107,7 +107,13 @@ fn build_apk() -> Result<(), String> {
     Ok(())
 }
 
-/// `make_app.sh`: build the `dist` host binary and assemble `dist/RustScreen.app`.
+/// Features `make-app` builds with when `--features` is not given: the full live host,
+/// so the bundled executable is the REAL `rustscreen` CLI. (The retired `make_app.sh`
+/// bundled the 6-line version-printing `macos-host` stub — a P8 scaffold from before the
+/// live pipeline existed; faithfully ported at first, retired here.)
+const MAKE_APP_DEFAULT_FEATURES: &str = "live-capture,live-usb";
+
+/// `make_app.sh`: build the `dist` `rustscreen` binary and assemble `dist/RustScreen.app`.
 fn make_app(features: Option<&str>) -> Result<(), String> {
     require_macos("make-app")?;
     let root = repo_root();
@@ -116,20 +122,27 @@ fn make_app(features: Option<&str>) -> Result<(), String> {
     let cargo_toml = read(&root.join("Cargo.toml"))?;
     let version = logic::workspace_version(&cargo_toml).unwrap_or_else(|| "0.0.0".to_string());
 
-    let feat_note = features
-        .map(|f| format!(", features: {f}"))
-        .unwrap_or_default();
-    println!("==> Building macos-host (dist{feat_note})");
+    // The bundle ships the real CLI (`[[bin]] rustscreen`, required-features
+    // live-capture,live-usb), so those features are the default; `--features` can extend
+    // them (e.g. adding live-inject). Passing a list that drops a required feature fails
+    // the `--bin rustscreen` build below with cargo's own clear error.
+    let features = features.unwrap_or(MAKE_APP_DEFAULT_FEATURES);
+    println!("==> Building rustscreen (dist, features: {features})");
     let mut build = Command::new("cargo");
-    build
-        .current_dir(&root)
-        .args(["build", "--profile", "dist", "-p", "macos-host"]);
-    if let Some(f) = features {
-        build.args(["--features", f]);
-    }
+    build.current_dir(&root).args([
+        "build",
+        "--profile",
+        "dist",
+        "-p",
+        "macos-host",
+        "--bin",
+        "rustscreen",
+        "--features",
+        features,
+    ]);
     run("cargo build", &mut build)?;
 
-    let bin_path = root.join("target/dist/macos-host");
+    let bin_path = root.join("target/dist/rustscreen");
     if !bin_path.is_file() {
         return Err(format!(
             "expected binary not found at {}",
@@ -155,8 +168,8 @@ fn make_app(features: Option<&str>) -> Result<(), String> {
         &logic::fill_version_template(&template, &version),
     )?;
 
-    // The executable (copy + chmod +x).
-    let dest_bin = macos_dir.join("macos-host");
+    // The executable (copy + chmod +x). Name must match CFBundleExecutable in Info.plist.
+    let dest_bin = macos_dir.join("rustscreen");
     fs::copy(&bin_path, &dest_bin)
         .map_err(|e| format!("copy binary → {} failed: {e}", dest_bin.display()))?;
     set_executable(&dest_bin)?;
@@ -425,8 +438,10 @@ USAGE:
 COMMANDS:
     build-apk                       Build the release Android APK (cargo-ndk dist .so + Gradle).
                                     Requires ANDROID_NDK_HOME.
-    make-app [--features <list>]    Build the dist host binary and assemble dist/RustScreen.app.
-                                    macOS only. e.g. --features live-capture,live-usb,live-inject
+    make-app [--features <list>]    Build the dist `rustscreen` binary and assemble
+                                    dist/RustScreen.app. macOS only. Defaults to
+                                    --features live-capture,live-usb (the live host);
+                                    e.g. --features live-capture,live-usb,live-inject
     make-dmg [<bundle>]             Wrap an .app (default dist/RustScreen.app) in a DMG. macOS only.
     sign-notarize [<bundle>]        Codesign + notarize + staple. macOS only.
                                     Requires SIGN_IDENTITY and NOTARY_PROFILE.

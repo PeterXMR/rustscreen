@@ -314,6 +314,10 @@ pub fn run_session_with_clock<T: Read + Write>(
     // Set only by the `Control::Bye` arm: distinguishes a deliberate host stop (→ app closes) from
     // a plain EOF/disconnect (→ app stays and waits for reconnect). See [`SessionSummary`].
     let mut ended_by_host_bye = false;
+    // ONE reusable out-buffer for the frames each decode/pump presents, cleared per frame —
+    // in steady state it holds exactly one element, so reusing it (instead of a fresh `Vec`
+    // returned per call) keeps the per-frame decode path allocation-free.
+    let mut presented: Vec<crate::decode::PresentedFrame> = Vec::new();
 
     loop {
         // Apply any pending render-surface change (app background/foreground) before blocking on
@@ -367,21 +371,22 @@ pub fn run_session_with_clock<T: Read + Write>(
                         .map_err(SessionError::from)?;
                     transport.flush().map_err(SessionError::from)?;
                 }
-                let presented = if admission == Admission::Feed {
+                presented.clear();
+                if admission == Admission::Feed {
                     // Stamp arrival ONLY for admitted frames: a dropped frame never decodes or
                     // presents, so it must not enter the bounded StatsTracker FIFO (where its
                     // orphan record could evict an admitted frame's record under burst drops).
                     stats.on_arrive(*pts_us, now_us());
                     decode_session
-                        .feed(&frame, decoder)
+                        .feed(&frame, decoder, &mut presented)
                         .map_err(SessionError::Decode)?
                 } else {
                     input_frames_dropped += 1;
-                    decoder.pump().map_err(SessionError::Decode)?
+                    decoder.pump(&mut presented).map_err(SessionError::Decode)?
                 };
                 // Each presented output frame completes a per-frame record; emit its Stats.
                 let mut wrote_stats = false;
-                for pf in presented {
+                for pf in &presented {
                     stats.on_decode(pf.pts_us, pf.decode_us);
                     if let Some(stats_frame) = stats.on_present(pf.pts_us, pf.present_us) {
                         stats_frame
@@ -398,10 +403,10 @@ pub fn run_session_with_clock<T: Read + Write>(
                 }
             }
             Frame::VideoConfig { .. } => {
-                // Config drives configure() but never presents a frame; ignore the (empty)
-                // presented list.
+                // Config drives configure() but never presents a frame; nothing is appended
+                // to `presented` (and the Video arm clears it before every use anyway).
                 decode_session
-                    .feed(&frame, decoder)
+                    .feed(&frame, decoder, &mut presented)
                     .map_err(SessionError::Decode)?;
             }
             Frame::ClockPing { .. } => {
@@ -498,7 +503,8 @@ mod tests {
         fn decode(
             &mut self,
             input: &crate::decode::DecoderInput,
-        ) -> Result<Vec<crate::decode::PresentedFrame>, DecodeError> {
+            presented: &mut Vec<crate::decode::PresentedFrame>,
+        ) -> Result<(), DecodeError> {
             let idx = self.decode_index;
             self.decode_index += 1;
             if self.fail_on_decode_index == Some(idx) {
@@ -507,16 +513,20 @@ mod tests {
             self.calls
                 .borrow_mut()
                 .push(DecoderCall::Decode(input.clone()));
-            Ok(self.present_script.pop_front().unwrap_or_default())
+            presented.extend(self.present_script.pop_front().unwrap_or_default());
+            Ok(())
         }
 
         fn in_flight(&self) -> usize {
             self.in_flight_script.borrow_mut().pop_front().unwrap_or(0)
         }
 
-        fn pump(&mut self) -> Result<Vec<crate::decode::PresentedFrame>, DecodeError> {
+        fn pump(
+            &mut self,
+            _presented: &mut Vec<crate::decode::PresentedFrame>,
+        ) -> Result<(), DecodeError> {
             self.calls.borrow_mut().push(DecoderCall::Pump);
-            Ok(Vec::new())
+            Ok(())
         }
     }
 
